@@ -250,15 +250,8 @@ static void compute_play_duration(void)
     /* Читаем из VGM-заголовка (страница 0 должна быть доступна) */
     wc_mngcvpl(0);
     {
-        volatile uint8_t *b = (volatile uint8_t *)0xC000;
-        total_samples = (uint32_t)b[0x18]
-                      | ((uint32_t)b[0x19] << 8)
-                      | ((uint32_t)b[0x1A] << 16)
-                      | ((uint32_t)b[0x1B] << 24);
-        loop_samples  = (uint32_t)b[0x20]
-                      | ((uint32_t)b[0x21] << 8)
-                      | ((uint32_t)b[0x22] << 16)
-                      | ((uint32_t)b[0x23] << 24);
+        total_samples = *(volatile uint32_t *)(0xC000 + 0x18);
+        loop_samples  = *(volatile uint32_t *)(0xC000 + 0x20);
     }
     wc_mngcvpl(vgm_cur_page);
 
@@ -681,8 +674,15 @@ void start_playback(void)
         /* Инициализация IM2: перехват вектора WC #5BFF */
         isr_init();
 
-        /* Включить OPL3 mode + wavesel + reset */
+        /* Инициализация OPL: opl3_init() всегда включает OPL3 mode (NEW=1).
+         * Для OPL2/OPL1 файлов сбрасываем NEW=0 (режим совместимости):
+         *   - чип автоматически выводит звук на оба канала
+         *   - биты L/R в C0-C8 игнорируются
+         * Для OPL3 файлов оставляем NEW=1 — L/R управляются из VGM. */
         opl3_init();
+        if (vgm_chip_type != VGM_CHIP_OPL3) {
+            opl3_write_b1(0x05, 0x00);  /* NEW=0: OPL2 compat mode */
+        }
 
         /* Включить частоту SAA1099 (если MultiSound) */
         saa_clock_on();
