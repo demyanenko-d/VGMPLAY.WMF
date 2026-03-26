@@ -1,0 +1,7 @@
+src_sdcc/build
+Debuger/obj
+Debuger/bin
+Debuger/*.vgz
+Debuger/*.vgm
+Debuger/dumps
+**/*.img

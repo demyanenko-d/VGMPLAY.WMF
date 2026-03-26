@@ -1,0 +1,363 @@
+; samflate :: samflate.z80s       by Andrew Collier (C) 2009
+; an implementation of the Inflate decompression algorithm
+; corresponding to deflate compression as used by gzip
+; and compatible with RFC 1951
+
+; # You may use and distribute this code under any DFSG-compatible
+; # license (eg. BSD, GNU GPLv2).
+
+; The latest version of this file will be kept available at the sourceforge project,
+; "samflate"
+
+; This is a basic interface for the inflate decoder
+; It sets up the necessary memory conditions and calls the inflate code
+; (the algorithm implementation is in inflatelib.z80s)
+
+; It also arranges the screen effect during decompression
+; (the screen is switched off most of the time, to improve speed)
+
+; Other programs using inflate decompression internally will probably not need
+; to use much of this file, but you are welcome to use it under the same
+; license terms should you wish to.
+
+
+LMPR:           EQU 250
+HMPR:           EQU 251
+VMPR:           EQU 252
+BORDER:         EQU 254
+CLUT:           EQU 248
+LINE:           EQU 249
+STATUS:         EQU 249
+
+START_OF_PROGRAM: equ 24576 + 32768; after a mode4 screen + a few extra bytes
+PAGE_OF_PROGRAM: equ 24
+
+
+
+; in fact, we're usually called in section C
+        ; should attempt to confirm this by checking BC
+
+ENTRY_POINT: equ (START_OF_PROGRAM) \ 16384 + 32768
+
+
+
+ORG ENTRY_POINT
+DUMP PAGE_OF_PROGRAM, ENTRY_POINT \ 16384
+
+
+
+; Interface to SAM BASIC
+; CALL samflate_addr, FROM_ADDRESS, TO_ADDRESS
+; where addresses are float types consisting of page and offset in basic's combined format
+
+; On entry, A contains the number of parameters
+; parameters themselves and type information have been placed on the FPC stack
+
+    cp 2
+    jp nz, parameter_error
+
+
+    rst 0x28 ; call floating point calculator, stack = FR,t,TO,t
+
+    db 0x1d ; SWOP23    ; FR,TO,t,t
+    db 0x33 ; EXIT
+
+    ; check type information
+    call JGETINT
+    cp 0xc0
+    jr nz, parameter_error
+    call JGETINT
+    cp 0xc0
+    jr nz, parameter_error
+    
+
+    rst 0x28 ; call floating point calculator, stack = FR,TO
+
+    db 0x25 ; DUP       ; FR,TO,TO
+    db 0xe2 ; STK16K    ; FR,TO,TO,16K
+    db 0x08 ; MOD       ; FR,TO,TO\16K
+    db 0x06 ; SWOP      ; FR,TO\16K,TO
+    db 0xe2 ; STK16K    ; FR,TO\16K,TO,16K
+    db 0x09 ; IDIV      ; FR,TO\16K,TO/16K
+    
+    db 0x1c ; SWOP13    ; TO/16K,TO\16K,FR
+
+    db 0x25 ; DUP       ; TO/16K,TO\16K,FR,FR
+    db 0xe2 ; STK16K    ; TO/16K,TO\16K,FR,FR,16K
+    db 0x08 ; MOD       ; TO/16K,TO\16K,FR,FR\16K
+    db 0x06 ; SWOP      ; TO/16K,TO\16K,FR\16K,FR
+    db 0xe2 ; STK16K    ; TO/16K,TO\16K,FR\16K,FR,16K
+    db 0x09 ; IDIV      ; TO/16K,TO\16K,FR\16K,FR/16K
+    
+    db 0x06 ; SWOP      ; TO/16K,TO\16K,FR/16K,FR\16K
+    
+    db 0x33 ; EXIT
+
+
+;JGETINT 
+;(0121H) 
+; 
+;Unstack number from calculator stack into HL. BC holds 
+;a copy of HL, and A holds a copy of L. An error is 
+;generated if the rounded number is not in the range 0- 
+;65535. 
+
+JGETINT: EQU 0x0121  
+
+    call JGETINT
+    ld ((START_OF_GZDATA \ 16384) + 32768),hl
+
+    call JGETINT
+    ld a,h
+    or a
+    jr nz, invalid_argument_error
+    ld a,l
+    dec a
+    cp 32
+    jr nc, invalid_argument_error
+    ld ((PAGE_OF_GZDATA \ 16384) + 32768),a
+ 
+ 
+    call JGETINT
+    ld ((START_OF_DESTINATION \ 16384) + 32768),hl
+
+    call JGETINT
+    ld a,h
+    or a
+    jr nz, invalid_argument_error
+    ld a,l
+    dec a
+    cp 32
+    jr nc, invalid_argument_error
+    ld ((PAGE_OF_DESTINATION \ 16384) + 32768),a
+    
+    
+    di
+    
+    ; page ourselves into section D via secion A
+
+    in a,(vmpr)
+    ld ((vmprs\16384) + 32768),a
+
+    in a,(lmpr)
+    ld ((lmprs\16384) + 32768),a
+    
+    ld ((sps\16384) + 32768),sp
+    
+    in a,(hmpr)
+    ld ((hmprs\16384) + 32768),a
+    and 31
+    or 32
+    out (lmpr),a
+    jp lmem
+
+
+invalid_argument_error:
+    rst 8
+    db 27
+
+parameter_error:
+    rst 8
+    db 26
+
+
+
+
+
+xhmem:
+    
+lmprs: equ $+1
+    ld a,00
+    out (lmpr),a
+    
+sps: equ $+1
+    ld sp,0000
+
+vmprs: equ $+1
+    ld a,00
+    out (vmpr),a
+
+    ld a,0x08
+    out (border),a
+
+    ld a,255
+    out (line),a
+
+    im 0
+    ei
+    
+resultcode: equ $+1
+    ld a,00
+    or a
+    ret z
+    
+    rst 8
+    db 19 ; loading error
+    
+    
+
+
+
+
+
+
+
+
+org ($\16384)+49152
+
+
+
+                
+
+hmem:
+    ; okay, here we are in section D.
+    
+    ld sp,0
+
+    inc a
+    and 31
+    or 32 ; mode 2
+    ld (scr_on_vmpr),a
+    or 96
+    ld (scr_off_vmpr),a     ; screen "off" only works in modes 3 and 4
+
+
+
+    ld a,4
+    ld de,(192-4)*32 + 0xe000
+@:  ld hl,attrtab
+    ld bc,32
+    ldir
+    dec a
+    jr nz, @
+
+
+    ld a,IM2_VALUE_I
+    ld i,a
+    ld a,188
+    out (line),a
+    im 2
+    ei
+
+
+
+
+START_OF_GZDATA: equ $+1
+    ld hl, 0000
+
+PAGE_OF_GZDATA: equ $+1
+    ld c, 0
+
+START_OF_DESTINATION: equ $+1
+    ld de, 0000
+
+PAGE_OF_DESTINATION: equ $+1
+    ld b, 0
+
+
+
+    call inflate
+    ld ((resultcode\16384) + 49152),a
+
+    ; finishing up, put pages back into initial position
+hmprs: equ $+1
+    ld a,00
+    ld b,a
+    
+    and 31
+    or 32
+    out (lmpr),a
+    jp xlmem
+
+attrtab:    db 0x09, 0x12, 0x1b, 0x24, 0x2d, 0x36, 0x3f, 0x40, 0x49, 0x52, 0x5b, 0x64, 0x6d, 0x76, 0x7f
+            db 0x09, 0x12, 0x1b, 0x24, 0x2d, 0x36, 0x3f, 0x40, 0x49, 0x52, 0x5b, 0x64, 0x6d, 0x76, 0x7f
+            db 0x09, 0x12
+
+
+@:
+ds align 256
+IM2_VALUE_I: equ $/256
+    for 257, db interrupt_routine/256
+
+
+ org ($\16384)
+lmem:
+    dec a
+    and 31
+    out (hmpr),a
+    jp hmem
+
+
+xlmem:
+    ld a,b
+    out (hmpr),a
+    jp xhmem
+
+ org ($\16384)+49152
+
+           
+
+
+@:
+ds align 32
+paltab:     db 125,93,85,89,83,81,28,28,20,28,81,83,89,85,93
+            db 125,93,85,89,83,81,28,28,20,28,81,83,89,85,93
+
+frameinterrupt:    
+
+scr_off_vmpr: equ $+1
+    ld a,00    
+    out (vmpr),a
+
+    ld a,0x88
+    out (border),a
+
+    push hl
+    push bc
+
+    ld hl,paltab
+    ld bc,16*256 + CLUT
+
+    exx
+    ld a,h  ; *usually* the position in the compressed file. But we may be in the alternate set anyway,
+            ; so randomly this will be a completely different value. Fortunately we use this only for a
+            ; visual effect of general progress, and nothing at all important depends on the value.
+    exx
+    and 15
+    add l
+    ld l,a
+
+    for 15, outi
+
+    pop bc
+    pop hl
+    pop af
+    ei 
+    reti
+            
+@:
+DS ALIGN 257    ; yes, 257.
+
+interrupt_routine: 
+    push af
+
+    ld a,0x08
+    out (border),a
+
+scr_on_vmpr: equ $+1
+    ld a,00    
+    out (vmpr),a        ; turn on the screen - we need to do this much quicker than turning it off..
+
+    in a,(STATUS)
+    rra
+    jp c, frameinterrupt
+
+    pop af
+    ei 
+    reti
+
+
+INCLUDE "samflatelib.z80s"
+
+
+

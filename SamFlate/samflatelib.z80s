@@ -1,0 +1,1815 @@
+; samflate :: inflatelib.z80s       by Andrew Collier (C) 2009
+; an implementation of the Inflate decompression algorithm
+; corresponding to deflate compression as used by gzip
+; and compatible with RFC 1951
+
+; Although I have not directly translated the code, this implementation
+; is based on Paul Sladen's pyflate.py which I used as a reference
+; for the compressed file format. Therefore I'm releasing this code
+; under the same license terms:
+; # You may use and distribute this code under any DFSG-compatible
+; # license (eg. BSD, GNU GPLv2).
+
+; The latest version of this file will be kept available at the sourceforge project,
+; "samflate"
+
+; My intent is that it should not in general be necessary to modify this file
+; in order to use gz decompression in general programs
+; (not branching the file will make for easier bug-fixing and maintenance)
+
+; This code must be called in section D, with stack near the top of memory
+; * The first 257 bytes of section D might be overwritten! *
+; section C will be used as temporary storage
+
+; Interrupts may be enabled, provided that they IM2 is selected and a 
+; handler table is included inside section D.
+; (If you're wondering why the code isn't in section A, it is necessary (for the dictionary lookups to work)
+; that the temporary work page - which would have to be B in that case - immediately follows the rotating memory window)
+
+; The code runs in section D and uses section C as temporary storage
+; (i.e you should allow 32k of storage for operation, 
+;  which cannot overlap with the compressed or uncompressed file.
+;  If you're careful, the beginning of the compressed file can overlap with the end 
+;  of the uncompressed.)
+
+; in fact we write the decoded file into C before copying it to the destination page
+;   we may write up to 257 bytes of section D as well, to do page checks less often
+; gz data is generally resident in sections A+B
+; this means we do not need to change the paging between every byte
+
+; moreover we only need to check the encoded page window after overflowing 16k of the decoded file
+; (in a 32k window we are guaranteed to be able to see 16k of the compressed file
+; wherever the block starts; we know the compressed block is smaller than the decoded block.
+; If it were not, it would be stored in the file as block type 0.)
+
+; we will often want to copy whole pages from C to low memory
+; (partial pages at the start or end of files should be done more simply and perhaps more slowly)
+; We can optimise copies by using the stack - but need to take care not to corrupt anything if interrupts occur
+; we use the stack to write into section A
+; - interrupts either write memory in A which will then be written by correct copied data
+;   or else write into D, which under our own control and can be safe if we don't overwrite 
+;   values from the stack which might otherwise have been in use
+
+; LIMITATIONS
+
+; This code does not keep track of a checksum
+; Errors in the gz file are not likely to be detected and may cause a crash.
+
+
+inflate:
+    ; decode a block of gzip data starting at offset HL [of page C  *]
+    ;          writing the result starting at offset DE [of page B  *]
+    
+    ; * unless assembled with   INFLATELIB_CONFIG__NO_MEMORY_PAGING  defined
+    ; use this when the decoded data is KNOWN to fit inside free memory
+    ; e.g. this library can be assembled within the top 8k of section D, 
+    ; and decompressing a MODE 4 screen at DE==32768 can be made to work
+
+    ; returns A=0, carry clear, if decompression appeared to be successful
+    ; returns A!=0, carry set, if error was detected.
+    ; (NB. We do not calculate checksum. Most error conditions are not detected and will probably cause a crash.)
+
+
+IF 0 == defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)
+    ld a,d
+    and 0x3f            ; section A
+    ld d,a
+    ld (dst), de
+    
+    or 0x80             ; section C
+    ld d,a
+
+    
+    in a,(lmpr)
+    ld (inflate_lmprs),a
+    
+    ld a,b
+    and 31
+    or 32
+    ld (dst.page),a
+    dec a
+    dec a
+    ld (dst.page.minustwo),a
+
+    ld a,h
+    and 0x3f            ; section A
+    ld h,a
+
+    ld a,c
+    and 31
+    or 32
+    ld (src.page),a
+    
+    out (lmpr),a
+ENDIF
+    ld (interim_dst),de
+
+    
+    ; by default, the source file will be in sections A/B
+    ; we write decoded information into section C and copy completed pages into destination memory
+
+    ; for quick and easy access we use alternate registers to store src file pointers
+    
+    ld c,(hl)
+    inc hl
+    ld b,8
+    
+    ; hl = pointer to next byte
+    ; c = a partially used byte (shifted, lowest bits are valid - others RAZ)
+    ; b = number of valid bits in c
+    
+    exx
+
+
+
+    call read8bits
+    cp 0x1f         ; check gzip magic numbers
+    jp nz, fail
+    call read8bits
+    cp 0x8b         ; check gzip magic numbers
+    jp nz, fail
+
+    call read8bits
+    cp 0x8          ; method - only type 8 (DEFLATE) is implemented
+    jp nz, fail
+  
+    call read8bits
+    ld d,a          ; flags
+
+    ld a,6          ; mtime, extra_flags, os_type
+    call dropbytes  
+    
+    ld a,d
+    and 0x04
+    call nz, drop_gz_fextra
+    
+    ld a,d                      ; read a again because any of these functions might have changed it
+    and 0x08
+    call nz, drop_gz_fname
+
+    ld a,d
+    and 0x10
+    call nz, drop_gz_fcomment
+
+    ld a,d
+    and 0x02
+    call nz, drop_gz_fhcrc
+
+
+NEW_BLOCK:
+
+    call read1bit   ; last
+    ld (this_was_last_block),a
+    
+    call read2bits   ; blocktype
+    cp 3
+    jp z, fail
+    cp 1
+    jp c, blocktype0
+    jp z, blocktype1
+    jp blocktype2
+    
+
+blocktype0: ; raw block data type
+    call readalign
+    call read8bits
+    ld c,a
+    call read8bits
+    ld b,a
+    
+    
+    ; apparently for some reason, the block length is stored twice (and should match)    
+    call read8bits
+    ld l,a
+    call read8bits
+    ld h,a
+    
+    or a
+    sbc hl,bc
+    ld a,h
+    or l
+    jp nz, fail
+    
+
+    ld de,(interim_dst)
+
+IF 0 == defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)
+
+try_another_page_worth:
+    ld l,e
+    ld h,d
+    add hl,bc
+    ld a,h
+    sub 0x80
+    cp 0x40
+    jr c, fits_in_section
+    
+    ; the area to be copied will fill our section C working area
+
+
+    ld hl, 49152
+    or a
+    sbc hl,de
+    
+    ld a,l
+    ld l,c
+    ld c,a
+    
+    ld a,h
+    ld h,b
+    ld b,a
+    
+    or a
+    sbc hl,bc
+    ld (remaining_copy_length),hl
+        
+    exx
+    push hl
+    exx
+    pop hl      ; address of the data to copy from (guaranteeed that 16k is available)
+
+    ldir
+    
+    push hl
+    exx
+    pop hl  ; store the source pointer back in HL'      - revisit this in a moment to sort out 16k wrapping
+    exx
+    
+    ; now, copy the filled page to the destination address
+
+    ld a,(dst.page)
+    out (lmpr),a
+    
+    ld de,(dst)
+    
+    ld hl,16384     ; number of bytes until the end of this page
+    or a
+    sbc hl,de
+    
+    ld c,l
+    ld b,h
+    
+    ld l,e
+    ld a,d
+    or 0x80
+    ld h,a
+    
+    ldir
+
+    ld hl,0
+    ld (dst),hl
+    ld a,(dst.page)
+    inc a
+    ld (dst.page),a
+    dec a
+    dec a
+    ld (dst.page.minustwo),a
+
+
+    ; now, get the gz source back into low memory
+    exx
+    bit 6,h
+    jr z, no_16k_rollover
+
+    ld a,h
+    and 0x3f
+    ld h,a
+    
+    ld a,(src.page)
+    inc a
+    ld (src.page),a
+
+no_16k_rollover:
+    exx
+
+    ld a,(src.page)
+    out (lmpr),a
+
+    ld de,32768
+
+remaining_copy_length: equ $+1
+    ld bc,0000
+    
+    jp try_another_page_worth
+
+
+fits_in_section:
+ENDIF
+    
+    exx
+    push hl
+    exx
+    pop hl 
+    ldir
+    push hl
+    exx
+    pop hl  ; store the source pointer back in HL'      - revisit this in a moment to sort out 16k wrapping
+    exx
+    ld (interim_dst),de
+    
+    jp END_BLOCK
+    
+    
+blocktype1:    ; static huffman   
+    
+    ld hl,288
+    ld (literals),hl
+    ld a,32
+    ld (distances),a
+    
+    ld hl,codelengths
+    
+    ld b,144
+    ld a,8
+    
+@:  ld (hl),a
+    inc hl
+    djnz @-
+
+    ld b,112
+    ld a,9
+    
+@:  ld (hl),a
+    inc hl
+    djnz @-
+
+    ld b,24
+    ld a,7
+    
+@:  ld (hl),a
+    inc hl
+    djnz @-
+    
+    ld b,8
+    ld a,8
+    
+@:  ld (hl),a
+    inc hl
+    djnz @-
+
+    jp huffman_common
+    
+    
+blocktype2:    ; dynamic huffman   
+    
+    call read5bits  ; HLIT
+    inc a
+    ld l,a
+    ld h,1
+    ld (literals),hl
+    
+    call read5bits  ; HDIST
+    inc a
+    ld (distances),a    
+
+    ; the shape of the huffman tree used to compress this block is presented in a huffman-encoded form
+    ; thus first, we are given the shape of the tree used to describe it.
+    
+    call read4bits
+    add 4
+    ld (code_lengths_length),a
+    
+    
+    ld hl,codelengths
+    ld b,20
+    xor a
+    
+clear_codelengths_loop:
+    ld (hl),a
+    inc hl
+    djnz clear_codelengths_loop
+
+    ld de, code_length_orders
+    ld h,codelengths/256
+        
+code_lengths_length: equ $+1
+    ld b,00
+
+code_lengths_loop:
+    ld a,(de)
+    add codelengths\256
+    ld l,a
+    call read3bits
+    ld (hl),a
+    inc de
+    djnz code_lengths_loop    
+    
+
+    ; create a huffman tree we can use from these code lengths
+    
+    ld bc,19 ; (not code_lengths_length... total number of symbols, including those which may not have been described)
+    ld hl,codelengths
+    ld de,Huffman_Tables_Start
+    
+    call makeHuffmanTable
+    
+    
+    ; now, decode this to find the shape of the "real" huffman table
+    
+    ; first tree contains literals/lengths entries, second contains distances entries
+    
+    
+    
+    ld hl,Huffman_Tables_Start
+    ld de,codelengths
+literals: equ $+1
+    ld bc,0000
+    
+    ld a,(distances)
+    add c
+    ld c,a
+    
+    ld a,b
+    adc 0
+    ld b,a
+    
+        
+    call decodeProtoHuffman
+
+
+
+huffman_common:        
+    ;; now we can create huffman tables from these code lengths
+    
+    ld bc,(literals)
+    ld hl, codelengths
+    ld de,Huffman_Tables_Start
+    
+    call makeHuffmanTable
+
+    ld de,(next_huffman_table_store)
+    ld (Distance_Huffman_Tables_Start),de
+
+    ld hl, codelengths
+    ld bc,(literals)
+    add hl,bc
+distances: equ $+1
+    ld c,00
+    ld b,0
+
+    call makeHuffmanTable
+
+
+
+    ; now we can decode the actual data from the file!
+
+interim_dst: equ $+1
+    ld de,32768     ; not true!
+
+
+Distance_Huffman_Tables_Start: equ $+1
+    ld hl,0000
+
+    ld a,l
+    rra
+    rra
+    ld l,a
+
+    ld (Distance_HuffmanTableBegin),hl
+
+
+    ld hl, Huffman_Tables_Start
+    
+    ld a,l
+    rra
+    rra
+    ld l,a
+
+    ld (HuffmanTableBegin),hl
+
+
+decode_tableloop:
+
+    exx
+    ld a,b
+    exx
+    add a
+    add a
+    ld (decode_tableloop_jr_offset),a
+
+
+
+HuffmanTableBegin: equ $+1
+    ld hl,0000    
+    ld a,l
+    
+decode_tableloop_jr_offset: equ $+1
+    jr $+2
+    jp fail
+    nop
+    jp decode_tableloop_unrolled_0
+    nop
+    jp decode_tableloop_unrolled_7
+    nop
+    jp decode_tableloop_unrolled_6
+    nop
+    jp decode_tableloop_unrolled_5
+    nop
+    jp decode_tableloop_unrolled_4
+    nop
+    jp decode_tableloop_unrolled_3
+    nop
+    jp decode_tableloop_unrolled_2
+    nop
+    jp decode_tableloop_unrolled_1
+ 
+
+UNROLL: equ FOR 8
+
+decode_tableloop_unrolled_{UNROLL}:
+    ; as read1bit, in-lined (can also unroll loop and Duff on b') - returns bit in CARRY FLAG ONLY
+
+        exx
+if (UNROLL > 0)
+        dec b
+        or a
+        rr c
+ELSE        
+        or a
+        rr c
+        
+        ld b,8
+        ld c,(hl)
+        inc hl
+ENDIF    
+        exx
+
+    
+    adc a
+    add a
+    ld l,a
+
+    ld a,(hl)
+    bit 7,a
+    jp z, decoded_symbol
+    
+    inc hl
+    ld h,(hl)
+
+NEXT UNROLL
+    jp decode_tableloop_unrolled_0
+
+decoded_symbol:    
+    or a
+    jr nz, decode_special
+
+
+    inc hl
+  ld a,(hl) ; this is ONLY so we can see value in the debugger
+    ldi     ; copy a byte from hl to de, inc de [we don't care about hl or bc, but ldi is still faster]
+
+IF 0 == defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)
+    bit 6,D
+    jp nz, copy_decoded_page_to_destination
+
+ENDIF
+
+    jp decode_tableloop
+    
+
+end_of_huffman_block:
+
+
+    ld (interim_dst),de
+    jp END_BLOCK
+
+
+decode_special:
+    inc hl
+    ld a,(hl)
+    or a
+    jr z, end_of_huffman_block
+
+
+; thus we have decoded a length code 
+; a few more bits *may* be used to work out exactly how many bytes are repeated
+
+; then a decode from the distance tree will tell us where the sequence is copied from
+
+
+
+    ld hl, lengthcodetable - 4   ; because code offsets start at 1 not 0
+    add a
+    add a
+    add l
+    ld l,a
+    ld a,h
+    adc 0
+    ld h,a
+
+    ld c,(hl)
+    inc hl
+    ld b,(hl)
+    inc hl
+    ld a,(hl)
+    inc hl
+    ld h,(hl)
+    ld l,a
+    ld (@calladdress),hl
+
+@calladdress: equ $+1    
+    call 0000
+
+    add c
+    ld c,a
+    ld a,b
+    adc 0
+    ld b,a
+    
+    ; dictionary lookup length is max 258 bytes
+    ; we can copy the whole thing without checking for page flip if we specify that the
+    ; first 257 bytes of section D may be overwritten
+    ; this means that after copying a page we always jump to a new symbol
+    ; which simplifies things (i.e. never into the middle of a copy)
+    
+
+
+
+
+distance_decode_tableloop:
+
+    exx
+    ld a,b
+    exx
+    add a
+    add a
+    ld (distance_decode_tableloop_jr_offset),a
+
+
+
+Distance_HuffmanTableBegin: equ $+1
+    ld hl,0000    
+    ld a,l
+    
+distance_decode_tableloop_jr_offset: equ $+1
+    jr $+2
+    jp fail
+    nop
+    jp distance_decode_tableloop_unrolled_0
+    nop
+    jp distance_decode_tableloop_unrolled_7
+    nop
+    jp distance_decode_tableloop_unrolled_6
+    nop
+    jp distance_decode_tableloop_unrolled_5
+    nop
+    jp distance_decode_tableloop_unrolled_4
+    nop
+    jp distance_decode_tableloop_unrolled_3
+    nop
+    jp distance_decode_tableloop_unrolled_2
+    nop
+    jp distance_decode_tableloop_unrolled_1
+ 
+
+UNROLL: equ FOR 8
+
+distance_decode_tableloop_unrolled_{UNROLL}:
+    ; as read1bit, in-lined (can also unroll loop and Duff on b') - returns bit in CARRY FLAG ONLY
+
+        exx
+if (UNROLL > 0)
+        dec b
+        or a
+        rr c
+ELSE        
+        or a
+        rr c
+        
+        ld b,8
+        ld c,(hl)
+        inc hl
+ENDIF    
+        exx
+
+    
+    adc a
+    add a
+    ld l,a
+
+    ld a,(hl)
+    bit 7,a
+    jp z, distance_decoded_symbol
+    
+    inc hl
+    ld h,(hl)
+
+NEXT UNROLL
+    jp distance_decode_tableloop_unrolled_0
+
+
+distance_decoded_symbol:    
+
+    inc hl
+    ld a,(hl)
+
+    add a
+    ld l,a ; l = 2x original a
+    add a  ; a = 4x orginal a
+    add l  ;     +
+
+
+    ld hl, distancecodetable 
+    add l
+    ld l,a
+    ld a,h
+    adc 0
+    ld h,a
+
+
+    push de
+
+
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+
+    push de
+    
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    ld (@calladdress1),de
+
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    ld (@calladdress2),de
+
+
+@calladdress1: equ $+1    
+    call 0000
+    ld e,a
+   
+@calladdress2: equ $+1    
+    call 0000
+    ld d,a
+    
+    pop hl
+    
+    add hl,de
+
+    ex de,hl
+    ld hl,0
+    or a
+    sbc hl, de
+
+    pop de
+
+    ; bc is length, hl is 0-distance, de is current write point 
+
+    add hl,de
+    
+    
+IF 0 == defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)   
+    ; page in the real destination page
+dst.page.minustwo: equ $+1    
+    ld a,00
+    out (lmpr),a
+ENDIF
+
+    ldir
+
+IF 0 == defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)   
+src.page: equ $+1    
+    ld a,00
+    out (lmpr),a
+ENDIF
+
+
+IF defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)
+    jp decode_tableloop
+ELSE
+    bit 6,D
+    jp z, decode_tableloop
+
+copy_decoded_page_to_destination:
+
+    ; at this point, section C is full
+    ; we may have written a few bytes into section D - these need to go back into C when the pointers are reset
+    
+    ; at the start of a file, we are writing only partial pages
+        ; (end of file also requires a copy out of C, but that's not here)
+    
+    ld (store_number_of_extra_bytes_written),de     ; save this for later use
+    
+    
+dst.page: equ $+1    
+    ld a,00
+    out (lmpr),a
+
+dst: equ $+1
+    ld de,0
+  
+    ld a,e
+    or d
+    jr z, optimized_whole_page_copy
+
+    ld hl,16384
+    or a
+    sbc hl,de
+    
+    ld c,l
+    ld b,h
+    
+    ld l,e
+    ld a,d
+    or 0x80
+    ld h,a
+    
+    ldir
+    
+    jp finished_page_copy
+
+optimized_whole_page_copy:  
+    ld hl,32768
+    ld de,0
+    xor a
+
+page_copy_loop:    
+    for 64, ldi
+    dec a
+    jp nz, page_copy_loop
+
+
+finished_page_copy:
+    ld hl,0
+    ld (dst),hl
+    ld a,(dst.page)
+    inc a
+    ld (dst.page),a
+    dec a
+    dec a
+    ld (dst.page.minustwo),a
+    
+    
+    ld de,32768
+    
+store_number_of_extra_bytes_written: equ $+1
+    ld bc,0000
+    ld a,b
+    and 0x3f
+    ld b,a
+    or c
+    jr z,no_extra_bytes_written
+
+    ld hl,49152
+    ldir
+
+no_extra_bytes_written:
+
+
+    ; put the gzdata back into low memory
+
+    ; at this point we also need to check if the gzdata pointer needs to be updated
+    ; (i.e. roll page back to section A if it has reached B)
+
+    exx
+    bit 6,h
+    jr z, no_src_rollover
+
+    ld a,h
+    and 0x3f
+    ld h,a
+    
+    ld a,(src.page)
+    inc a
+    ld (src.page),a
+
+no_src_rollover:
+    exx
+
+    ld a,(src.page)
+    out (lmpr),a
+
+
+    jp decode_tableloop
+
+ENDIF
+
+
+
+
+
+; for each length code starting at symbol-257
+; a word describing how many bits to read (function call or NULL)
+; a word describing how many are added to the value read (if any)
+lengthcodetable:
+    dw 3, read0bits
+    dw 4, read0bits
+    dw 5, read0bits
+    dw 6, read0bits
+    dw 7, read0bits
+    dw 8, read0bits
+    dw 9, read0bits
+    dw 10, read0bits
+    dw 11, read1bits
+    dw 13, read1bits
+    dw 15, read1bits
+    dw 17, read1bits
+    dw 19, read2bits
+    dw 23, read2bits
+    dw 27, read2bits
+    dw 31, read2bits
+    dw 35, read3bits
+    dw 43, read3bits
+    dw 51, read3bits
+    dw 59, read3bits
+    dw 67, read4bits
+    dw 83, read4bits
+    dw 99, read4bits
+    dw 115, read4bits
+    dw 131, read5bits
+    dw 163, read5bits
+    dw 195, read5bits
+    dw 227, read5bits
+    dw 258, read0bits
+
+distancecodetable:
+    dw 1, read0bits, read0bits
+    dw 2, read0bits, read0bits
+    dw 3, read0bits, read0bits
+    dw 4, read0bits, read0bits
+    dw 5, read1bits, read0bits
+    dw 7, read1bits, read0bits
+    dw 9, read2bits, read0bits
+    dw 13, read2bits, read0bits
+    dw 17, read3bits, read0bits
+    dw 25, read3bits, read0bits
+    dw 33, read4bits, read0bits
+    dw 49, read4bits, read0bits
+    dw 65, read5bits, read0bits
+    dw 97, read5bits, read0bits
+    dw 129, read6bits, read0bits
+    dw 193, read6bits, read0bits
+    dw 257, read7bits, read0bits
+    dw 385, read7bits, read0bits
+    dw 513, read8bits, read0bits
+    dw 769, read8bits, read0bits
+    dw 1025, read8bits, read1bits
+    dw 1537, read8bits, read1bits
+    dw 2049, read8bits, read2bits
+    dw 3073, read8bits, read2bits
+    dw 4097, read8bits, read3bits
+    dw 6145, read8bits, read3bits
+    dw 8193, read8bits, read4bits
+    dw 12289, read8bits, read4bits
+    dw 16385, read8bits, read5bits
+    dw 24577, read8bits, read5bits
+
+
+
+
+END_BLOCK:
+
+this_was_last_block: equ $+1
+    ld a,00
+    or a
+    jp z, NEW_BLOCK
+    
+    ; copy any remaining bytes from C into the destination page
+    
+IF 0 == defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)
+    
+    
+    ld a,(dst.page)
+    out (lmpr),a
+    
+    ld de,(dst)         ; start of written data (A)
+    
+    ld hl,(interim_dst) ; one past the end of written data (C)
+    
+    or a
+    sbc hl,de
+    
+    ld c,l
+    ld a,h
+    and 0x3f
+    ld b,a
+    or c
+    jr z, no_bytes_to_be_written_in_next_page
+
+    ld l,e
+    ld a,d
+    and 0x3f
+    ld d,a
+    or 0x80
+    ld h,a
+    
+    ldir
+no_bytes_to_be_written_in_next_page:    
+ENDIF    
+    
+exit:
+
+IF 0 == defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)
+inflate_lmprs: equ $+1
+    ld a,00
+    out (lmpr),a
+ENDIF
+
+    xor a
+    ret    
+
+fail:
+IF 0 == defined(INFLATELIB_CONFIG__NO_MEMORY_PAGING)
+    ld a,(inflate_lmprs)
+    out (lmpr),a
+ENDIF
+
+    ld a,1
+    scf
+    ret
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+drop_gz_fextra:
+    push hl
+    push bc
+
+    call read8bits
+    ld l,a
+    call read8bits
+    ld h,a
+    or c
+    jp z,gz_fextra_ret
+
+
+    ld bc,255
+
+gz_fextra_loop:    
+    ld a,h
+    or a
+    jr z, gz_fextra_lastbytes
+    
+    ld a,255
+    call dropbytes
+    
+    or a
+    sbc hl,bc
+    jr gz_fextra_loop
+
+gz_fextra_lastbytes:    
+    ld a,l
+    call dropbytes
+    
+gz_fextra_ret:
+    pop bc
+    pop hl
+    ret
+
+
+
+drop_gz_fname:
+drop_gz_fcomment:
+
+drop_gz_fname_loop:
+    call read8bits
+    or a
+    jr nz, drop_gz_fname_loop
+
+    ret
+
+
+drop_gz_fhcrc:
+    ld a,2
+    call dropbytes
+    ret
+
+
+
+
+
+
+
+dropbytes:
+    or a
+    ret z
+    
+    push bc
+    ld b,a
+dropbytesloop:
+    call read8bits      ; we can optimize this, by fiddling the file pointer
+                        ; but we MUST guarantee that if there are valid bits in c then they are updated to the new file position    
+                        ; since this is not called too often, it's easier to be valid and slow for the time being
+    djnz dropbytesloop
+    pop bc
+    ret
+
+makeHuffmanTable:
+    ; hl points to a table of code lengths
+    ; number of symbols in that table is bc
+    ; de is where the caller want the initial lookup table to be store 
+    ;       (further tables will be stored at incrementing addresses)
+    
+    ; a lookup table will consist of 16 entries 2 bytes each
+    ; 0[7] type  (0=four bits have been decoded, do more lookup / 1=symbol has been decoded
+    ; 0[6]      1 (to confirm initialized)
+    ;           if type==0                      if type==1
+    ; 0[4-5]                                     number of undecoded bits
+    ; 0[0-2]     address of next table/32 MSB    symbol MSB
+    ; 1[0-7]     address of next table/32 LSB    symbol LSB
+
+
+    ld (huffman_number_symbols),bc
+    ld (huffman_code_lengths),hl
+    ld (huffman_table_store),de
+    
+
+    ; 1) Count the number of codes for each code length. Let bl_count[N] be the number of codes of length N, N >= 1.
+
+    ; zero out initial codelength_count
+
+    ld hl,codelength_count
+
+    ld b,18
+clear_codelength_count_loop:
+    ld (hl),0
+    inc hl
+    ld (hl),0
+    inc hl
+    djnz clear_codelength_count_loop
+
+    ; now increment in codelength_count for each length described
+
+huffman_number_symbols: equ $+1
+    ld bc,0000
+
+huffman_code_lengths: equ $+1
+    ld hl,0000
+    
+    ld de,codelength_count
+
+codelength_count_loop:    
+    ld a,(hl)
+    inc hl
+    
+    add a,a         ; rla with guaranteed 0 bit clear
+    ld e,a
+    
+    ld a,(de)
+    inc a
+    ld (de),a
+    or a
+    jr nz, @+
+    inc de
+    ld a,(de)
+    inc a
+    ld (de),a
+@:  dec bc
+    ld a,b
+    or c
+    jr nz, codelength_count_loop
+    
+    ; 2) Find the numerical value of the smallest code for each code length:
+
+    ; bl_count[0] = 0;      // because this is the number of unused codes. We need to ignore this
+    xor a
+    ld e,a
+    ld (de),a
+    inc de
+    ld (de),a
+    
+    ; code = 0;
+    ld e,a
+    ld d,a
+    ld c,a
+
+    ; for (bits = 1; bits <= MAX_BITS; bits++) {
+    ld b,1
+    
+smallest_codes_loop:
+
+    ;     code = (code + bl_count[bits-1]) << 1;
+    ld h, codelength_count/256
+    ld a,b
+    dec a
+    add a,a
+    ld l,a
+    
+    ld a,(hl)
+    add e
+    ld e,a
+    
+    inc hl          ; doesn't change carry bit, so following ADC carries through from previous add
+    ld a,(hl)
+    adc d
+    ld d,a
+    
+    ld a,c
+    adc 0
+    ld c,a
+    
+    rl e
+    rl d
+    rl c
+
+    ;     next_code[bits] = code;    
+    ld h, next_code/256
+    ld a,b
+    rla
+    rla
+    ld l,a
+
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld (hl),c
+    inc hl
+    ld (hl),0
+    
+    ; }
+    inc b
+    ld a,b
+    cp 19
+    
+    jr c, smallest_codes_loop
+    
+    
+
+; 3) Assign numerical values to all codes, using consecutive values for all codes
+; of the same length with the base values determined at step 2. Codes that are never
+; used (which have a bit length of zero) must not be assigned a value.
+
+    ; for (n = 0;  n <= max_code; n++) {
+    
+    ld bc,0
+assign_huffman_codes_loop:
+    
+    ;     len = tree[n].Len;
+
+    ld hl, (huffman_code_lengths)
+    add hl,bc
+    
+    ld a,(hl)
+    
+    ;     if (len != 0) {
+    or a
+    jr z, no_zerolength_code
+    
+    ;         tree[n].Code = next_code[len];
+    rla
+    rla
+    ld l,a
+    ld h,next_code/256
+
+    push hl
+
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    ld a,(hl)
+    
+    
+    ld hl, codes
+    add hl,bc
+    add hl,bc
+    add hl,bc
+    add hl,bc
+
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld (hl),a
+    
+    ;         next_code[len]++;
+
+    pop hl
+    
+    inc e
+    ld (hl),e
+    inc hl
+
+    ld e,a
+    
+    ld a,d
+    adc 0
+    ld (hl),a
+    inc hl
+
+    ld a,e
+    adc 0
+    ld (hl),a
+    
+    ;     }
+no_zerolength_code:
+
+    ; }
+    inc bc
+    
+    ld hl,(huffman_number_symbols)
+    
+    or a
+    sbc hl,bc
+    jr nz, assign_huffman_codes_loop
+    
+
+    
+
+; now rearrange those integers into a format we will find easier to use
+
+    ld hl,(huffman_table_store)
+
+    xor a
+     
+    ld (hl),a
+    inc hl
+    ld (hl),a
+    inc hl
+    ld (hl),a
+    inc hl
+    ld (hl),a
+    inc hl
+    
+    ld (next_huffman_table_store),hl
+
+    ld hl,0
+    ld (huffman_codes_tabulated),hl
+
+
+    ld de,(huffman_codes_tabulated)
+predecode_next_symbol:
+    
+    ld hl,(huffman_code_lengths)
+    
+    add hl,de
+    
+    ld a,(hl)
+    or a
+    jp z, symbol_not_used
+    ld b,a    
+
+    
+    ld hl, codes
+    
+    add hl,de
+    add hl,de
+    add hl,de
+    add hl,de
+    
+    
+    ld d,(hl)
+    inc hl
+    ld c,(hl)
+    inc hl
+    ld a,(hl)
+    
+    rra
+    rr c
+    rr d
+    rra
+    rr c
+    rr d
+    rra
+    
+    ld e,a
+    ; this means that c[7:0], d[7:0], e[7:6] contain exactly 18 bits with c containing most significant bits
+    
+    ; we can consider all the other bits in a consistent manner by shifting left e,d,c
+    ; b is the number of bits actually used by this code
+    
+    ld a,18
+    sub b
+    jr z, no_unused_code_bits
+
+    or a
+discard_unused_code_bits:
+    rl e
+    rl d
+    rl c
+    dec a
+    jr nz, discard_unused_code_bits
+
+no_unused_code_bits:
+
+
+huffman_table_store: equ $+1        ; all codes start parseing at this table
+    ld hl,0000
+
+next_huffman_predecode_bit:
+    ; we now have b bits of a code store in c,d,e
+    ; our current pointer in the table is hl
+    
+    rl e
+    rl d
+    rl c
+    
+    jr nc,@
+    
+    inc hl
+    inc hl
+    
+@:
+    ; so we have chosen a bit path, either write a symbol here or follow/write a new table entry    
+
+    dec b
+    jr z, write_a_symbol_definition    
+
+    ; table redirect
+    
+    ld a,(hl)
+    or a
+    jr z, write_a_table_definition
+    
+    ; follow the table already written
+    
+    inc hl
+    ld h,(hl)
+
+    add a,a     ; we always take the 0 branch here, and add later if necessary
+    add a,a
+    ld l,a
+    
+    jr next_huffman_predecode_bit
+    
+write_a_table_definition:
+
+    push de     ; store while we use more registers
+
+next_huffman_table_store: equ $+1
+    ld de,0000
+    
+    ld a,e
+    rra
+    scf
+    rra
+    ld (hl),a
+    inc hl
+    ld (hl),d
+    
+    ld l,e
+    ld h,d
+    
+    xor a
+    ld (de),a
+    inc de
+    ld (de),a
+    inc de
+    ld (de),a
+    inc de
+    ld (de),a
+    inc de
+
+    ; the address of the bottom four pixels of attribute space in a mode 2 screen at section D
+    ; is 63360 == 0xf780
+    ; it can be useful to avoid these
+
+    ld a,d
+    cp 0xf7
+    jr nz, @
+    ld a,e
+    cp 0x80
+    jr nz, @
+    ld de,0xf800
+    
+@:  ld (next_huffman_table_store),de
+    
+    pop de
+
+    jr next_huffman_predecode_bit
+
+
+write_a_symbol_definition:
+
+huffman_codes_tabulated: equ $+1
+    ld de,0000
+
+    ld (hl),d
+    inc hl
+    ld (hl),e
+    
+
+symbol_not_used:
+    inc de
+    ld (huffman_codes_tabulated),de
+
+    ld hl,(huffman_number_symbols)
+    or a
+    sbc hl,de
+    
+    ld a,h
+    or l
+    jp nz, predecode_next_symbol
+
+    ret
+
+
+
+
+
+decodeProtoHuffman:
+    ; decode bc huffman length codes
+    ; to an area of memory starting at de
+    ; using the huffman table at hl
+    
+    ld a,l
+    rra
+    rra
+    ld l,a
+    ld (ProtoHuffmanTableBegin),hl
+    
+        ; this is called infrequently for small tables
+        ; write it small and simple - the main one can be optimized more for speed
+
+    jr protodecode_tablejump
+
+protodecode_tableloop:
+    inc hl
+    ld h,(hl)
+    ld l,a
+
+protodecode_tablejump:    
+    call read1bit
+    rra
+    
+    ld a,l
+    adc a
+    add a
+    ld l,a
+
+    ld a,(hl)
+    bit 7,a
+    jr nz, protodecode_tableloop
+    
+
+    inc hl
+    ld a,(hl)
+    cp 16
+    jr nc, protodecode_special
+
+    ld (de),a
+    inc de
+    dec bc
+
+protodecode_loop:
+    
+ProtoHuffmanTableBegin: equ $+1
+    ld hl,0000    
+
+    ld a,b
+    or c
+    jr nz, protodecode_tablejump
+    
+    ret
+
+protodecode_special:
+    cp 17
+    jr z, protodecode_17
+    jr nc, protodecode_18
+
+protodecode_16:
+    
+    call read2bits
+    add 3
+    ld h,a
+    
+    dec de
+    ld a,(de)
+    inc de
+    
+@:  ld (de),a
+    inc de
+    dec bc
+    dec h
+    jr nz,@
+
+    jr protodecode_loop
+
+protodecode_17:
+
+    call read3bits
+    add 3
+    ld h,a
+    xor a    
+
+@:  ld (de),a
+    inc de
+    dec bc
+    dec h
+    jr nz,@
+
+    jr protodecode_loop
+
+protodecode_18:
+
+    call read7bits
+    add 11
+    ld h,a
+    xor a    
+
+@:  ld (de),a
+    inc de
+    dec bc
+    dec h
+    jr nz,@
+
+    jr protodecode_loop
+
+
+
+
+; file read routines
+; huffman compression requires that we read partial bytes
+
+; these functions use the alternate registers
+; they will not affect main registers, except to return the result in A
+
+; c' contains unused bits of a byte read from memory
+; b' contains number of bits valid
+; hl' contains pointer to next byte to read
+
+; we read bits LSB first
+; calls for more than one bit expect the partial bytes returned as LSB = LSB
+
+
+read1bit:
+read1bits:
+    exx
+    dec b
+    jr z,@
+    xor a
+    rr c
+    rla
+    exx
+    ret
+@:  xor a
+    rr c
+    rla
+    
+    ld b,8
+    ld c,(hl)
+    inc hl
+
+    exx
+    ret
+
+
+N: equ FOR 9
+if (N >= 2)
+
+
+read{N}bits:
+    exx
+    ld a,b
+    sub N
+    jr c, @l1
+    jr z, @l2
+
+    ld b,a
+
+    ld e,c
+    ld a,c
+
+  IF N <= 4
+    FOR N, rra
+  ELSE
+    FOR 8-N, rlca
+  ENDIF
+
+    and 0xff >> N
+    
+    ld c,a
+    
+    ld a,e
+    and (1<<N)-1
+
+    exx
+    ret
+
+@l2:
+    ld a,c
+
+    ld b,8
+    ld c,(hl)
+    inc hl
+
+    exx
+    ret
+
+@l1: 
+    ld e,c
+    ld d,b
+    
+    ld c,(hl)
+    inc hl
+    
+    ld a,c
+
+@:  add a,a
+    djnz @
+    or e
+    and (1<<N)-1
+    ld e,a
+
+    ld a,N
+    sub d
+    ld b,a
+    
+    ld a,c
+@:  or a
+    rra
+    djnz @
+    ld c,a
+
+    ld a,d
+    sub N
+    add 8
+    ld b,a
+
+    ld a,e
+
+    exx
+    ret
+
+endif
+NEXT N
+
+read0bits:
+    xor a
+    ret
+
+; at the start of type 0 blocks, we throw away spare bits and align reads to byte boundaries
+readalign:
+    exx
+    ld c,(hl)
+    inc hl
+    ld b,8
+    exx
+    ret
+
+
+
+code_length_orders: db 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15    
+
+
+    defm "samflate1.0.0"
+    db 0
+
+
+    print "Code Length", $-START_OF_PROGRAM
+ 
+
+
+; How many of these *really* need to be aligned?
+; need to count them in section D, as there may be many blocks before we finish a page in section C
+
+ds align 256
+codelength_count: ds 36         ; lengths up to 18, 2 bytes per length as (theoretically) there can be >256 symbols per length
+
+ds align 32
+codelengths:  ds 288 + 33  ; single byte per entry, max size of literals tree = 287, of lengths tree = 33
+
+ds align 256
+next_code: ds 128       ; 4 bytes per (32) code length
+
+
+ds align 256
+codes:      ds 288 * 4          ; worst case of 18bits*288 symbols (using 4 bytes per entry for easier code lookup)
+                        ; I'm aware that a maximum of 286 symbols are used - but the static huffman encoding
+                        ; contains space for 288, the last are never used but we need reserve space for them
+
+    DS ALIGN 4
+Huffman_Tables_Start:
+    
+print 65534 - Huffman_Tables_Start + 2, "bytes available for Huffman predecode tables"
+

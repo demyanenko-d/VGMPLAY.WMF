@@ -1,0 +1,25 @@
+; vgmplayer.lk — линкер-скрипт SDCC
+;
+; Плагин занимает окно #8000–#BFFF (16КБ = 0x4000 байт)
+;
+; Размещение:
+;   _CODE    : 0x8000        — код + постоянные данные
+;   _DATA    : после _CODE    — BSS-переменные
+;   _IM2TABLE: 0xBE00        — таблица IM2 (257 байт, ALIGN 256!)
+;                              I = 0xBE; вектор 0xFF → читает [0xBEFF..0xBF00]
+;
+; Предупреждение: менять _IM2TABLE только сохраняя выравнивание по 256!
+
+-mjwx
+-b _CODE = 0x8000
+-b _GSINIT = 0x8000
+-b _GSFINAL = 0x8000
+-b _DATA
+-b _BSS
+-b _INITIALIZED
+-b _INITIALIZER
+-b _IM2TABLE = 0xBE00
+-b _DABS
+-b _CABS
+-l z80
+-e

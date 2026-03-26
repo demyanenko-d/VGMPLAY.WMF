@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>InflateDebugger</RootNamespace>
+    <Nullable>disable</Nullable>
+    <NoWarn>CS8625;CS8618;CS8602;CS8604;CS8600;CS8601</NoWarn>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+</Project>
