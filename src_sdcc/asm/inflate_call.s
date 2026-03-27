@@ -184,7 +184,10 @@ _ifl_scan_loop:
 .endif
 
         ;--- 8. запуск inflate ---
-        jp      0xC000
+        ;    JP 0xC200 = inflate_init (safe zone, survives backref LDIR)
+        ;    НЕ JP 0xC000! Entry zone 0xC000–0xC1FF перезаписывается
+        ;    LDIR overflow при распаковке backref'ов.
+        jp      0xC200
 
         ;--- сюда вернёмся по RET из inflate ---
         ;    A = 0 (ok) / 1 (error)

@@ -108,20 +108,50 @@ lbl:
 
 
 ; ============================================================================
-;  ENTRY POINT  (0xC000) -- runs once, may be overwritten later
+;  ENTRY POINT  (0xC000) -- JP to safe init zone
+;
+;  This 3-byte JP may be overwritten by DEFLATE backref LDIR overflow
+;  (up to 258 bytes past 0xBFFF).  That's fine: by the time the overflow
+;  happens, we've already jumped to init and are deep inside inflate_core.
+;
+;  CRITICAL: on the SECOND call, this JP is STILL needed — the caller
+;  does JP 0xC000 every time.  The backref overflow writes decoded data
+;  bytes here; we MUST ensure they don't corrupt the JP opcode.
+;
+;  Solution: inflate_init lives at 0xC102+ (safe zone), the entry JP
+;  survives because backref LDIR writes at most 258 bytes past 0xBFFF
+;  starting from the current DE.  The overflow only happens when
+;  DE wraps 0xBFFF → 0xC000, writing max 258 bytes (0xC000–0xC101).
+;  Our JP at 0xC000 (3 bytes) IS in the danger zone.
+;
+;  REAL solution: we restore the entry JP from inflate_call.s before
+;  each call, since the inflate binary page is mapped to Win 3.
 ; ============================================================================
 entry:
-        IFDEF DBG_ENABLE
-        ; DBG: 0x0E = very first instruction of inflate entry
-        push    af
-        push    bc
-        ld      a, #0E
-        ld      bc, #FFAF
-        out     (c), a
-        pop     bc
-        pop     af
-        ENDIF
+        jp      inflate_init
 
+; ============================================================================
+;  PADDING — survive DEFLATE backref overflow
+;
+;  During LDIR of a backref copy, DE can advance up to 258 bytes
+;  past 0xBFFF into Win 3 (0xC000+), overwriting inflate code.
+;  inflate_init MUST start at or after 0xC102 to survive.
+;  We place it at 0xC200 for a clean round address.
+; ============================================================================
+        DS #C200 - $, 0
+
+; ============================================================================
+;  INFLATE INIT — safe zone (≥ 0xC102), runs every call
+;
+;  Registers on entry:
+;    A  = source start physical page
+;    E  = destination start physical page
+;    D  = saved Win 2 page (to restore on exit)
+;    SP = safe stack in Win 3 area
+;    Return address already pushed on stack
+; ============================================================================
+inflate_init:
+        ASSERT $ == #C200, "inflate_init must be at exactly 0xC200 (inflate_call.s hardcodes this)"
         ; A = src start page, D = saved pg2, E = dst start page
         ld      (src_page + 1), a
         ld      a, d
@@ -135,38 +165,18 @@ entry:
         ld      hl, 0
         ld      (dst + 1), hl
 
-        ; DBG: 0x0F = stores done, about to remap Win2
-        DBG_OUT #0F
-
         ; Remap Win 2 = decode buffer page
         ld      a, PAGE_DECODE
         OUT_W2
-
-        ; DBG: 0x11 = Win2 remapped to PAGE_DECODE, survived
-        DBG_OUT #11
 
         ; Remap Win 0 = first source page
         ld      a, (src_page + 1)
         OUT_W0
 
-        ; DBG: 0x10 = inflate entry complete, Win0+Win2 remapped
-        DBG_OUT_PAGES #10
-
         ; Source pointer at start of Win 0, decode buffer at 0x8000
         ld      hl, #0000
         ld      de, #8000
-        jp      inflate_core
-
-; ============================================================================
-;  PADDING — survive DEFLATE backref overflow
-;
-;  During LDIR of a backref copy, DE can advance up to 258 bytes
-;  past 0xBFFF into Win 3 (0xC000+), overwriting inflate code.
-;  Entry code above is expendable (runs once).
-;  inflate_core MUST start at or after 0xC102 to survive.
-; ============================================================================
-        ASSERT $ <= #C102, "entry code too large — already past safe zone"
-        DS #C102 - $, 0
+        ; fall through to inflate_core
 
 ; ============================================================================
 ;  INFLATE CORE -- gzip header parse + DEFLATE blocks
