@@ -74,7 +74,7 @@
 
 #include "types.h"
 
-/* ── Коды команд (8 типов, шаг 0x20) ─────────────────────────────── */
+/* ── Коды команд (8 типов, шаг 0x20 + ISR_DONE) ─────────────────── */
 #define CMD_WRITE_AY  0x00  /* AY8910 chip 1: [reg, val, 0]          */
 #define CMD_INC_SEC   0x10  /* Инкрементировать счётчик секунд: [0,0,0]    */
 #define CMD_WRITE_AY2 0x20  /* AY8910 chip 2 (TurboSound): [reg,val,0]*/
@@ -86,6 +86,7 @@
 #define CMD_WRITE_SAA2 0xA0 /* SAA1099 chip 2: [reg, val, 0]         */
 #define CMD_WAIT      0xC0  /* Ждать N ISR-тиков:  [lo,  hi,  0]      */
 #define CMD_END_BUF   0xE0  /* Переключить буфер: [0,   0,   0]      */
+#define CMD_ISR_DONE  0xF0  /* Заморозить ISR, выставить isr_done: [0,0,0] */
 
 /* ── Размер командного буфера ────────────────────────────────────── */
 #define CMD_BUF_SIZE  512   /* байт; 128 команд по 4 байта           */
@@ -123,6 +124,11 @@ extern volatile uint8_t  isr_border_color;
 /** Счётчик секунд воспроизведения.
  *  Инкрементируется ISR по команде CMD_INC_SEC, читается main loop. */
 extern volatile uint16_t isr_play_seconds;
+
+/** Флаг завершения: 1 = ISR заморожен на CMD_ISR_DONE.
+ *  Записывается ISR, читается main loop.
+ *  Main loop очищает при старте воспроизведения. */
+extern volatile uint8_t  isr_done;
 
 /** Командные буферы A и B. Заполняются main loop, читаются ISR. */
 extern uint8_t cmd_buf_a[CMD_BUF_SIZE];

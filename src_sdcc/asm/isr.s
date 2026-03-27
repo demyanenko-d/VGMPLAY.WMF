@@ -33,6 +33,7 @@
         .globl  _isr_border_color
         .globl  _isr_play_seconds
         .globl  _isr_read_ptr
+        .globl  _isr_done
         .globl  _cmd_buf_a
         .globl  _cmd_buf_b
         .globl  _isr_init
@@ -51,7 +52,7 @@ PORT_INTMASK = 0x2AAF
 ; Адрес вектора FRAME INT в IM2-таблице WC (I=#5B, vector=0xFF → #5BFF)
 WC_IM2_VEC = 0x5BFF
 
-; Коды команд (8 типов, шаг 0x20)
+; Коды команд (8 типов, шаг 0x20 + ISR_DONE)
 CMD_WRITE_AY  = 0x00
 CMD_INC_SEC   = 0x10
 CMD_WRITE_AY2 = 0x20
@@ -63,6 +64,7 @@ CMD_WRITE_B1  = 0x80
 CMD_WRITE_SAA2= 0xA0
 CMD_WAIT      = 0xC0
 CMD_END_BUF   = 0xE0
+CMD_ISR_DONE  = 0xF0
 
 ; Порты OPL3
 OPL3_ADDR0 = 0xC4
@@ -268,6 +270,8 @@ _isr_cmd_loop:
         ; Rare commands (before END_BUF fallthrough)
         cp      #CMD_END_BUF
         jp      z, _isr_do_end_buf
+        cp      #CMD_ISR_DONE
+        jp      z, _isr_cmd_done
         cp      #CMD_INC_SEC
         jp      z, _isr_inc_sec
         cp      #CMD_CALL_WC
@@ -285,10 +289,13 @@ _isr_do_end_buf:
         xor     #1
         ld      (_isr_active_buf), a
         jr      nz, _isr_end_use_b
-        ld      de, #_cmd_buf_a
-        jp      _isr_cmd_loop
+        ld      hl, #_cmd_buf_a
+        jr      _isr_end_save_ptr
 _isr_end_use_b:
-        ld      de, #_cmd_buf_b
+        ld      hl, #_cmd_buf_b
+_isr_end_save_ptr:
+        ld      (_isr_read_ptr), hl
+        ex      de, hl
         jp      _isr_cmd_loop
 
 _isr_write_b0:
@@ -330,8 +337,10 @@ _isr_do_wait:
 
 ;--- AY8910 chip 1 write: [reg, val, pad] --------------------------------
 _isr_write_ay:
-        ld      a, (de)             ; reg
         ld      bc, #0xFFFD
+        ld      a, #0xFF            ; select first AY (TurboSound)
+        out     (c), a
+        ld      a, (de)             ; reg
         out     (c), a              ; select AY register
         inc     de
         ld      a, (de)             ; val
@@ -441,6 +450,25 @@ _skip_program:
         ld      (_pos_ptr), hl
         jp      _isr_exit
 
+;--- CMD_ISR_DONE: заморозить ISR, выставить флаг [0,0,0] ------------------
+; ISR зацикливается на этой команде, не переключает буферы.
+; Main loop ждёт isr_done == 1 перед завершением.
+_isr_cmd_done:
+        inc     de
+        inc     de
+        inc     de                  ; пропустить 3 байта параметров
+        ; Выставить флаг готовности к завершению
+        ld      a, #1
+        ld      (_isr_done), a
+        ; Перемотать read_ptr на начало CMD_ISR_DONE (DE - 4)
+        ex      de, hl
+        dec     hl
+        dec     hl
+        dec     hl
+        dec     hl
+        ld      (_isr_read_ptr), hl
+        jp      _isr_exit
+
 ;--- CMD_CALL_WC: вызов оригинального WC handler [0,0,0] ------------------
 ; Внутренняя команда ISR (не используется buffer filler, зарезервировано)
 _isr_call_wc:
@@ -476,6 +504,7 @@ _isr_border_color:: .db 0          ; цвет бордюра при выходе
 _isr_play_seconds:: .dw 0          ; инкрементируется CMD_INC_SEC
 _isr_read_ptr::     .dw 0
 _isr_wait_ctr::     .dw 0
+_isr_done::         .db 0          ; 1 = ISR замер на CMD_ISR_DONE, готов к завершению
 _pos_ptr:           .dw 0          ; инициализируется в isr_init()
 _isr_saved_vec:     .dw 0          ; сохранённый вектор WC (#5BFF)
 

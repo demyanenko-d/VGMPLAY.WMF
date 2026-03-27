@@ -48,6 +48,13 @@ vgm_chip_entry_t vgm_chip_list[VGM_MAX_CHIPS];
 uint16_t vgm_loop_addr;
 uint8_t vgm_loop_page;
 
+/* ── High-level command queue globals ──────────────────────────────── */
+hl_entry_t vgm_hl_queue[HL_QUEUE_MAX];
+uint8_t vgm_hl_len;
+uint8_t vgm_hl_pos;
+uint8_t vgm_hl_abort_pos;
+uint8_t vgm_loop_count;
+
 
 /* ── Аккумулятор остатка задержки (VGM samples, 0..15) ─────────────── */
 static uint16_t vgm_wait_accum = 0;
@@ -72,7 +79,11 @@ static uint16_t vgm_sec_budget = ISR_FREQ;  /* тиков до CMD_INC_SEC  */
 
 
 /* ── Лимит команд между принудительными yield ──────────────────────── */
-#define VGM_FILL_CMD_BUDGET 32u
+/* Вариант v4_b16_hf: step=2560, ISR_FREQ=1367, TPF=28.
+ * Бюджет ISR-тика: 2560 T-states @ 7 МГц.
+ * ИНВАРИАНТ: N_cmds × worst_cmd_T + overhead ≤ step.
+ * build_variants.ps1 переопределяет это значение per-variant.         */
+#define VGM_FILL_CMD_BUDGET 16u
 
 
 /* ── Chip scan table (ROM-const) ────────────────────────────────────── */
@@ -332,12 +343,16 @@ const char *vgm_chip_name(uint8_t id)
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * emit_wait — вставить паузу tk тиков (ISR 2734 Hz)
+ * emit_wait — вставить паузу tk тиков (ISR)
  *
  * Использует два механизма паузы:
- *   CMD_SKIP_TICKS(N)  — N=0..ISR_TICKS_PER_FRAME-1, пауза N+1 тик.  ISR не вызывается
- *                         в промежутке (экономия CPU для main loop).
+ *   CMD_SKIP_TICKS(N)  — N=0..ISR_TICKS_PER_FRAME-1, пауза N+1 тик.
+ *                         ISR не вызывается (экономия CPU for main loop).
  *   CMD_WAIT(val)       — обычная пауза val+1 тик (ISR функционирует).
+ *
+ * ИНВАРИАНТ: значение N для CMD_SKIP_TICKS строго < ISR_TICKS_PER_FRAME.
+ * N ≥ ISR_TICKS_PER_FRAME → полный оборот pos_table → ISR промахивается
+ * мимо своей INT-позиции → каскадный пропуск кадров, падение темпа ×10+.
  *
  * Стратегия:
  *   Для пауз ≤ ISR_TICKS_PER_FRAME: CMD_SKIP_TICKS (1 команда, ISR молчит)
@@ -412,40 +427,45 @@ static void emit_wait(uint8_t *buf, uint16_t *poff, uint16_t tk)
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * vgm_fill_buffer  (OPTIMIZED v4 — CMD_SKIP_TICKS + CMD_INC_SEC)
+ * vgm_fill_buffer  (v5 — HL queue integrated)
+ *
+ * Заполняет один командный буфер ISR целиком (512 байт), управляя
+ * переходами между высокоуровневыми командами (HL queue):
+ *
+ *   HLCMD_CMDBLK  — подключает страницу cmdblocks, парсит VGM-опкоды
+ *                   блока в ISR-команды; при 0x66 переходит к следующей
+ *                   HL-команде и продолжает заполнять ТОТ ЖЕ буфер.
+ *   HLCMD_PLAY    — воспроизводит VGM из мегабуфера; при заполнении
+ *                   буфера сохраняет состояние и выходит; при 0x66
+ *                   переходит дальше по очереди.
+ *   HLCMD_LOOP    — перематывает к loop-точке, морфирует в PLAY.
+ *   HLCMD_ISR_DONE— пишет CMD_ISR_DONE в буфер, выходит досрочно.
+ *
+ * EOF-проверка удалена из горячего цикла — при загрузке в конец
+ * VGM-данных вписывается 0x66-сентинел (см. main.c write_vgm_sentinel).
  * ───────────────────────────────────────────────────────────────────── */
 void vgm_fill_buffer(uint8_t buf_idx)
 {
     uint8_t  *buf;
-    uint8_t  *rp;          /* локальный указатель чтения VGM (#C000-#FFFF) */
-    uint8_t   cpg;         /* локальная копия vgm_cur_page                 */
-    uint8_t   epg;         /* кэш vgm_end_page                             */
-    uint16_t  ead;         /* кэш vgm_end_addr                             */
-    uint16_t  off;         /* смещение записи в cmd_buf (0..508)           */
+    uint8_t  *rp;          /* локальный указатель чтения (#C000-#FFFF) */
+    uint8_t   cpg;         /* локальная копия vgm_cur_page              */
+    uint16_t  off;         /* смещение записи в cmd_buf (0..508)        */
     uint8_t   budget;
-    uint16_t  wacc;        /* аккумулятор остатка задержки (0..15)         */
+    uint16_t  wacc;        /* аккумулятор остатка задержки (0..15)      */
     uint8_t   op, b1, b2;
+    uint8_t   is_vgm;     /* 1 = чтение VGM из мегабуфера, 0 = cmdblk  */
 
-    buf  = buf_idx ? cmd_buf_b : cmd_buf_a;
-    cpg  = vgm_cur_page;
-    rp   = (uint8_t *)vgm_read_ptr;
-    epg  = vgm_end_page;
-    ead  = vgm_end_addr;
-    wacc = vgm_wait_accum;
+    buf = buf_idx ? cmd_buf_b : cmd_buf_a;
+    off = 0;
 
-    /* Восстановить VPL-страницу VGM (UI мог её переключить) */
-    wc_mngcvpl(cpg);
-
-    /* Тишина при паузе или конце */
-    if (vgm_song_ended || vgm_paused)
-    {
-        buf[0] = CMD_SKIP_TICKS; buf[1] = 54; buf[2] = 0; buf[3] = 0;
+    /* Пауза — заполнить тишиной */
+    if (vgm_paused) {
+        buf[0] = CMD_SKIP_TICKS; buf[1] = ISR_TICKS_PER_FRAME - 1; buf[2] = 0; buf[3] = 0;
         buf[4] = CMD_END_BUF;    buf[5] = 0;  buf[6] = 0; buf[7] = 0;
         return;
     }
 
-    budget = VGM_FILL_CMD_BUDGET;
-    off = 0;
+    wacc = vgm_wait_accum;
 
     /* ── Макрос: проверка границы страницы после rp++ ──────────────
      * При inc HL через #FFFF -> #0000 переключаем VPL-страницу.
@@ -454,15 +474,77 @@ void vgm_fill_buffer(uint8_t buf_idx)
     if (!(uint16_t)(rp)) { cpg++; wc_mngcvpl(cpg); rp = (uint8_t *)0xC000; } \
 } while(0)
 
+    /* ═══════════════════════════════════════════════════════════════
+     * next_hl — диспетчер высокоуровневых команд
+     * Вызывается при входе и при каждом 0x66 (конец блока/файла).
+     * НЕ выходит из функции — продолжает заполнять тот же буфер.
+     * ═══════════════════════════════════════════════════════════════ */
+next_hl:
+    if (vgm_hl_pos >= vgm_hl_len) {
+        /* Очередь исчерпана — заполнить остаток тишиной */
+        if (off == 0) {
+            buf[0] = CMD_SKIP_TICKS; buf[1] = ISR_TICKS_PER_FRAME - 1; buf[2] = 0; buf[3] = 0;
+            off = 4;
+        }
+        goto finish;
+    }
+
+    {
+        hl_entry_t *e = &vgm_hl_queue[vgm_hl_pos];
+
+        switch (e->cmd) {
+
+        case HLCMD_CMDBLK:
+            /* Подключить страницу cmdblocks, найти адрес блока */
+            wc_mngc_pl(CMDBLK_PAGE);
+            rp  = (uint8_t *)((const uint16_t *)0xC000)[e->param];
+            cpg = 0;       /* не используется для cmdblk, PAGE_CHK не сработает */
+            is_vgm = 0;
+            break;
+
+        case HLCMD_PLAY:
+            cpg  = vgm_cur_page;
+            rp   = (uint8_t *)vgm_read_ptr;
+            wc_mngcvpl(cpg);
+            is_vgm = 1;
+            break;
+
+        case HLCMD_LOOP:
+            if (!vgm_rewind_to_loop()) {
+                /* Нет loop-точки — пропустить */
+                vgm_hl_pos++;
+                goto next_hl;
+            }
+            vgm_loop_count++;
+            e->cmd = HLCMD_PLAY;   /* морфируем, чтобы не перематывать снова */
+            cpg  = vgm_cur_page;
+            rp   = (uint8_t *)vgm_read_ptr;
+            wacc = vgm_wait_accum;
+            wc_mngcvpl(cpg);
+            is_vgm = 1;
+            break;
+
+        case HLCMD_ISR_DONE:
+            buf[off] = CMD_ISR_DONE;
+            buf[off+1] = 0; buf[off+2] = 0; buf[off+3] = 0;
+            off += 4;
+            vgm_hl_pos++;
+            goto finish;
+
+        default:
+            vgm_hl_pos++;
+            goto next_hl;
+        }
+    }
+
+    budget = VGM_FILL_CMD_BUDGET;
+
+    /* ═══════════════════════════════════════════════════════════════
+     * Горячий цикл — разбор VGM-опкодов → ISR-команды
+     * EOF-проверка удалена (гарантирован 0x66-сентинел в данных).
+     * ═══════════════════════════════════════════════════════════════ */
     while (off < (CMD_BUF_SIZE - 48))
     {
-        /* ── Конец данных? ─────────────────────────────────────── */
-        if (cpg > epg || (cpg == epg && (uint16_t)rp >= ead))
-        {
-            vgm_song_ended = 1;
-            break;
-        }
-
         /* ── Читаем опкод ──────────────────────────────────────── */
         op = *rp++; PAGE_CHK();
 
@@ -720,8 +802,15 @@ void vgm_fill_buffer(uint8_t buf_idx)
         /* ═══════ End of data (0x66) ═══════ */
         if (op == 0x66)
         {
-            vgm_song_ended = 1;
-            break;
+            if (is_vgm) {
+                vgm_song_ended = 1;
+                /* Сохранить VGM-состояние (rp уже за 0x66) */
+                vgm_cur_page   = cpg;
+                vgm_read_ptr   = (uint16_t)rp;
+                vgm_wait_accum = wacc;
+            }
+            vgm_hl_pos++;
+            goto next_hl;   /* продолжить заполнение из следующей HL-команды */
         }
 
         /* ═══════ Data block (0x67) — rare ═══════ */
@@ -791,12 +880,21 @@ void vgm_fill_buffer(uint8_t buf_idx)
 
 #undef PAGE_CHK
 
-    /* Записать состояние обратно в глобалы */
-    vgm_cur_page    = cpg;
-    vgm_read_ptr    = (uint16_t)rp;
-    vgm_wait_accum  = wacc;
+    /* Буфер заполнен — сохранить VGM-состояние если читали файл */
+    if (is_vgm) {
+        vgm_cur_page    = cpg;
+        vgm_read_ptr    = (uint16_t)rp;
+        vgm_wait_accum  = wacc;
+    }
 
-    /* Завершить буфер */
+finish:
+    /* Принудительная пауза перед CMD_END_BUF — гарантирует, что ISR
+     * не обработает хвост этого буфера + голову следующего за один тик
+     * (иначе пропуск INT-позиции и падение темпа в десятки раз).       */
+    buf[off] = CMD_SKIP_TICKS;
+    buf[off + 1] = 0; buf[off + 2] = 0; buf[off + 3] = 0;
+    off += 4;
+
     buf[off] = CMD_END_BUF;
     buf[off + 1] = 0; buf[off + 2] = 0; buf[off + 3] = 0;
 }

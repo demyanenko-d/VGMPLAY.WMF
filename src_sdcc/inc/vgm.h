@@ -250,6 +250,44 @@ void vgm_parse_gd3(void);
  */
 const char *vgm_chip_name(uint8_t id);
 
+/* ─── VGM-format command blocks (cmdblocks page) ────────────────── */
+
+/** Plugin page containing VGM-format command blocks */
+#define CMDBLK_PAGE         5
+
+/** Block indices in the pointer table at 0xC000 */
+#define CMDBLK_INIT_OPL3    0   /* OPL3 init: NEW=1, wavesel          */
+#define CMDBLK_INIT_OPL2    1   /* OPL2 compat: NEW=0, wavesel        */
+#define CMDBLK_SILENCE_OPL  2   /* OPL3 silence: Key Off + TL max     */
+#define CMDBLK_SILENCE_AY   3   /* AY chip 1: mixer off, vol=0        */
+#define CMDBLK_SILENCE_AY2  4   /* AY chip 2 (TS): mixer off, vol=0   */
+#define CMDBLK_SILENCE_SAA  5   /* SAA1099 chip 1: reset + amp=0      */
+#define CMDBLK_SILENCE_SAA2 6   /* SAA1099 chip 2: reset + amp=0      */
+#define CMDBLK_SAA_CLK_ON   7   /* MultiSound: SAA clock enable       */
+#define CMDBLK_SAA_CLK_OFF  8   /* MultiSound: SAA clock disable      */
+#define CMDBLK_SILENCE_YM2203   9 /* YM2203 chip 1: SSG+FM silence      */
+#define CMDBLK_SILENCE_YM2203_2 10 /* YM2203 chip 2 (TS): SSG+FM silence */
+
+/* ─── High-level command queue (HL queue) ───────────────────────── */
+
+/** HL command types */
+#define HLCMD_CMDBLK    1   /* Execute VGM-format cmdblock (param = CMDBLK_xxx) */
+#define HLCMD_PLAY      2   /* Play VGM from current position until 0x66        */
+#define HLCMD_LOOP      3   /* Rewind to loop point, then play (morphs→PLAY)    */
+#define HLCMD_ISR_DONE  4   /* Emit CMD_ISR_DONE in buffer, ISR freezes         */
+
+#define HL_QUEUE_MAX 16
+
+typedef struct { uint8_t cmd, param; } hl_entry_t;
+
+/** HL queue globals — written by main.c (build_playback_queue),
+ *  consumed inside vgm_fill_buffer(). */
+extern hl_entry_t vgm_hl_queue[HL_QUEUE_MAX];
+extern uint8_t vgm_hl_len;        /* total entries              */
+extern uint8_t vgm_hl_pos;        /* current entry              */
+extern uint8_t vgm_hl_abort_pos;  /* jump-to on user abort      */
+extern uint8_t vgm_loop_count;    /* incremented on each LOOP   */
+
 /* ─── VGZ (gzip-сжатый VGM) ─────────────────────────────────────── */
 
 /**

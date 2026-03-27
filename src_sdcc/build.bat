@@ -38,12 +38,20 @@ echo [2/8] Генерация freq_tables.bin...
 node scripts\gen_freq_tables.js --page-base 1 --binary build\freq_tables.bin --cheader inc\freq_lut_map.h
 if errorlevel 1 ( echo FAIL gen_freq_tables && goto :err )
 
-echo [3/8] Сборка inflate.asm (sjasmplus)...
+echo [3/9] Сборка inflate.asm (sjasmplus)...
 ..\tools\sjasm\sjasmplus.exe asm\inflate.asm >nul 2>&1
 if errorlevel 1 ( echo FAIL inflate.asm && goto :err )
 REM inflate.asm имеет SAVEBIN "build/inflate.bin" внутри
+REM Паддинг inflate.bin до 16KB (чтобы cmdblocks.bin начинался на границе страницы)
+powershell -NoProfile -Command "$f=[IO.File]::ReadAllBytes('build\inflate.bin'); if($f.Length -lt 16384){$pad=New-Object byte[] (16384-$f.Length); [IO.File]::WriteAllBytes('build\inflate.bin',$f+$pad); Write-Host ('  inflate.bin padded: '+$f.Length+' -> 16384')}"
+if errorlevel 1 ( echo FAIL pad inflate && goto :err )
 
-echo [4/8] Компиляция C файлов...
+echo [3b/9] Сборка cmdblocks.asm (sjasmplus)...
+..\tools\sjasm\sjasmplus.exe asm\cmdblocks.asm >nul 2>&1
+if errorlevel 1 ( echo FAIL cmdblocks.asm && goto :err )
+REM cmdblocks.asm имеет SAVEBIN "build/cmdblocks.bin" внутри
+
+echo [4/9] Компиляция C файлов...
 sdcc %CFLAGS% -c main.c         -o build\main.rel    >nul
 if errorlevel 1 ( echo FAIL main.c && goto :err )
 
@@ -55,7 +63,7 @@ if errorlevel 1 ( echo FAIL keys.c && goto :err )
 
 REM txtlib is now hand-written assembly (asm\txtlib.s), assembled below
 
-echo [5/8] Сборка ASM файлов...
+echo [5/9] Сборка ASM файлов...
 sdasz80 %ASFLAGS% build\crt0.rel    asm\crt0.s      >nul
 if errorlevel 1 ( echo FAIL crt0.s && goto :err )
 
@@ -77,7 +85,7 @@ if errorlevel 1 ( echo FAIL txtlib.s && goto :err )
 sdasz80 %ASFLAGS% build\inflate_call.rel asm\inflate_call.s >nul
 if errorlevel 1 ( echo FAIL inflate_call.s && goto :err )
 
-echo [6/8] Линковка...
+echo [6/9] Линковка...
 REM Порядок важен: crt0 первым (entry point), затем модули
 REM Layout: CODE #8000–#B83F, DATA #B8A0–#BFFF
 REM   Все секции (DATA + GSINIT + HOME + INITIALIZER) должны
@@ -120,15 +128,18 @@ powershell -NoProfile -Command ^
   "if($lastEnd -ge 0xC000){Write-Host '  *** ERROR: sections overflow past 0xBFFF! ***' -ForegroundColor Red; exit 1}"
 if errorlevel 1 goto :err
 
-echo [7/8] Генерация WMF (multi-page)...
-REM Склеить freq_tables.bin + inflate.bin в один extra blob
-copy /b build\freq_tables.bin+build\inflate.bin build\extra_combined.bin >nul
+echo [7/9] Генерация WMF (multi-page)...
+REM Склеить freq_tables.bin + inflate.bin + cmdblocks.bin в один extra blob
+copy /b build\freq_tables.bin+build\inflate.bin+build\cmdblocks.bin build\extra_combined.bin >nul
 if errorlevel 1 ( echo FAIL combine extra && goto :err )
 node scripts\ihx2wmf.js build\vgmplay.ihx ..\DiskRef\WC\VGMPLAY.WMF --extra build\extra_combined.bin
 if errorlevel 1 ( echo FAIL ihx2wmf && goto :err )
 copy /Y ..\DiskRef\WC\VGMPLAY.WMF ..\VGMPLAY.WMF >nul
 
-echo [8/8] Сборка образа диска...
+echo [8/9] Проверка размеров binary...
+powershell -NoProfile -Command "Get-ChildItem build\*.bin | Select-Object Name, Length | Format-Table -AutoSize"
+
+echo [9/9] Сборка образа диска...
 if not exist "..\tools\robimg.exe" (
     echo   SKIP: tools\robimg.exe не найден
     goto :ok

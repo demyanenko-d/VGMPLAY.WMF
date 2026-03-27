@@ -8,12 +8,10 @@
  * Функции:
  *   - Отображение метаданных (GD3: автор, игра, трек, система)
  *   - Воспроизведение с двойной буферизацией (ISR 1367 Гц)
- *   - Автоматический фейд-аут перед концом трека
- *   - Ручной выход с 0.32s фейдом (Q / ESC)
  *   - OPL3: NEW=1 (L/R через C0-C8); OPL1/OPL2: NEW=0 (compat mode)
  *
  * Управление:
- *   ESC / Q  — выход (с фейдом)
+ *   ESC / Q  — выход
  *   N        — следующий файл в каталоге
  *   P        — предыдущий файл
  */
@@ -25,7 +23,6 @@
 #include "inc/vgm.h"
 #include "inc/isr.h"
 #include "inc/keys.h"
-#include "inc/opl3.h"
 #include <string.h>
 
 /* ── Бордюр-отладка ─────────────────────────────────────────────────── */
@@ -72,103 +69,26 @@ static void dbg_trace2(uint8_t code, uint8_t d1, uint8_t d2) {
 #define dbg_trace(code)            ((void)0)
 #define dbg_trace2(code, d1, d2)   ((void)0)
 #endif
-/* ── SAA1099 clock (MultiSound) ──────────────────────────────── */
-/* MultiSound перехватывает выбор регистров 0xF0-0xFF в YM2149.
- * Младшие 4 бита номера регистра (top.v):
- *   bit 0 — выбор чипа YM (0=YM1, 1=YM2)
- *   bit 1 — 0=чтение статуса YM2203, 1=normal
- *   bit 2 — 0=FM ON (Z/pullup), 1=FM OFF
- *   bit 3 — 0=SAA1099 clock ON,  1=SAA1099 clock OFF
- */
-static void saa_clock_on(void) {
-    __asm
-        ld   bc, #0xFFFD
-        ld   a, #0xF3        ; 0xF3: bit0=1(YM2), bit1=1(normal), bit2=0(FM ON), bit3=0(SAA ON)
-        out  (c), a
-    __endasm;
-}
 
-static void saa_clock_off(void) {
-    __asm
-        ld   bc, #0xFFFD
-        ld   a, #0xFF        ; 0xFF: bit2=1(FM OFF), bit3=1(SAA OFF)
-        out  (c), a
-    __endasm;
-}
-/* ── Тишина чипов ────────────────────────────────────────────────────── */
-/* Обход vgm_chip_list[] — гасим все обнаруженные чипы при stop_playback.
- * ay_silence / ay2_silence / saa_silence / saa2_silence — в asm/opl3.s  */
-
-static void silence_chips(void)
-{
-    for (uint8_t i = 0; i < vgm_chip_count; i++) {
-        uint8_t id = vgm_chip_list[i].id;
-        uint8_t dual = vgm_chip_list[i].flags & VGM_CF_DUAL;
-
-        switch (id) {
-        case VGM_OFF_AY8910:
-        case VGM_OFF_YM2203:
-            ay_silence();
-            if (dual) ay2_silence();
-            break;
-
-        case VGM_OFF_YM3526:
-        case VGM_OFF_YM3812:
-        case VGM_OFF_Y8950:
-        case VGM_OFF_YMF262:
-        case VGM_OFF_YMF278B:
-            opl3_reset();
-            break;
-
-        case VGM_OFF_SAA1099:
-            saa_silence();
-            if (dual) saa2_silence();
-            break;
-
-        default:
-            break;
-        }
-    }
-}
-
-/* ── OPL3 operator offset table ─────────────────────────────────── */
-/* OPL3 operators are not contiguous: 0x00-0x05, 0x08-0x0D, 0x10-0x15 */
-static const uint8_t opl3_op_offsets[] = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
-    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15
-};
-#define OPL3_NUM_OPS 18
-
-/* ── Фейд-параметры ─────────────────────────────────────────────────── */
-/* FADE_STEPS / FADE_INTERVAL — для ручного выхода (Q/ESC).
- * AUTOFADE — для автоматического затухания перед концом трека.         */
-#define FADE_STEPS    16
-#define FADE_INTERVAL 1     /* кадров между шагами (1 × 20ms = 20ms) */
-
-static void wait_frames(uint8_t n)
-{
-    while (n--) {
-        uint8_t t0 = isr_tick_ctr;
-        while ((uint8_t)(isr_tick_ctr - t0) < ISR_TICKS_PER_FRAME)
-            ;
-    }
-}
-
-/* ── Кешированные флаги активных чипов (для фейда) ────────────────── */
+/* ── Кешированные флаги активных чипов ────────────────────────────── */
 static uint8_t s_has_opl, s_has_ay, s_has_ay2;
 static uint8_t s_has_saa, s_has_saa2;
+static uint8_t s_has_ym2203, s_has_ym2203_2;
 
 static void detect_active_chips(void)
 {
     s_has_opl = s_has_ay = s_has_ay2 = 0;
     s_has_saa = s_has_saa2 = 0;
+    s_has_ym2203 = s_has_ym2203_2 = 0;
     for (uint8_t i = 0; i < vgm_chip_count; i++) {
         uint8_t id = vgm_chip_list[i].id;
         uint8_t dual = vgm_chip_list[i].flags & VGM_CF_DUAL;
         switch (id) {
-        case VGM_OFF_AY8910:
         case VGM_OFF_YM2203:
+            s_has_ym2203 = 1;
+            if (dual) s_has_ym2203_2 = 1;
+            /* fallthrough */
+        case VGM_OFF_AY8910:
             s_has_ay = 1;
             if (dual) s_has_ay2 = 1;
             break;
@@ -189,124 +109,67 @@ static void detect_active_chips(void)
     }
 }
 
-/* Применить один шаг затухания (0..15) ко всем активным чипам.
- * Работает при включённом ISR — не останавливает воспроизведение. */
-static void apply_fade_step(uint8_t step)
-{
-    if (s_has_opl) {
-        uint8_t tl = (uint8_t)(step << 2);  /* 0,4,8,...60 */
-        if (tl > 0x3F) tl = 0x3F;
-        for (uint8_t op = 0; op < OPL3_NUM_OPS; op++) {
-            uint8_t reg = 0x40 + opl3_op_offsets[op];
-            opl3_write_b0(reg, tl);
-            opl3_write_b1(reg, tl);
-        }
-    }
-    if (s_has_ay) {
-        uint8_t vol = step >= 15 ? 0 : (uint8_t)(15 - step);
-        ay_write_reg(8, vol);
-        ay_write_reg(9, vol);
-        ay_write_reg(10, vol);
-    }
-    if (s_has_ay2) {
-        uint8_t vol = step >= 15 ? 0 : (uint8_t)(15 - step);
-        ay2_write_reg(8, vol);
-        ay2_write_reg(9, vol);
-        ay2_write_reg(10, vol);
-    }
-    if (s_has_saa) {
-        uint8_t amp = step >= 15 ? 0 : (uint8_t)((15 - step) * 0x11);
-        for (uint8_t r = 0; r < 6; r++)
-            saa_write_reg(r, amp);
-    }
-    if (s_has_saa2) {
-        uint8_t amp = step >= 15 ? 0 : (uint8_t)((15 - step) * 0x11);
-        for (uint8_t r = 0; r < 6; r++)
-            saa2_write_reg(r, amp);
-    }
-}
-
-/* Быстрый фейд для ручного выхода (Q/ESC): останавливает ISR,
- * гасит за 16 × 20ms = 0.32 сек + 0.5 сек тишина */
-static void fade_out_chips(void)
-{
-    isr_enabled = 0;
-    for (uint8_t step = 0; step < FADE_STEPS; step++) {
-        apply_fade_step(step);
-        wait_frames(FADE_INTERVAL);
-    }
-    silence_chips();
-    wait_frames(25);
-}
-
-/* ── Автофейд перед концом трека ─────────────────────────────────────
- * Вычисляем полную длительность: total_samples + max_loops * loop_samples.
- * Начинаем фейд за 1 секунду до конца (ISR продолжает играть).
- * 16 шагов по 2 кадра = 32 кадра = 0.64 сек плавного затухания.      */
-static uint16_t s_total_play_sec;
-static uint16_t s_fade_start_sec;
-static uint8_t  s_auto_fading;
-static uint8_t  s_auto_fade_step;
-static uint8_t  s_auto_fade_frame;
-static uint8_t  s_auto_fade_done;
-
 #define MAX_LOOP_REWINDS 2
 
-static void compute_play_duration(void)
+/* ── HL queue helpers ────────────────────────────────────────────────
+ * The queue itself and its state live in vgm.c (vgm_hl_queue etc.)
+ * vgm_fill_buffer() reads them internally; main.c only builds
+ * the queue and sets vgm_hl_pos on abort (ESC/N/P).               */
+
+static void hl_push(uint8_t cmd, uint8_t param)
 {
-    uint32_t total_samples, loop_samples;
-    uint16_t total_sec, loop_sec;
-
-    /* Читаем из VGM-заголовка (страница 0 должна быть доступна) */
-    wc_mngcvpl(0);
-    {
-        total_samples = *(volatile uint32_t *)(0xC000 + 0x18);
-        loop_samples  = *(volatile uint32_t *)(0xC000 + 0x20);
+    if (vgm_hl_len < HL_QUEUE_MAX) {
+        vgm_hl_queue[vgm_hl_len].cmd = cmd;
+        vgm_hl_queue[vgm_hl_len].param = param;
+        vgm_hl_len++;
     }
-    wc_mngcvpl(vgm_cur_page);
-
-    total_sec = (uint16_t)(total_samples / 44100UL);
-    loop_sec  = (uint16_t)(loop_samples  / 44100UL);
-
-    if (vgm_loop_addr && loop_sec) {
-        s_total_play_sec = total_sec + MAX_LOOP_REWINDS * loop_sec;
-    } else {
-        s_total_play_sec = total_sec;
-    }
-
-    /* Начать фейд за 1 секунду до конца */
-    s_fade_start_sec = (s_total_play_sec > 1) ? (s_total_play_sec - 1) : 0;
-    s_auto_fading = 0;
-    s_auto_fade_step = 0;
-    s_auto_fade_frame = 0;
-    s_auto_fade_done = 0;
 }
 
-/* Вызывается каждый кадр (50 Гц) из главного цикла */
-static void update_auto_fade(void)
+/* ── Build the playback queue based on detected chips / loop info ─── */
+static void build_playback_queue(void)
 {
-    if (s_auto_fade_done || !s_fade_start_sec)
-        return;
+    vgm_hl_len = 0;
 
-    if (!s_auto_fading) {
-        if (isr_play_seconds >= s_fade_start_sec)
-            s_auto_fading = 1;
-        else
-            return;
+    /* Init phase: enable clocks + chip init */
+    if (s_has_saa || s_has_saa2)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_ON);
+    if (s_has_opl)
+        hl_push(HLCMD_CMDBLK,
+                (vgm_chip_type == VGM_CHIP_OPL3) ? CMDBLK_INIT_OPL3
+                                                  : CMDBLK_INIT_OPL2);
+
+    /* Main playback */
+    hl_push(HLCMD_PLAY, 0);
+
+    /* Loop repeats (if the VGM has a loop point) */
+    if (vgm_loop_addr) {
+        for (uint8_t i = 0; i < MAX_LOOP_REWINDS; i++)
+            hl_push(HLCMD_LOOP, 0);
     }
 
-    if (s_auto_fade_step >= FADE_STEPS) {
-        s_auto_fade_done = 1;
-        return;
-    }
+    /* ── Shutdown sequence (abort target) ──────────────────────── */
+    vgm_hl_abort_pos = vgm_hl_len;
 
-    /* 2 кадра на шаг → 32 кадра = 0.64 сек плавного затухания */
-    s_auto_fade_frame++;
-    if (s_auto_fade_frame >= 2) {
-        s_auto_fade_frame = 0;
-        apply_fade_step(s_auto_fade_step);
-        s_auto_fade_step++;
-    }
+    if (s_has_opl)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_OPL);
+    if (s_has_ym2203)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_YM2203);
+    else if (s_has_ay)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_AY);
+    if (s_has_ym2203_2)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_YM2203_2);
+    else if (s_has_ay2)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_AY2);
+    if (s_has_saa)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_SAA);
+    if (s_has_saa2)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_SAA2);
+    if (s_has_saa || s_has_saa2)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_OFF);
+
+    hl_push(HLCMD_ISR_DONE, 0);
+
+    vgm_hl_pos = 0;
 }
 
 /* ── Размеры и цвета окна ───────────────────────────────────────────── */
@@ -325,7 +188,6 @@ static uint8_t pbinfo_start_row;
 static uint8_t s_playback_inited = 0;
 static uint8_t s_last_active_buf = 0;
 static uint8_t s_buf_ready[2] = {0, 0};
-static uint8_t s_loop_count = 0;
 static uint8_t s_last_loop_count = 0;
 static uint16_t s_last_displayed_sec = 0xFFFF;  /* форсить первую отрисовку */
 
@@ -660,48 +522,33 @@ uint8_t load_vgm(void)
 
 void start_playback(void)
 {
-
-
     ints_disable();
 
     vgm_paused = 0;
 
-    /* Первый запуск: инициализируем ISR, сбрасываем счётчик и заранее
-       заполняем оба буфера, чтобы ISR не увидел пустой буфер. */
     if (!s_playback_inited)
     {
         s_playback_inited = 1;
 
-        /* Сброс секунд (ISR считает через CMD_INC_SEC) */
+        /* Сброс счётчиков */
         isr_play_seconds = 0;
         s_last_displayed_sec = 0xFFFF;
-        s_loop_count = 0;
+        vgm_loop_count = 0;
 
         /* ISR-состояние */
         isr_active_buf = 0;
         isr_wait_ctr = 0;
+        isr_done = 0;
+
+        /* Build HL command queue for this track */
+        build_playback_queue();
 
         /* Инициализация IM2: перехват вектора WC #5BFF */
         isr_init();
 
-        /* Инициализация OPL: opl3_init() всегда включает OPL3 mode (NEW=1).
-         * Для OPL2/OPL1 файлов сбрасываем NEW=0 (режим совместимости):
-         *   - чип автоматически выводит звук на оба канала
-         *   - биты L/R в C0-C8 игнорируются
-         * Для OPL3 файлов оставляем NEW=1 — L/R управляются из VGM. */
-        opl3_init();
-        if (vgm_chip_type != VGM_CHIP_OPL3) {
-            opl3_write_b1(0x05, 0x00);  /* NEW=0: OPL2 compat mode */
-        }
-
-        /* Включить частоту SAA1099 (если MultiSound) */
-        saa_clock_on();
-
-        /* Сброс VGM runtime уже должен быть сделан parse_header().
-           Здесь только заливаем первые два буфера. */
-        s_buf_ready[0] = 0;
-        s_buf_ready[1] = 0;
-
+        /* Fill both buffers from the HL queue.
+         * vgm_fill_buffer handles HL transitions internally —
+         * init cmdblocks + start of VGM data may all go in buf 0. */
         vgm_fill_buffer(0);
         s_buf_ready[0] = 1;
 
@@ -717,30 +564,22 @@ void start_playback(void)
 
 void stop_playback(void)
 {
-    if (s_playback_inited) {
-        if (s_auto_fade_done) {
-            /* Автофейд уже завершён — просто останавливаем */
-            isr_enabled = 0;
-            silence_chips();
-        } else {
-            /* Ручной выход — быстрый фейд + тишина */
-            fade_out_chips();
-        }
-
+    if (!s_playback_inited) {
         ints_disable();
-        saa_clock_off();
-        isr_deinit();   /* восстановить вектор WC (DI уже сделан) */
-    } else {
-        ints_disable();
+        ints_enable();
+        return;
     }
 
+    ints_disable();
     isr_enabled = 0;
-    vgm_paused = 0;
+    isr_deinit();   /* восстановить вектор WC */
 
+    vgm_paused = 0;
     s_playback_inited = 0;
     s_buf_ready[0] = 0;
     s_buf_ready[1] = 0;
     s_last_active_buf = 0;
+    isr_done = 0;
 
     ints_enable();
 }
@@ -750,13 +589,7 @@ void update_buffer(void)
     uint8_t active;
     uint8_t free_idx;
 
-    if (!s_playback_inited)
-        return;
-
-    if (!isr_enabled)
-        return;
-
-    if (state != STATE_PLAYBACK)
+    if (!s_playback_inited || !isr_enabled || isr_done)
         return;
 
     active = (uint8_t)(isr_active_buf & 1U);
@@ -771,29 +604,18 @@ void update_buffer(void)
     /* Всегда держим готовым неактивный буфер */
     free_idx = (uint8_t)(active ^ 1U);
 
-    if (!s_buf_ready[free_idx])
-    {
-        /* Конец трека → перемотка на loop (макс. MAX_LOOP_REWINDS раз) или stop */
-        if (vgm_song_ended)
-        {
-            if (s_loop_count < MAX_LOOP_REWINDS && vgm_rewind_to_loop())
-                s_loop_count++;
-            else
-                return;            /* song finished — silence plays */
-        }
+    if (s_buf_ready[free_idx])
+        return;
 
-        /* DEBUG: red border while fill_buffer works;
-           ISR will restore this color on every exit */
-        isr_border_color = 2;
-        border(2);
+    /* Fill the free buffer — vgm_fill_buffer handles HL transitions */
+    isr_border_color = 2;
+    border(2);
 
-        vgm_fill_buffer(free_idx);
-        s_buf_ready[free_idx] = 1;
+    vgm_fill_buffer(free_idx);
+    s_buf_ready[free_idx] = 1;
 
-        /* DEBUG: back to black */
-        isr_border_color = 0;
-        border(0);
-    }
+    isr_border_color = 0;
+    border(0);
 }
 
 void update_playback_info(void)
@@ -807,10 +629,10 @@ void update_playback_info(void)
 
     /* Перерисовывать только при смене секунд или loop —
        сокращает вызовы WC API с 50/сек до 1-2/сек */
-    if (sec == s_last_displayed_sec && s_loop_count == s_last_loop_count)
+    if (sec == s_last_displayed_sec && vgm_loop_count == s_last_loop_count)
         return;
     s_last_displayed_sec = sec;
-    s_last_loop_count = s_loop_count;
+    s_last_loop_count = vgm_loop_count;
 
     buf_clear(work_buf);
     buf_append_str(work_buf, "Playing  ");
@@ -820,7 +642,7 @@ void update_playback_info(void)
 
     /* Всегда показываем номер прохода (1 = первый, 2 = после 1-й перемотки) */
     buf_append_str(work_buf, "  Loop ");
-    buf_append_char(work_buf, (char)('1' + s_loop_count));
+    buf_append_char(work_buf, (char)('1' + vgm_loop_count));
 
     print_line(&s_wnd, pbinfo_start_row, work_buf,
                WC_COLOR(WC_GREEN, WC_BLACK));
@@ -889,11 +711,18 @@ void main(void)
         {
             /* Парсим GD3 и восстанавливаем VPL-страницу */
             vgm_parse_gd3();
+
+            /* ── 0x66 sentinel ───────────────────────────────────
+             * Пишем VGM end-marker (0x66) сразу после конца данных,
+             * чтобы hot-loop в vgm_fill_buffer мог работать без
+             * проверки EOF на каждой итерации.                     */
+            wc_mngcvpl(vgm_end_page);
+            *(volatile uint8_t *)vgm_end_addr = 0x66;
+
             wc_mngcvpl(vgm_cur_page);
 
             /* Определяем типы чипов и длительность трека */
             detect_active_chips();
-            compute_play_duration();
         }
     }
 
@@ -906,6 +735,11 @@ void main(void)
     uint8_t key = 0;
 
     uint8_t tick_prev = isr_tick_ctr;
+
+    /* Default exit = next track; ESC/P override it.
+     * WC_EXIT_ESC == 0, so we must not leave wc_exit_code at 0
+     * or the isr_done handler would misinterpret it as ESC. */
+    wc_exit_code = WC_EXIT_NEXT;
 
     /* Главный цикл: isr_tick_ctr меняется ~ISR_FREQ раз/сек,
        опрос клавиатуры и UI-обновление делаем каждые ISR_TICKS_PER_FRAME тиков (~50 Гц) */
@@ -922,37 +756,34 @@ void main(void)
 
             if (key == KEY_ESC)
             {
-                stop_playback();
+                vgm_hl_pos = vgm_hl_abort_pos;
+                vgm_song_ended = 0;
                 wc_exit_code = WC_EXIT_ESC;
-                break;
             }
 
             if (key == KEY_NEXT)
             {
-                stop_playback();
+                vgm_hl_pos = vgm_hl_abort_pos;
+                vgm_song_ended = 0;
                 wc_exit_code = WC_EXIT_NEXT;
-                break;
             }
             if (key == KEY_PREV)
             {
-                stop_playback();
+                vgm_hl_pos = vgm_hl_abort_pos;
+                vgm_song_ended = 0;
                 wc_exit_code = WC_EXIT_PREV;
-                break;
             }
 
             update_playback_info();
-            update_auto_fade();
         }
 
         if (state == STATE_PLAYBACK)
         {
             update_buffer();
 
-            /* Трек закончился (loop исчерпан или нет loop) → следующий */
-            if (vgm_song_ended)
+            /* ISR замер на CMD_ISR_DONE → чистый выход */
+            if (isr_done)
             {
-                stop_playback();
-                wc_exit_code = WC_EXIT_NEXT;
                 break;
             }
         }
