@@ -72,7 +72,9 @@
 /* ── Нумерация регистров (часто используемые) ────────────────────── */
 #define OPL3_REG_WAVESEL    0x01    /* Waveform select enable (бит 5)  */
 #define OPL3_REG_CONNSEL    0x04    /* Connection select (4-op, Bank0) */
-#define OPL3_REG_OPL3EN     0x05    /* OPL3 enable (Bank 1 only!)     */
+#define OPL3_REG_OPL3EN     0x05    /* OPL3 mode reg (Bank 1 only!)   */
+#define OPL3_OPL3EN_ON      0x01    /* NEW=1: OPL3 mode (L/R via C0-C8)*/
+#define OPL3_OPL3EN_OFF     0x00    /* NEW=0: OPL2 compat (L+R always)  */
 #define OPL3_REG_CSW        0x08    /* CSW / Note select (Bank 0)     */
 #define OPL3_REG_BD         0xBD    /* Percussion / AM / VIB depth    */
 
@@ -89,9 +91,17 @@ void opl3_write_b1(uint8_t addr, uint8_t data);
 
 /**
  * Инициализация OPL3:
- *   1. Bank1 reg 0x05 = 0x05 (OPL3 enable)
- *   2. Bank0 reg 0x01 = 0x20 (waveform select enable)
- *   3. KeyOff на всех 18 каналах (opl3_reset)
+ *   1. Bank1 reg[0x05] = 0x01  — NEW=1, OPL3 mode (регистры C0-C8 управляют L/R)
+ *   2. Bank0 reg[0x01] = 0x20  — Waveform Select Enable
+ *   3. Полный сброс всех 18 каналов: KeyOff, TL, F-Num (opl3_reset)
+ *
+ * ⚠ После `opl3_init()` чип находится в режиме OPL3 (NEW=1):
+ *   - Регистры C0-C8 задают маршрутизацию L/R (биты 4-5)
+ *   - OPL2/OPL1 VGM файлы НЕ устанавливают биты L/R → тишина!
+ *
+ * Для OPL1/OPL2 файлов после init вызовите:
+ *   opl3_write_b1(OPL3_REG_OPL3EN, 0x00);  // NEW=0: OPL2-compat mode
+ * В этом режиме L+R включены автоматически, биты C0-C8[5:4] игнорируются.
  */
 void opl3_init(void);
 

@@ -348,3 +348,128 @@ PANEL_IX:   DW 0
 - **wild_player/** - полноценный музыкальный плеер
 - **gsplayer/** - плеер для GS
 - **txt_editor/** - редактор текста
+
+---
+
+## Минимальный плагин на SDCC C
+
+> Компилятор: SDCC 4.x, ключи `--opt-code-size -mz80 --sdcccall 1`  
+> Источник соглашений: `src_sdcc/inc/wc_api.h`
+
+```c
+/*
+ * hello_plugin.c — минимальный WC-плагин на SDCC C
+ *
+ * Сборка:
+ *   sdcc --opt-code-size -mz80 --sdcccall 1 --code-loc 0x8000 \
+ *        --data-loc 0xB800 -I inc hello_plugin.c wc_api.s crt0.s
+ *   makebin -s 16384 hello_plugin.ihx hello_plugin.bin
+ *   pack hello_plugin.bin HELLO.WMF   # добавить заголовок WMF
+ */
+
+#include "inc/wc_api.h"
+#include "inc/types.h"
+
+/* ─────────────────────────────────────────────────
+ * DATA: размещается в #B800+ (--data-loc 0xB800)
+ * ──────────────────────────────────────────────── */
+
+/* Окно в секции DATA (адрес в #8000–#BFFF — обязательно!) */
+static wc_window_t g_win;
+
+/* Буфер вывода */
+static char g_buf[64];
+
+/*
+ * wc_exit_code — специальная переменная: WC читает A при
+ * выходе из main(). Значения: 0=ESC, 2=след. файл, 3=reload dir.
+ */
+uint8_t wc_exit_code;
+
+/* ─────────────────────────────────────────────────
+ * CODE: размещается в #8000+ (--code-loc 0x8000)
+ * ──────────────────────────────────────────────── */
+
+int main(void) {
+    /* 1. Восстановить дисплей WC (TXT-режим, панели)
+     *    ⚠ Затирает #1000–#1447 в окне 0 */
+    wc_gedpl();
+
+    /* 2. Настроить окно */
+    g_win.type      = WC_WIN_SINGLE;   /* однолинейная рамка */
+    g_win.cur_mask  = 0x07;
+    g_win.x         = 255;   /* 255 = по центру */
+    g_win.y         = 255;
+    g_win.width     = 44;
+    g_win.height    = 6;
+    g_win.color     = WC_COLOR(WC_BLACK, WC_BRIGHT_WHITE);
+    g_win.buf_addr  = 0x0000;  /* 0 = автосохранение фона в RESB */
+
+    /* 3. Нарисовать окно */
+    wc_prwow(&g_win);
+
+    /* 4. Вывести текст (разметка WC: 0x0E = центрирование) */
+    wc_txtpr(&g_win, "\x0eHello from C plugin!", 1, 1);
+    wc_txtpr(&g_win, "\x0e\x03Press ESC to exit", 3, 1);
+
+    /* 5. Главный цикл */
+    while (1) {
+        if (wc_key_esc())   break;
+        if (wc_key_enter()) break;
+
+        /* пример: цикл ожидания клавиши без блокировки */
+        /* uint8_t k = wc_kbscn(WC_KBSCN_NORMAL); */
+    }
+
+    /* 6. Убрать окно и восстановить дисплей */
+    wc_rresb(&g_win);
+    wc_gedpl();
+
+    /* 7. Код выхода */
+    wc_exit_code = 0;   /* 0 = нормальный выход */
+    return 0;
+}
+```
+
+### Полезные паттерны
+
+**Загрузка файла в мегабуфер:**
+```c
+void load_file_to_megabuf(void) {
+    uint8_t page = 0;
+    uint8_t rc;
+
+    wc_stream(WC_STREAM_ROOT);     // открыть файловый поток
+    // wc_fentry() уже вызван WC перед стартом плагина
+
+    do {
+        /* ⚠ После любого wc_* Win3 сбрасывается — переключаем снова */
+        wc_mngcvpl(page);
+        rc = wc_load512(0xC000, 32);  // читать 16 КБ
+        page++;
+    } while (rc == 0 && page < 64);
+    /* rc == WC_EOF (0x0F) = конец файла, rc != 0 && != 0x0F = ошибка */
+}
+```
+
+**Установка собственного ISR:**
+```c
+extern void my_isr(void);  // ISR написан на ASM в asm/isr.s
+
+void setup_isr(void) {
+    wc_int_pl(WC_INT_PLUGIN);              // режим плагина
+    wc_int_pl_handler((uint16_t)my_isr);   // задать адрес
+    /* Теперь my_isr() вызывается ~1367 раз/сек */
+}
+
+void restore_isr(void) {
+    wc_int_pl(WC_INT_DISABLE_ALL);  // вернуть управление WC
+}
+```
+
+**Переключение CPU на 14 МГц:**
+```c
+wc_turbopl(WC_TURBO_CPU, 0x02);    // 14 МГц
+// ...работа...
+wc_turbopl(WC_TURBO_RESTORE, 0);   // восстановить
+```

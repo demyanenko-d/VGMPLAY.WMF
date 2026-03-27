@@ -518,3 +518,380 @@ GEDPL   MACRO
         JP WLD
         ENDM
 ```
+
+---
+
+## C API (SDCC)
+
+> Источник: `src_sdcc/inc/wc_api.h` + `src_sdcc/asm/wc_api.s`  
+> Компилятор: SDCC 4.x, соглашение **sdcccall(1)**
+
+### Соглашение вызова sdcccall(1)
+
+| Аргумент | Тип         | Регистр  |
+|----------|-------------|----------|
+| 1-й      | `uint8_t`   | `A`      |
+| 1-й      | `uint16_t` / указатель | `HL` |
+| 2-й      | `uint16_t` / указатель | `DE` |
+| 3-й+     | любой       | стек (callee-cleans) |
+| Возврат  | `uint8_t`   | `A`      |
+| Возврат  | `uint16_t`  | `HL`     |
+
+WC API **портит**: `AF, BC, DE, HL, IX` при каждом вызове.  
+WC API **сохраняет**: `IY, AF', BC', DE', HL', SP`.
+
+---
+
+### Управление памятью (страницы)
+
+```c
+// Переключить окно #C000 на логическую страницу плагина N
+void wc_mngc_pl(uint8_t page);
+
+// Переключить окно #0000 на логическую страницу плагина N
+void wc_mng0_pl(uint8_t page);
+
+// Переключить окно #8000 на логическую страницу плагина N
+void wc_mng8_pl(uint8_t page);
+
+// Переключить окно #C000 на VPL-страницу мегабуфера N (физич. = WC_PAGE_TVBPG + N)
+void wc_mngcvpl(uint8_t vpage);
+
+// Переключить видеобуфер (WC_VIDEO_TXT / WC_VIDEO_BUF1..4)
+void wc_mngv_pl(uint8_t mode);
+```
+
+> ⚠️ После **любого** вызова WC API окно `#C000` сбрасывается на текстовую страницу!  
+> Если плагин работал с `mngcvpl()`, после каждого UI-вызова нужно снова вызвать `mngcvpl()`.
+
+---
+
+### Отображение / UI
+
+```c
+// Восстановить дисплей WC (TXT-режим, панели)
+// ⚠ Затирает #1000–#1447 в окне 0!
+void wc_gedpl(void);
+
+// Нарисовать окно
+void wc_prwow(wc_window_t *win);
+
+// Убрать окно (восстановить фон из RESB)
+void wc_rresb(wc_window_t *win);
+
+// Прокрутить область окна
+void wc_scrlwow(wc_window_t *win, uint8_t y, uint8_t x,
+                uint8_t h, uint8_t w, uint8_t flags);
+
+// Вывести строку с разметкой WC в окно
+// Возвращает: номер строки после последнего символа
+uint8_t wc_txtpr(wc_window_t *win, const char *str, uint8_t y, uint8_t x);
+
+// Вывести сообщение (несколько абзацев, разделённых 0x00 0x00)
+uint8_t wc_mezz(wc_window_t *win, uint8_t msg_num,
+                const char *str, uint8_t y, uint8_t x);
+
+// Вывести строку без разметки (raw)
+void wc_prsrw(wc_window_t *win, const char *str,
+              uint8_t y, uint8_t x, uint16_t len);
+
+// Вывести строку без разметки с заданным атрибутом цвета
+void wc_prsrw_attr(wc_window_t *win, const char *str,
+                   uint8_t y, uint8_t x, uint16_t len, uint8_t attr);
+
+// Получить адрес экрана по позиции в окне
+uint16_t wc_gadrw(wc_window_t *win, uint8_t y, uint8_t x);
+
+// Показать/убрать курсор
+void wc_cursor(wc_window_t *win);
+void wc_curser(wc_window_t *win);
+
+// Диалог Yes/No или Ok/Cancel
+// mode: WC_YN_YES_NO, WC_YN_OK_CANCEL, WC_YN_POLL, WC_YN_EXIT
+// Возвращает: 0=нет/отмена, 1=да/ок (при POLL: текущий выбор)
+uint8_t wc_yn(uint8_t mode);
+
+// Ввод строки в окне
+void wc_istr(wc_window_t *win, uint8_t mode);
+
+// Вставить символ val по адресу addr в текстовой памяти
+void wc_nork(uint16_t addr, uint8_t val);
+```
+
+---
+
+### Клавиатура
+
+```c
+// Опрос конкретной клавиши (возвращает 1 если нажата)
+uint8_t wc_key_space(void);
+uint8_t wc_key_up(void);
+uint8_t wc_key_down(void);
+uint8_t wc_key_left(void);
+uint8_t wc_key_right(void);
+uint8_t wc_key_tab(void);
+uint8_t wc_key_enter(void);
+uint8_t wc_key_esc(void);
+uint8_t wc_key_bspc(void);
+uint8_t wc_key_pgup(void);
+uint8_t wc_key_pgdn(void);
+uint8_t wc_key_home(void);
+uint8_t wc_key_end(void);
+uint8_t wc_key_f1(void);
+uint8_t wc_key_f2(void);
+uint8_t wc_key_f3(void);
+uint8_t wc_key_f4(void);
+uint8_t wc_key_f5(void);
+uint8_t wc_key_f6(void);
+uint8_t wc_key_f7(void);
+uint8_t wc_key_f8(void);
+uint8_t wc_key_f9(void);
+uint8_t wc_key_f10(void);
+
+// Модификаторы (без автоповтора)
+uint8_t wc_key_alt(void);
+uint8_t wc_key_shift(void);
+uint8_t wc_key_ctrl(void);
+
+// Прочие клавиши
+uint8_t wc_key_del(void);
+uint8_t wc_key_ins(void);
+uint8_t wc_key_caps(void);
+uint8_t wc_key_any(void);          // любая клавиша нажата (без автоповтора)
+
+// Ждать нажатия любой клавиши, вернуть скан-код
+uint8_t wc_key_wait_any(void);
+
+// Ждать отпускания всех клавиш
+void    wc_key_wait_release(void);
+
+// Получить скан-код нажатой клавиши
+// mode: WC_KBSCN_NORMAL (с учётом SHIFT/CL/Lang) или WC_KBSCN_RAW
+uint8_t wc_kbscn(uint8_t mode);
+```
+
+---
+
+### Файловые операции
+
+Все буферы и строки файловых функций **обязаны** быть в `#8000–#FFFF`  
+(WC ремапит `#0000–#7FFF` внутри FAT-операций).
+
+```c
+// Прочитать blocks×512 байт по адресу dest из открытого файла
+// Возвращает: 0=OK, WC_EOF=конец файла, иное=ошибка
+uint8_t wc_load512(uint16_t dest, uint8_t blocks);
+
+// Прочитать blocks×256 байт по адресу dest
+uint8_t wc_load256(uint16_t dest, uint8_t blocks);
+
+// Записать blocks×512 байт по адресу src в открытый файл
+void wc_save512(uint16_t src, uint8_t blocks);
+
+// Пропустить sectors×512 байт в открытом файле (без чтения)
+void wc_loadnone(uint8_t sectors);
+
+// Сменить поток (контекст файловой операции)
+// mode: WC_STREAM_ROOT, WC_STREAM_CLONE, WC_STREAM_WCDIR, 0/1
+void wc_stream(uint8_t mode);
+
+// Управление каталогом (WC_ADIR_SEEK_START, WC_ADIR_RESET_NEXT)
+void wc_adir(uint8_t mode);
+
+// Открыть файл по имени в текущем каталоге
+// name_with_flag: [1 байт флагов][имя][0]
+// Возвращает: 0=не найден, ненулевое=найден
+uint8_t wc_fentry(uint16_t name_with_flag);
+
+// Найти следующий файл в каталоге
+// flags: [7]=только короткие имена, [1:0]=00 все/01 файлы/10 каталоги
+// Возвращает: 0 (Z=1)=конец каталога, ненулевое=найден
+uint8_t wc_findnext(uint16_t entry_buf, uint8_t flags);
+
+// Открыть файл, найденный последним wc_fentry()
+void wc_gfile(void);
+
+// Войти в каталог, найденный последним wc_fentry()
+void wc_gdir(void);
+
+// Создать файл: [1 байт флагов][длина][имя][0]
+uint8_t wc_mkfile(uint16_t name_with_flag);
+
+// Создать каталог
+uint8_t wc_mkdir(uint16_t name);
+
+// Переименовать файл/каталог
+uint8_t wc_rename(uint16_t old_name, uint16_t new_name);
+
+// Удалить файл
+uint8_t wc_delfl(uint16_t name_with_flag);
+
+// Перейти к началу файла плагина (позиционировать поток на первый блок)
+void wc_gipagpl(void);
+
+// Прочитать FAT ENTRY (32 байта) файла в буфер по адресу addr
+void wc_tentry(uint16_t addr);
+
+// Обойти цепочку секторов, записать список секторов в buf..bufend
+void wc_chtosep(uint16_t buf, uint16_t bufend);
+
+// Получить заголовок помеченного файла
+// panel = IX структура панели WC, filenum = номер файла, namebuf = буфер
+void wc_tmrkdfl(uint16_t panel, uint16_t filenum, uint16_t namebuf);
+```
+
+---
+
+### Графика и видео
+
+```c
+// Переключить видеорежим: WC_VIDEO_TXT / WC_VIDEO_BUF1..4
+void wc_mngv_pl(uint8_t mode);
+
+// Отобразить видеостраницу vpage (0x00–0x3F) на окно #C000
+void wc_mngcvpl(uint8_t vpage);
+
+// Отобразить видеостраницу vpage на окно #0000
+// ⚠ GEDPL (~wc_gedpl) затирает #1000–#1447 — не хранить данные там!
+void wc_mng0vpl(uint8_t vpage);
+
+// Отобразить видеостраницу vpage на окно #8000
+void wc_mng8vpl(uint8_t vpage);
+
+// Установить видеорежим TSConfig
+// mode: TSCONF_VM_* | TSCONF_RRES_* (байт VConfig)
+void wc_gvmod(uint8_t mode);
+
+// Установить Y-смещение прокрутки графики
+void wc_gyoff(uint16_t y);
+
+// Установить X-смещение прокрутки графики
+void wc_gxoff(uint16_t x);
+
+// Установить страницу тайловой карты
+void wc_gvtm(uint8_t page);
+
+// Установить страницу графики тайловой плоскости (plane=0 или 1)
+void wc_gvtl(uint8_t plane, uint8_t page);
+
+// Установить страницу графики спрайтов
+void wc_gvsgp(uint8_t page);
+```
+
+---
+
+### DMA
+
+```c
+// Настройка и запуск DMA TSConfig.
+// Подфункции:
+//   0x00 — src+dst: B=src_page, HL=src_addr, C=dst_page, DE=dst_addr
+//   0x01 — только src; 0x02 — только dst
+//   0x05 — DMA_T; 0x06 — DMA_N; 0x07 — T+N
+//   0xFC — RAM→RAM (с ожиданием)  0xFB — BLT→RAM
+//   0xFA — FILL                   0xF9 — RAM→CRAM (палитра)
+//   0xF8 — RAM→SFILE (спрайты)    0xFD — запустить без ожидания
+//   0xFE — запустить с ожиданием  0xFF — ждать готовности DMA
+void wc_dmapl(uint8_t subfunc);
+```
+
+---
+
+### Системные функции
+
+```c
+// Прерывания (WC_INT_DISABLE_ALL / NO_TIME / NO_PS2 / PLUGIN)
+// При WC_INT_PLUGIN — следующий вызов wc_int_pl_handler() задаёт адрес
+void wc_int_pl(uint8_t mode);
+
+// Установить адрес обработчика ISR плагина (после wc_int_pl(WC_INT_PLUGIN))
+void wc_int_pl_handler(uint16_t handler_addr);
+
+// Управление CPU/AY частотой
+// mode: WC_TURBO_CPU (param 0=3.5, 1=7, 2=14, 3=28 МГц)
+//       WC_TURBO_AY  (param 0=1.750, 1=1.773, 2=3.5, 3=3.546 МГц)
+//       WC_TURBO_RESTORE (0xFF) — восстановить из настроек WC
+void wc_turbopl(uint8_t mode, uint8_t param);
+
+// Получить параметр из INI-файла плагина
+// param_num: 0-based номер параметра
+// Возвращает: номер опции (0-based), 0xFF если параметр не задан
+uint8_t wc_prm_pl(uint8_t param_num);
+
+// Резидентный JP на другую страницу плагина (без возврата!)
+// page: номер страницы (от 0), addr: адрес в #8000–#BFFF
+void wc_resident_jump(uint8_t page, uint16_t addr);
+
+// Резидентный CALL на другую страницу плагина (с возвратом)
+// Сохраняет все регистры кроме A и HL
+void wc_resident_call(uint8_t page, uint16_t addr);
+
+// Заполнить буфер символом c (аналог memset)
+void wc_strset(char *dsr, uint16_t len, char c);
+```
+
+---
+
+### Системные переменные (прямой доступ по адресу)
+
+```c
+// Читаются напрямую, без вызова WC API:
+extern volatile uint8_t  wc_exit_code;      // #8000 − записать перед return из main()
+                                             // 0=ESC, 1=не распознан, 2=следующий,
+                                             // 3=перечитать каталог, 4=предыдущий
+
+#define WC_SYS_ABT  (*(volatile uint8_t*)0x6004)  // 1 = был нажат ESC
+#define WC_SYS_ENT  (*(volatile uint8_t*)0x6005)  // 1 = был нажат ENTER
+#define WC_SYS_TMN  (*(volatile uint16_t*)0x6009) // таймер INT (инкремент каждый INT)
+#define WC_SYS_HEI  (*(volatile uint8_t*)0x600E)  // высота TXT-экрана (25/30/36)
+#define WC_SYS_PG0  (*(volatile uint8_t*)0x6000)  // текущая страница окна #0000
+#define WC_SYS_PGC  (*(volatile uint8_t*)0x6003)  // текущая страница окна #C000
+```
+
+---
+
+### Пример минимального плагина (SDCC C)
+
+```c
+#include "inc/wc_api.h"
+#include "inc/types.h"
+
+// Структура окна в DATA (0x8000+)
+static wc_window_t g_win;
+
+// Код выхода (WC читает A при RET из main)
+uint8_t wc_exit_code;
+
+int main(void) {
+
+    // --- Настройка окна ---
+    g_win.type     = WC_WIN_SINGLE;
+    g_win.cur_mask = 0x07;
+    g_win.x        = 255;   // по центру
+    g_win.y        = 255;
+    g_win.width    = 40;
+    g_win.height   = 8;
+    g_win.color    = WC_COLOR(WC_BLACK, WC_BRIGHT_WHITE);
+    g_win.buf_addr = 0x0000; // автосохранение фона
+
+    // --- Отрисовка UI ---
+    wc_gedpl();
+    wc_prwow(&g_win);
+    wc_txtpr(&g_win, "Hello from plugin!", 1, 1);
+
+    // --- Главный цикл ---
+    while (1) {
+        if (wc_key_esc()) break;
+        if (wc_key_enter()) {
+            // ... какое-то действие
+        }
+    }
+
+    // --- Выход ---
+    wc_rresb(&g_win);
+    wc_gedpl();
+
+    wc_exit_code = 0;   // 0 = нормальный выход (ESC)
+    return 0;
+}
+```

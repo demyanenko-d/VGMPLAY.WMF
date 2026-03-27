@@ -14,17 +14,22 @@
  * CMD_END_BUF). VGM данные хранятся в VPL-страницах WC, доступных
  * через окно #C000.
  *
- * Поддерживаемые VGM-команды (OPL1 / OPL2 / OPL3):
+ * Поддерживаемые VGM-команды (OPL1 / OPL2 / OPL3 / AY / SAA):
  *   0x5A rr dd  — YM3812  (OPL2) write         → CMD_WRITE_B0
  *   0x5B rr dd  — YM3526  (OPL1) write         → CMD_WRITE_B0
+ *   0x5C rr dd  — Y8950   (OPL)  write         → CMD_WRITE_B0
  *   0x5E rr dd  — YMF262  (OPL3) Bank 0 write  → CMD_WRITE_B0
  *   0x5F rr dd  — YMF262  (OPL3) Bank 1 write  → CMD_WRITE_B1
+ *   0x55 rr dd  — YM2203  PSG-часть (AY), reg 0-15 → CMD_WRITE_AY
+ *   0xA0 rr dd  — AY8910  (чип 1/2 по [7])  → CMD_WRITE_AY / CMD_WRITE_AY2
+ *   0xBD rr dd  — SAA1099 (чип 1/2 по [7])  → CMD_WRITE_SAA / CMD_WRITE_SAA2
  *   0x61 nn nn  — Wait N samples (16-bit LE)
  *   0x62        — Wait 735 samples (1/60 сек)
  *   0x63        — Wait 882 samples (1/50 сек)
  *   0x66        — End of data
  *   0x67 ...    — Data block (пропускается)
  *   0x70–0x7F   — Wait 1–16 samples
+ *   Прочие     — пропускаются по таблице VGM spec (1-байт / 2-байт / 3-байт аргументы)
  *
  * Масштабирование задержек:
  *   VGM sample rate = 44100 Hz, ISR freq = 2734 Hz -> делим на 16.
@@ -123,9 +128,14 @@ extern uint16_t *freq_lut_base;
 
 /* ── Тип OPL-чипа (обратная совместимость) ───────────────────────── */
 #define VGM_CHIP_NONE  0
-#define VGM_CHIP_OPL   1     /* YM3526  (OPL1): cmd 0x5B              */
+#define VGM_CHIP_OPL   1     /* YM3526 (OPL1) + Y8950: cmd 0x5B/0x5C  */
 #define VGM_CHIP_OPL2  2     /* YM3812  (OPL2): cmd 0x5A              */
 #define VGM_CHIP_OPL3  3     /* YMF262  (OPL3): cmd 0x5E/5F           */
+
+/* Приоритет определения типа: YMF262 > YM3812 > YM3526/Y8950
+ * Используется в start_playback() для выбора NEW=0/1 режима OPL3:
+ *   VGM_CHIP_OPL3  → opl3_init() остаётся (NEW=1, L/R через C0-C8)
+ *   не OPL3      → opl3_write_b1(OPL3_REG_OPL3EN, 0x00) (NEW=0, L+R авто) */
 
 /* ── Коды результата ─────────────────────────────────────────────── */
 #define VGM_OK         0
@@ -206,9 +216,9 @@ uint8_t vgm_parse_header(void);
  * Поддерживаемые VGM-команды:
  *   0x5A/0x5B/0x5C/0x5E → CMD_WRITE_B0 (OPL1/OPL2/Y8950/OPL3 bank 0)
  *   0x5F               → CMD_WRITE_B1 (OPL3 bank 1)
- *   0x55           → CMD_WRITE_AY (YM2203 PSG-часть, reg 0-15)
- *   0xA0           → CMD_WRITE_AY / CMD_WRITE_AY2 (AY8910, dual)
- *   0xBD           → CMD_WRITE_SAA / CMD_WRITE_SAA2 (SAA1099, dual)
+ *   0x55               → CMD_WRITE_AY (YM2203 PSG-часть, reg 0-15)
+ *   0xA0               → CMD_WRITE_AY / CMD_WRITE_AY2 (AY8910, dual)
+ *   0xBD               → CMD_WRITE_SAA / CMD_WRITE_SAA2 (SAA1099, dual)
  *   0x61/0x62/0x63/0x70-0x7F → CMD_WAIT
  *   0x66           → end; 0x67 → data block skip
  *

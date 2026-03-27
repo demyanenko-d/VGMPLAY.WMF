@@ -32,12 +32,14 @@
  *   Код          │ Байт 1 │ Байт 2 │ Байт 3 │ Действие
  *   ─────────────┼────────┼────────┼────────┼─────────────────────
  *   CMD_WRITE_AY │ reg    │ val    │ 0      │ OUT AY8910 chip 1
+ *   CMD_INC_SEC  │ 0      │ 0      │ 0      │ Инкр. isr_play_seconds
  *   CMD_WRITE_AY2│ reg    │ val    │ 0      │ OUT AY8910 chip 2 (TS)
+ *   CMD_CALL_WC  │ 0      │ 0      │ 0      │ Вызов WC ISR handler
  *   CMD_WRITE_B0 │ reg    │ val    │ 0      │ OUT OPL3 Bank 0
+ *   CMD_SKIP_TICKS│ N     │ 0      │ 0      │ Пропустить N позиций pos_table
  *   CMD_WRITE_SAA│ reg    │ val    │ 0      │ OUT SAA1099 chip 1
  *   CMD_WRITE_B1 │ reg    │ val    │ 0      │ OUT OPL3 Bank 1
  *   CMD_WRITE_SA2│ reg    │ val    │ 0      │ OUT SAA1099 chip 2
- *   CMD_SKIP_TICKS│ N     │ 0      │ 0      │ Skip N pos_table → N+1 тик
  *   CMD_WAIT     │ lo     │ hi     │ 0      │ Ждать (hi<<8)|lo тиков
  *   CMD_END_BUF  │ 0      │ 0      │ 0      │ Переключить буфер
  *
@@ -74,15 +76,15 @@
 
 /* ── Коды команд (8 типов, шаг 0x20) ─────────────────────────────── */
 #define CMD_WRITE_AY  0x00  /* AY8910 chip 1: [reg, val, 0]          */
-#define CMD_INC_SEC   0x10  /* Увеличить счётчик секунд: [0,0,0]  */
-#define CMD_WRITE_AY2 0x20  /* AY8910 chip 2 (TurboSound):           */
+#define CMD_INC_SEC   0x10  /* Инкрементировать счётчик секунд: [0,0,0]    */
+#define CMD_WRITE_AY2 0x20  /* AY8910 chip 2 (TurboSound): [reg,val,0]*/
 #define CMD_CALL_WC   0x30  /* Вызов WC ISR handler: [0,0,0]        */
 #define CMD_WRITE_B0  0x40  /* OPL3 Bank 0 write: [reg, val, 0]      */
-#define CMD_SKIP_TICKS 0x50 /* Skip N pos_table entries: [N,0,0]     */
+#define CMD_SKIP_TICKS 0x50 /* Пропустить N записей pos_table: [N,0,0]  */
 #define CMD_WRITE_SAA 0x60  /* SAA1099 chip 1: [reg, val, 0]         */
 #define CMD_WRITE_B1  0x80  /* OPL3 Bank 1 write: [reg, val, 0]      */
 #define CMD_WRITE_SAA2 0xA0 /* SAA1099 chip 2: [reg, val, 0]         */
-#define CMD_WAIT      0xC0  /* Wait N ISR-тиков:  [lo,  hi,  0]      */
+#define CMD_WAIT      0xC0  /* Ждать N ISR-тиков:  [lo,  hi,  0]      */
 #define CMD_END_BUF   0xE0  /* Переключить буфер: [0,   0,   0]      */
 
 /* ── Размер командного буфера ────────────────────────────────────── */
@@ -126,6 +128,9 @@ extern volatile uint16_t isr_play_seconds;
 extern uint8_t cmd_buf_a[CMD_BUF_SIZE];
 extern uint8_t cmd_buf_b[CMD_BUF_SIZE];
 
+/** Контрольный счётчик текущей задержки CMD_WAIT.
+ *  ISR декрементирует при каждом тике, переходит к следующей команде после достижения 0.
+ *  Не используется напрямую main loop — только ISR. */
 extern volatile uint16_t isr_wait_ctr;
 
 /** Указатель чтения ISR внутри активного буфера. */
