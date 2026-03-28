@@ -198,6 +198,69 @@ static uint8_t s_buf_ready[2] = {0, 0};
 static uint8_t s_last_loop_count = 0;
 static uint16_t s_last_displayed_sec = 0xFFFF;  /* форсить первую отрисовку */
 
+/* ── FSM-клавиатура (дебаунс без сжигания CPU) ───────────────────────
+ * Состояния:
+ *   WAIT_RELEASE — ждём отпускания ВСЕХ клавиш (защита от «залипания»
+ *                  при перезапуске плагина с зажатой N/P/ESC)
+ *   IDLE         — ничего не нажато, ждём нажатия
+ *   CONFIRM      — нажатие обнаружено, подтверждаем через
+ *                  KBD_DEBOUNCE_TICKS (~3 мс) стабильного удержания
+ * После подтверждения → WAIT_RELEASE (нет авто-повтора).             */
+#define KBD_ST_WAIT_RELEASE 0
+#define KBD_ST_IDLE         1
+#define KBD_ST_CONFIRM      2
+#define KBD_DEBOUNCE_TICKS  4u  /* ~3 мс при ISR_FREQ=1367             */
+
+static uint8_t kbd_state;
+static uint8_t kbd_raw;      /* кандидат-клавиша в CONFIRM             */
+static uint8_t kbd_tick;     /* isr_tick_ctr при входе в CONFIRM       */
+
+static void kbd_init(void)
+{
+    kbd_state = KBD_ST_WAIT_RELEASE;
+    kbd_raw   = KEY_NONE;
+}
+
+static uint8_t kbd_poll(void)
+{
+    uint8_t k = read_keys();
+
+    switch (kbd_state) {
+    case KBD_ST_WAIT_RELEASE:
+        if (k == KEY_NONE)
+            kbd_state = KBD_ST_IDLE;
+        return KEY_NONE;
+
+    case KBD_ST_IDLE:
+        if (k != KEY_NONE) {
+            kbd_raw  = k;
+            kbd_tick = isr_tick_ctr;
+            kbd_state = KBD_ST_CONFIRM;
+        }
+        return KEY_NONE;
+
+    case KBD_ST_CONFIRM:
+        if (k == KEY_NONE) {
+            /* Отпущена до подтверждения — глюк/дребезг */
+            kbd_state = KBD_ST_IDLE;
+            return KEY_NONE;
+        }
+        if (k != kbd_raw) {
+            /* Другая клавиша — начать подтверждение заново */
+            kbd_raw  = k;
+            kbd_tick = isr_tick_ctr;
+            return KEY_NONE;
+        }
+        /* Та же клавиша — проверяем интервал */
+        if ((uint8_t)(isr_tick_ctr - kbd_tick) >= KBD_DEBOUNCE_TICKS) {
+            kbd_state = KBD_ST_WAIT_RELEASE;
+            return kbd_raw;
+        }
+        return KEY_NONE;
+    }
+    return KEY_NONE;
+}
+
 /* VGZ info for display */
 static uint8_t  s_is_vgz;
 static uint32_t s_vgm_unpacked_size;
@@ -257,7 +320,7 @@ static void draw_pre_load_info(void)
     uint8_t row = 1;
 
     buf_clear(work_buf);
-    buf_append_str(work_buf, "              VGM Player ver 0.3 (alpha)");
+    buf_append_str(work_buf, "              VGM Player ver 0.4 (beta)");
     print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
     row = 3;
 
@@ -283,7 +346,7 @@ uint8_t drow_ui(void)
 
     // Заголовок ---------------------------------------------------------------------------------------
     buf_clear(work_buf);
-    buf_append_str(work_buf, "       VGM Player ver 0.3 (alpha)");
+    buf_append_str(work_buf, "       VGM Player ver 0.4 (beta)");
     print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
     row += 2;
 
@@ -770,7 +833,6 @@ void main(void)
     if (state == STATE_PLAYBACK)
         start_playback();
 
-    uint8_t row = 1;
     uint8_t key = 0;
 
     uint8_t tick_prev = isr_tick_ctr;
@@ -780,16 +842,20 @@ void main(void)
      * or the isr_done handler would misinterpret it as ESC. */
     wc_exit_code = WC_EXIT_NEXT;
 
+    /* FSM клавиатуры: стартуем в WAIT_RELEASE, чтобы дождаться
+     * отпускания кнопки, оставшейся от предыдущего трека.     */
+    kbd_init();
+
     /* Главный цикл: опрос клавиатуры на каждой итерации (порты — мгновенно),
        UI-обновление каждые ISR_TICKS_PER_FRAME тиков (~50 Гц) */
     while (state == STATE_PLAYBACK)
     {
-        /* ── Клавиатура: опрос на каждой итерации ──────────────
-         * read_keys() — 4 порт-чтения, ~40 T-states.  Если опрос
-         * привязан к tick_delta, при тяжёлом vgm_fill_buffer
-         * (весь цикл занят заполнением) кнопки не успевают
-         * считываться. */
-        key = read_keys();
+        /* ── Клавиатура: FSM дебаунс (~3 мс) ──────────────────
+         * kbd_poll() = read_keys() + FSM подтверждение.
+         * Защита: стартует в WAIT_RELEASE (зажатая N/P не
+         * сработает повторно). После подтверждения → снова
+         * WAIT_RELEASE (нет авто-повтора).                     */
+        key = kbd_poll();
 
         if (key == KEY_ESC)
         {
@@ -797,13 +863,13 @@ void main(void)
             vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_ESC;
         }
-        if (key == KEY_NEXT)
+        else if (key == KEY_NEXT)
         {
             vgm_hl_pos = vgm_hl_abort_pos;
             vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_NEXT;
         }
-        if (key == KEY_PREV)
+        else if (key == KEY_PREV)
         {
             vgm_hl_pos = vgm_hl_abort_pos;
             vgm_song_ended = 0;
