@@ -606,8 +606,8 @@ void start_playback(void)
      * Speeds up code fetches and static fb_* variable access.
      * MUST be after inflate/load — DMA/page I/O would corrupt cache.
      * SysConfig bit 2 = global enable, CacheConfig bit 2 = win2.    */
-    tsconf_set_cache(TSCONF_CACHE_EN_8000);
-    tsconf_set_cpu_cache(TSCONF_CPU_14MHZ, 1);
+    //tsconf_set_cache(TSCONF_CACHE_EN_8000);
+    //tsconf_set_cpu_cache(TSCONF_CPU_14MHZ, 1);
 
     vgm_paused = 0;
 
@@ -662,8 +662,8 @@ void stop_playback(void)
     /* Disable cache before returning to WC.
      * CacheConfig = 0 disables all per-window caches.
      * SysConfig: keep 14 MHz, clear global cache bit.  */
-    tsconf_set_cpu_cache(TSCONF_CPU_14MHZ, 0);
-    tsconf_set_cache(TSCONF_CACHE_NONE);
+    //tsconf_set_cpu_cache(TSCONF_CPU_14MHZ, 0);
+    //tsconf_set_cache(TSCONF_CACHE_NONE);
     
 
     vgm_paused = 0;
