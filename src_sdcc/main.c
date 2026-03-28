@@ -539,6 +539,13 @@ void start_playback(void)
 {
     ints_disable();
 
+    /* Enable 512-byte cache for Window 2 (#8000-#BFFF).
+     * Speeds up code fetches and static fb_* variable access.
+     * MUST be after inflate/load — DMA/page I/O would corrupt cache.
+     * SysConfig bit 2 = global enable, CacheConfig bit 2 = win2.    */
+    tsconf_set_cache(TSCONF_CACHE_EN_8000);
+    tsconf_set_cpu_cache(TSCONF_CPU_14MHZ, 1);
+
     vgm_paused = 0;
 
     if (!s_playback_inited)
@@ -588,6 +595,13 @@ void stop_playback(void)
     ints_disable();
     isr_enabled = 0;
     isr_deinit();   /* восстановить вектор WC */
+
+    /* Disable cache before returning to WC.
+     * CacheConfig = 0 disables all per-window caches.
+     * SysConfig: keep 14 MHz, clear global cache bit.  */
+    tsconf_set_cpu_cache(TSCONF_CPU_14MHZ, 0);
+    tsconf_set_cache(TSCONF_CACHE_NONE);
+    
 
     vgm_paused = 0;
     s_playback_inited = 0;

@@ -77,6 +77,32 @@ static uint16_t psg_shadow[3];  /* каналы 0,1,2 */
 /* ── Бюджеты для вставки служебных ISR-команд ──────────────────────── */
 static uint16_t vgm_sec_budget = ISR_FREQ;  /* тиков до CMD_INC_SEC  */
 
+/* ── Static locals for vgm_fill_buffer / emit_wait ─────────────────
+ * Eliminates SDCC's IX-frame (32-byte stack + 19T per ld r,-N(ix)).
+ * Static access: ld a,(nn) = 13T, ld hl,(nn) = 16T.                   */
+static uint8_t *fb_buf;    /* base of current cmd_buf                   */
+static uint8_t *fb_wp;     /* write pointer into cmd_buf                */
+static uint8_t *fb_rp;     /* VGM read pointer (#C000-#FFFF)           */
+static uint8_t  fb_cpg;    /* local copy of vgm_cur_page               */
+static uint8_t  fb_budget; /* commands until forced yield               */
+static uint16_t fb_wacc;   /* wait accumulator (0..31)                  */
+static uint8_t  fb_op;     /* current VGM opcode                       */
+static uint8_t  fb_b1;     /* operand byte 1                           */
+static uint8_t  fb_b2;     /* operand byte 2                           */
+static uint8_t  fb_is_vgm; /* 1 = VGM mega-buffer, 0 = cmdblk          */
+static uint16_t fb_t;      /* temp: wait accumulator + samples          */
+static uint16_t fb_tk;     /* temp: tick count for emit_wait            */
+static uint32_t fb_t32;    /* temp: 32-bit wait / data-block size       */
+static uint16_t fb_w;      /* temp: emit_wait split value               */
+static uint8_t  fb_n;      /* temp: skip byte count                    */
+static hl_entry_t *fb_e;   /* temp: HL queue entry pointer              */
+#ifdef VGM_FREQ_SCALE
+static uint8_t  fb_ch;     /* temp: PSG/FM channel index               */
+static uint16_t fb_scaled; /* temp: scaled frequency value              */
+static uint8_t  fb_fhi;    /* temp: FM F-Num hi byte                   */
+static uint8_t  fb_block;  /* temp: FM block                           */
+static uint8_t  fb_reg;    /* temp: AY register (0xA0 handler)         */
+#endif
 
 /* ── Лимит команд между принудительными yield ──────────────────────── */
 /* Вариант v4_b16_hf: step=2560, ISR_FREQ=1367, TPF=28.
@@ -363,35 +389,33 @@ const char *vgm_chip_name(uint8_t id)
  *   2 sec boundary × 12 + remainder 8 = 32 байт
  * Зазор: вызывающий обязан обеспечить off < CMD_BUF_SIZE - 48
  * ───────────────────────────────────────────────────────────────────── */
-static void emit_wait(uint8_t *buf, uint16_t *poff, uint16_t tk)
+static void emit_wait(uint16_t tk)
 {
-    uint16_t off = *poff;
-
     while (tk > 0)
     {
         /* ── SEC-рубеж: бюджет помещается в остаток ─────────── */
         if (vgm_sec_budget <= tk)
         {
-            uint16_t ns = vgm_sec_budget;
+            fb_w = vgm_sec_budget;
 
-            if (ns > ISR_TICKS_PER_FRAME) {
+            if (fb_w > ISR_TICKS_PER_FRAME) {
                 /* Большой бюджет: CMD_WAIT(основная часть) + CMD_SKIP_TICKS */
-                uint16_t w = ns - ISR_TICKS_PER_FRAME;
-                buf[off] = CMD_WAIT;
-                buf[off+1] = (uint8_t)(w - 1);
-                buf[off+2] = (uint8_t)((w - 1) >> 8);
-                off += 4;
-                buf[off] = CMD_SKIP_TICKS;
-                buf[off+1] = ISR_TICKS_PER_FRAME - 1;
-                off += 4;
-            } else if (ns >= 1) {
-                buf[off] = CMD_SKIP_TICKS;
-                buf[off+1] = (uint8_t)(ns - 1);
-                off += 4;
+                fb_w -= ISR_TICKS_PER_FRAME;
+                fb_wp[0] = CMD_WAIT;
+                fb_wp[1] = (uint8_t)(fb_w - 1);
+                fb_wp[2] = (uint8_t)((fb_w - 1) >> 8);
+                fb_wp += 4;
+                fb_wp[0] = CMD_SKIP_TICKS;
+                fb_wp[1] = ISR_TICKS_PER_FRAME - 1;
+                fb_wp += 4;
+            } else if (fb_w >= 1) {
+                fb_wp[0] = CMD_SKIP_TICKS;
+                fb_wp[1] = (uint8_t)(fb_w - 1);
+                fb_wp += 4;
             }
             /* CMD_INC_SEC */
-            buf[off] = CMD_INC_SEC;
-            off += 4;
+            fb_wp[0] = CMD_INC_SEC;
+            fb_wp += 4;
 
             tk -= vgm_sec_budget;
             vgm_sec_budget = ISR_FREQ;
@@ -401,23 +425,21 @@ static void emit_wait(uint8_t *buf, uint16_t *poff, uint16_t tk)
         /* ── Остаток: tk < sec_budget ───────────────────────── */
         if (tk > ISR_TICKS_PER_FRAME) {
             /* Более кадра: CMD_WAIT(основная часть) + CMD_SKIP_TICKS(остаток) */
-            uint16_t w = tk - ISR_TICKS_PER_FRAME;
-            buf[off] = CMD_WAIT;
-            buf[off+1] = (uint8_t)(w - 1);
-            buf[off+2] = (uint8_t)((w - 1) >> 8);
-            off += 4;
-            vgm_sec_budget -= w;
+            fb_w = tk - ISR_TICKS_PER_FRAME;
+            fb_wp[0] = CMD_WAIT;
+            fb_wp[1] = (uint8_t)(fb_w - 1);
+            fb_wp[2] = (uint8_t)((fb_w - 1) >> 8);
+            fb_wp += 4;
+            vgm_sec_budget -= fb_w;
             tk = ISR_TICKS_PER_FRAME;
         }
         /* Последние ≤ISR_TICKS_PER_FRAME тиков через SKIP (экономия CPU) */
-        buf[off] = CMD_SKIP_TICKS;
-        buf[off+1] = (uint8_t)(tk - 1);
-        off += 4;
+        fb_wp[0] = CMD_SKIP_TICKS;
+        fb_wp[1] = (uint8_t)(tk - 1);
+        fb_wp += 4;
         vgm_sec_budget -= tk;
         tk = 0;
     }
-
-    *poff = off;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -440,32 +462,23 @@ static void emit_wait(uint8_t *buf, uint16_t *poff, uint16_t tk)
  * ───────────────────────────────────────────────────────────────────── */
 void vgm_fill_buffer(uint8_t buf_idx)
 {
-    uint8_t  *buf;
-    uint8_t  *rp;          /* локальный указатель чтения (#C000-#FFFF) */
-    uint8_t   cpg;         /* локальная копия vgm_cur_page              */
-    uint16_t  off;         /* смещение записи в cmd_buf (0..508)        */
-    uint8_t   budget;
-    uint16_t  wacc;        /* аккумулятор остатка задержки (0..15)      */
-    uint8_t   op, b1, b2;
-    uint8_t   is_vgm;     /* 1 = чтение VGM из мегабуфера, 0 = cmdblk  */
-
-    buf = buf_idx ? cmd_buf_b : cmd_buf_a;
-    off = 0;
+    fb_buf = buf_idx ? cmd_buf_b : cmd_buf_a;
+    fb_wp  = fb_buf;
 
     /* Пауза — заполнить тишиной */
     if (vgm_paused) {
-        buf[0] = CMD_SKIP_TICKS; buf[1] = ISR_TICKS_PER_FRAME - 1;
-        buf[4] = CMD_END_BUF;
+        fb_buf[0] = CMD_SKIP_TICKS; fb_buf[1] = ISR_TICKS_PER_FRAME - 1;
+        fb_buf[4] = CMD_END_BUF;
         return;
     }
 
-    wacc = vgm_wait_accum;
+    fb_wacc = vgm_wait_accum;
 
-    /* ── Макрос: проверка границы страницы после rp++ ──────────────
+    /* ── Макрос: проверка границы страницы после fb_rp++ ───────────
      * При inc HL через #FFFF -> #0000 переключаем VPL-страницу.
      * Fast-path (99.99 %): одна проверка HL==0, ~15 T-states.        */
 #define PAGE_CHK() do { \
-    if (!(uint16_t)(rp)) { cpg++; wc_mngcvpl(cpg); rp = (uint8_t *)0xC000; } \
+    if (!(uint16_t)(fb_rp)) { fb_cpg++; wc_mngcvpl(fb_cpg); fb_rp = (uint8_t *)0xC000; } \
 } while(0)
 
     /* ═══════════════════════════════════════════════════════════════
@@ -476,366 +489,356 @@ void vgm_fill_buffer(uint8_t buf_idx)
 next_hl:
     if (vgm_hl_pos >= vgm_hl_len) {
         /* Очередь исчерпана — заполнить остаток тишиной */
-        if (off == 0) {
-            buf[0] = CMD_SKIP_TICKS; buf[1] = ISR_TICKS_PER_FRAME - 1;
-            off = 4;
+        if (fb_wp == fb_buf) {
+            fb_buf[0] = CMD_SKIP_TICKS; fb_buf[1] = ISR_TICKS_PER_FRAME - 1;
+            fb_wp = fb_buf + 4;
         }
         goto finish;
     }
 
-    {
-        hl_entry_t *e = &vgm_hl_queue[vgm_hl_pos];
+    fb_e = &vgm_hl_queue[vgm_hl_pos];
 
-        switch (e->cmd) {
+    switch (fb_e->cmd) {
 
-        case HLCMD_CMDBLK:
-            /* Подключить страницу cmdblocks, найти адрес блока */
-            wc_mngc_pl(CMDBLK_PAGE);
-            rp  = (uint8_t *)((const uint16_t *)0xC000)[e->param];
-            cpg = 0;       /* не используется для cmdblk, PAGE_CHK не сработает */
-            is_vgm = 0;
-            break;
+    case HLCMD_CMDBLK:
+        /* Подключить страницу cmdblocks, найти адрес блока */
+        wc_mngc_pl(CMDBLK_PAGE);
+        fb_rp  = (uint8_t *)((const uint16_t *)0xC000)[fb_e->param];
+        fb_cpg = 0;       /* не используется для cmdblk, PAGE_CHK не сработает */
+        fb_is_vgm = 0;
+        break;
 
-        case HLCMD_PLAY:
-            cpg  = vgm_cur_page;
-            rp   = (uint8_t *)vgm_read_ptr;
-            wc_mngcvpl(cpg);
-            is_vgm = 1;
-            break;
+    case HLCMD_PLAY:
+        fb_cpg  = vgm_cur_page;
+        fb_rp   = (uint8_t *)vgm_read_ptr;
+        wc_mngcvpl(fb_cpg);
+        fb_is_vgm = 1;
+        break;
 
-        case HLCMD_LOOP:
-            if (!vgm_rewind_to_loop()) {
-                /* Нет loop-точки — пропустить */
-                vgm_hl_pos++;
-                goto next_hl;
-            }
-            vgm_loop_count++;
-            e->cmd = HLCMD_PLAY;   /* морфируем, чтобы не перематывать снова */
-            cpg  = vgm_cur_page;
-            rp   = (uint8_t *)vgm_read_ptr;
-            wacc = vgm_wait_accum;
-            wc_mngcvpl(cpg);
-            is_vgm = 1;
-            break;
-
-        case HLCMD_ISR_DONE:
-            buf[off] = CMD_ISR_DONE;
-            off += 4;
-            vgm_hl_pos++;
-            goto finish;
-
-        default:
+    case HLCMD_LOOP:
+        if (!vgm_rewind_to_loop()) {
+            /* Нет loop-точки — пропустить */
             vgm_hl_pos++;
             goto next_hl;
         }
+        vgm_loop_count++;
+        fb_e->cmd = HLCMD_PLAY;   /* морфируем, чтобы не перематывать снова */
+        fb_cpg  = vgm_cur_page;
+        fb_rp   = (uint8_t *)vgm_read_ptr;
+        fb_wacc = vgm_wait_accum;
+        wc_mngcvpl(fb_cpg);
+        fb_is_vgm = 1;
+        break;
+
+    case HLCMD_ISR_DONE:
+        fb_wp[0] = CMD_ISR_DONE;
+        fb_wp += 4;
+        vgm_hl_pos++;
+        goto finish;
+
+    default:
+        vgm_hl_pos++;
+        goto next_hl;
     }
 
-    budget = VGM_FILL_CMD_BUDGET;
+    fb_budget = VGM_FILL_CMD_BUDGET;
 
     /* ═══════════════════════════════════════════════════════════════
      * Горячий цикл — разбор VGM-опкодов → ISR-команды
      * EOF-проверка удалена (гарантирован 0x66-сентинел в данных).
      * ═══════════════════════════════════════════════════════════════ */
-    while (off < (CMD_BUF_SIZE - 48))
+    while (fb_wp < fb_buf + (CMD_BUF_SIZE - 48))
     {
         /* ── Читаем опкод ──────────────────────────────────────── */
-        op = *rp++; PAGE_CHK();
+        fb_op = *fb_rp++; PAGE_CHK();
 
         /* ═══════ OPL2 write (0x5A) — самая частая ═══════ */
-        if (op == 0x5A)
+        if (fb_op == 0x5A)
         {
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            buf[off] = CMD_WRITE_B0;
-            buf[off + 1] = b1; buf[off + 2] = b2;
-            off += 4;
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_wp[0] = CMD_WRITE_B0;
+            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
+            fb_wp += 4;
             goto do_budget;
         }
 
         /* ═══════ Frame wait 1/60 (0x62) ═══════ */
-        if (op == 0x62)
+        if (fb_op == 0x62)
         {
-            uint16_t t  = wacc + 735u;
-            uint16_t tk = t >> VGM_SAMPLE_SHIFT;
-            wacc = t & VGM_SAMPLE_MASK;
-            if (tk) {
-                emit_wait(buf, &off, tk);
-                budget = VGM_FILL_CMD_BUDGET;
+            fb_t  = fb_wacc + 735u;
+            fb_tk = fb_t >> VGM_SAMPLE_SHIFT;
+            fb_wacc = fb_t & VGM_SAMPLE_MASK;
+            if (fb_tk) {
+                emit_wait(fb_tk);
+                fb_budget = VGM_FILL_CMD_BUDGET;
             }
             continue;
         }
 
         /* ═══════ Frame wait 1/50 (0x63) ═══════ */
-        if (op == 0x63)
+        if (fb_op == 0x63)
         {
-            uint16_t t  = wacc + 882u;
-            uint16_t tk = t >> VGM_SAMPLE_SHIFT;
-            wacc = t & VGM_SAMPLE_MASK;
-            if (tk) {
-                emit_wait(buf, &off, tk);
-                budget = VGM_FILL_CMD_BUDGET;
+            fb_t  = fb_wacc + 882u;
+            fb_tk = fb_t >> VGM_SAMPLE_SHIFT;
+            fb_wacc = fb_t & VGM_SAMPLE_MASK;
+            if (fb_tk) {
+                emit_wait(fb_tk);
+                fb_budget = VGM_FILL_CMD_BUDGET;
             }
             continue;
         }
 
         /* ═══════ Short wait 1-16 samples (0x70-0x7F) ═══════ */
-        if ((op & 0xF0) == 0x70)
+        if ((fb_op & 0xF0) == 0x70)
         {
-            uint16_t t  = wacc + (uint16_t)((op & 0x0Fu) + 1u);
-            uint16_t tk = t >> VGM_SAMPLE_SHIFT;
-            wacc = t & VGM_SAMPLE_MASK;
-            if (tk) {
-                emit_wait(buf, &off, tk);
-                budget = VGM_FILL_CMD_BUDGET;
+            fb_t  = fb_wacc + (uint16_t)((fb_op & 0x0Fu) + 1u);
+            fb_tk = fb_t >> VGM_SAMPLE_SHIFT;
+            fb_wacc = fb_t & VGM_SAMPLE_MASK;
+            if (fb_tk) {
+                emit_wait(fb_tk);
+                fb_budget = VGM_FILL_CMD_BUDGET;
             }
             continue;
         }
 
-        /* ═══════ Arbitrary wait (0x61) — uint32 only here ═══════ */
-        if (op == 0x61)
+        /* ═══════ Arbitrary wait (0x61) ═══════ */
+        if (fb_op == 0x61)
         {
-            uint32_t t32;
-            uint16_t tk;
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            t32 = (uint32_t)wacc + ((uint16_t)b1 | ((uint16_t)b2 << 8));
-            tk  = (uint16_t)(t32 >> VGM_SAMPLE_SHIFT);
-            wacc = (uint16_t)(t32 & (uint32_t)VGM_SAMPLE_MASK);
-            if (tk) {
-                emit_wait(buf, &off, tk);
-                budget = VGM_FILL_CMD_BUDGET;
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_t32 = (uint32_t)fb_wacc + ((uint16_t)fb_b1 | ((uint16_t)fb_b2 << 8));
+            fb_tk  = (uint16_t)(fb_t32 >> VGM_SAMPLE_SHIFT);
+            fb_wacc = (uint16_t)(fb_t32 & (uint32_t)VGM_SAMPLE_MASK);
+            if (fb_tk) {
+                emit_wait(fb_tk);
+                fb_budget = VGM_FILL_CMD_BUDGET;
             }
             continue;
         }
 
         /* ═══════ OPL3 Bank 0 (0x5E) ═══════ */
-        if (op == 0x5E)
+        if (fb_op == 0x5E)
         {
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            buf[off] = CMD_WRITE_B0;
-            buf[off + 1] = b1; buf[off + 2] = b2;
-            off += 4;
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_wp[0] = CMD_WRITE_B0;
+            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
+            fb_wp += 4;
             goto do_budget;
         }
 
         /* ═══════ OPL1 (0x5B) ═══════ */
-        if (op == 0x5B)
+        if (fb_op == 0x5B)
         {
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            buf[off] = CMD_WRITE_B0;
-            buf[off + 1] = b1; buf[off + 2] = b2;
-            off += 4;
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_wp[0] = CMD_WRITE_B0;
+            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
+            fb_wp += 4;
             goto do_budget;
         }
 
         /* ═══════ Y8950 / MSX-AUDIO (0x5C) ═══════ */
-        if (op == 0x5C)
+        if (fb_op == 0x5C)
         {
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            buf[off] = CMD_WRITE_B0;
-            buf[off + 1] = b1; buf[off + 2] = b2;
-            off += 4;
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_wp[0] = CMD_WRITE_B0;
+            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
+            fb_wp += 4;
             goto do_budget;
         }
 
         /* ═══════ OPL3 Bank 1 (0x5F) ═══════ */
-        if (op == 0x5F)
+        if (fb_op == 0x5F)
         {
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            buf[off] = CMD_WRITE_B1;
-            buf[off + 1] = b1; buf[off + 2] = b2;
-            off += 4;
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_wp[0] = CMD_WRITE_B1;
+            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
+            fb_wp += 4;
             goto do_budget;
         }
 
         /* ═══════ YM2203 SSG+FM (0x55) ═══════ */
-        if (op == 0x55)
+        if (fb_op == 0x55)
         {
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             /* ── PSG tone period (reg 0x00-0x05): 12-bit, парами lo/hi ── */
-            if (b1 <= 0x05) {
-                uint8_t ch = b1 >> 1;           /* 0,1,2 */
-                if (b1 & 1) {
+            if (fb_b1 <= 0x05) {
+                fb_ch = fb_b1 >> 1;           /* 0,1,2 */
+                if (fb_b1 & 1) {
                     /* hi-nibble → обновить shadow, пересчитать полные 12 бит */
-                    psg_shadow[ch] = (psg_shadow[ch] & 0x00FF)
-                                   | ((uint16_t)(b2 & 0x0F) << 8);
+                    psg_shadow[fb_ch] = (psg_shadow[fb_ch] & 0x00FF)
+                                      | ((uint16_t)(fb_b2 & 0x0F) << 8);
                 } else {
                     /* lo-byte → обновить shadow */
-                    psg_shadow[ch] = (psg_shadow[ch] & 0x0F00) | b2;
+                    psg_shadow[fb_ch] = (psg_shadow[fb_ch] & 0x0F00) | fb_b2;
                 }
-                {
-                    uint16_t scaled = freq_lut_base[psg_shadow[ch]];
-                    /* Emit lo byte (reg 0,2,4) */
-                    buf[off] = CMD_WRITE_AY;
-                    buf[off + 1] = ch << 1;  /* reg = 0,2,4 */
-                    buf[off + 2] = (uint8_t)(scaled & 0xFF);
-                    off += 4;
-                    /* Emit hi nibble (reg 1,3,5) */
-                    buf[off] = CMD_WRITE_AY;
-                    buf[off + 1] = (ch << 1) | 1;  /* reg = 1,3,5 */
-                    buf[off + 2] = (uint8_t)((scaled >> 8) & 0x0F);
-                    off += 4;
-                    goto do_budget;
-                }
+                fb_scaled = freq_lut_base[psg_shadow[fb_ch]];
+                /* Emit lo byte (reg 0,2,4) */
+                fb_wp[0] = CMD_WRITE_AY;
+                fb_wp[1] = fb_ch << 1;  /* reg = 0,2,4 */
+                fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
+                fb_wp += 4;
+                /* Emit hi nibble (reg 1,3,5) */
+                fb_wp[0] = CMD_WRITE_AY;
+                fb_wp[1] = (fb_ch << 1) | 1;  /* reg = 1,3,5 */
+                fb_wp[2] = (uint8_t)((fb_scaled >> 8) & 0x0F);
+                fb_wp += 4;
+                goto do_budget;
             }
             /* ── Noise period (reg 0x06): 5-bit ── */
-            else if (b1 == 0x06) {
-                b2 = (uint8_t)(freq_lut_base[b2 & 0x1F] & 0x1F);
+            else if (fb_b1 == 0x06) {
+                fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
             /* ── FM F-Number hi+Block (reg 0xA4-0xA6): буферизовать ── */
-            else if (b1 >= 0xA4 && b1 <= 0xA6) {
-                fm_fnum_hi[b1 - 0xA4] = b2;
+            else if (fb_b1 >= 0xA4 && fb_b1 <= 0xA6) {
+                fm_fnum_hi[fb_b1 - 0xA4] = fb_b2;
                 /* НЕ записываем в буфер — дождёмся защёлки 0xA0-0xA2 */
                 goto do_budget;
             }
             /* ── FM F-Number lo (reg 0xA0-0xA2): защёлка → пересчёт ── */
-            else if (b1 >= 0xA0 && b1 <= 0xA2) {
-                uint8_t ch = b1 - 0xA0;
-                uint8_t hi = fm_fnum_hi[ch];
-                uint16_t fnum = ((uint16_t)(hi & 0x07) << 8) | b2;
-                uint8_t block = (hi >> 3) & 0x07;
-                fnum = freq_lut_base[fnum]; /* LUT: 0..2047 */
+            else if (fb_b1 >= 0xA0 && fb_b1 <= 0xA2) {
+                fb_ch = fb_b1 - 0xA0;
+                fb_fhi = fm_fnum_hi[fb_ch];
+                fb_scaled = ((uint16_t)(fb_fhi & 0x07) << 8) | fb_b2;
+                fb_block = (fb_fhi >> 3) & 0x07;
+                fb_scaled = freq_lut_base[fb_scaled]; /* LUT: 0..2047 */
                 /* Overflow: если fnum > 2047 → увеличить block */
-                while (fnum > 2047 && block < 7) {
-                    fnum >>= 1;
-                    block++;
+                while (fb_scaled > 2047 && fb_block < 7) {
+                    fb_scaled >>= 1;
+                    fb_block++;
                 }
-                if (fnum > 2047) fnum = 2047;
+                if (fb_scaled > 2047) fb_scaled = 2047;
                 /* Emit hi byte (0xA4+ch) */
-                buf[off] = CMD_WRITE_AY;
-                buf[off + 1] = 0xA4 + ch;
-                buf[off + 2] = (uint8_t)((block << 3) | ((fnum >> 8) & 0x07));
-                off += 4;
+                fb_wp[0] = CMD_WRITE_AY;
+                fb_wp[1] = 0xA4 + fb_ch;
+                fb_wp[2] = (uint8_t)((fb_block << 3) | ((fb_scaled >> 8) & 0x07));
+                fb_wp += 4;
                 /* Emit lo byte (0xA0+ch) — защёлка */
-                buf[off] = CMD_WRITE_AY;
-                buf[off + 1] = b1;
-                buf[off + 2] = (uint8_t)(fnum & 0xFF);
-                off += 4;
+                fb_wp[0] = CMD_WRITE_AY;
+                fb_wp[1] = fb_b1;
+                fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
+                fb_wp += 4;
                 goto do_budget;
             }
           }
 #endif /* VGM_FREQ_SCALE */
-            buf[off] = CMD_WRITE_AY;
-            buf[off + 1] = b1; buf[off + 2] = b2;
-            off += 4;
+            fb_wp[0] = CMD_WRITE_AY;
+            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
+            fb_wp += 4;
             goto do_budget;
         }
 
         /* ═══════ AY8910 dual (0xA0) ═══════ */
-        if (op == 0xA0)
+        if (fb_op == 0xA0)
         {
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
-            uint8_t reg = b1 & 0x7F;
+            fb_reg = fb_b1 & 0x7F;
             /* PSG tone period (reg 0-5): полный 12-бит через shadow */
-            if (reg <= 0x05) {
-                uint8_t ch = reg >> 1;
-                if (reg & 1) {
-                    psg_shadow[ch] = (psg_shadow[ch] & 0x00FF)
-                                   | ((uint16_t)(b2 & 0x0F) << 8);
+            if (fb_reg <= 0x05) {
+                fb_ch = fb_reg >> 1;
+                if (fb_reg & 1) {
+                    psg_shadow[fb_ch] = (psg_shadow[fb_ch] & 0x00FF)
+                                      | ((uint16_t)(fb_b2 & 0x0F) << 8);
                 } else {
-                    psg_shadow[ch] = (psg_shadow[ch] & 0x0F00) | b2;
+                    psg_shadow[fb_ch] = (psg_shadow[fb_ch] & 0x0F00) | fb_b2;
                 }
-                {
-                    uint16_t scaled = freq_lut_base[psg_shadow[ch]];
-                    /* AY (0xA0): emit оба байта сразу */
-                    buf[off] = (b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
-                    buf[off + 1] = ch << 1;  /* lo reg */
-                    buf[off + 2] = (uint8_t)(scaled & 0xFF);
-                    off += 4;
-                    buf[off] = (b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
-                    buf[off + 1] = (ch << 1) | 1;  /* hi reg */
-                    buf[off + 2] = (uint8_t)((scaled >> 8) & 0x0F);
-                    off += 4;
-                    goto do_budget;
-                }
+                fb_scaled = freq_lut_base[psg_shadow[fb_ch]];
+                /* AY (0xA0): emit оба байта сразу */
+                fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
+                fb_wp[1] = fb_ch << 1;  /* lo reg */
+                fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
+                fb_wp += 4;
+                fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
+                fb_wp[1] = (fb_ch << 1) | 1;  /* hi reg */
+                fb_wp[2] = (uint8_t)((fb_scaled >> 8) & 0x0F);
+                fb_wp += 4;
+                goto do_budget;
             }
             /* Noise period (reg 6) */
-            else if (reg == 0x06) {
-                b2 = (uint8_t)(freq_lut_base[b2 & 0x1F] & 0x1F);
+            else if (fb_reg == 0x06) {
+                fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
           }
 #endif
-            buf[off]     = (b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
-            buf[off + 1] = b1 & 0x7F;
-            buf[off + 2] = b2;
-            off += 4;
+            fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
+            fb_wp[1] = fb_b1 & 0x7F;
+            fb_wp[2] = fb_b2;
+            fb_wp += 4;
             goto do_budget;
         }
 
         /* ═══════ SAA1099 dual (0xBD) ═══════ */
-        if (op == 0xBD)
+        if (fb_op == 0xBD)
         {
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            buf[off]     = (b1 & 0x80) ? CMD_WRITE_SAA2 : CMD_WRITE_SAA;
-            buf[off + 1] = b1 & 0x7F;
-            buf[off + 2] = b2;
-            off += 4;
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_SAA2 : CMD_WRITE_SAA;
+            fb_wp[1] = fb_b1 & 0x7F;
+            fb_wp[2] = fb_b2;
+            fb_wp += 4;
             goto do_budget;
         }
 
         /* ═══════ End of data (0x66) ═══════ */
-        if (op == 0x66)
+        if (fb_op == 0x66)
         {
-            if (is_vgm) {
+            if (fb_is_vgm) {
                 vgm_song_ended = 1;
-                /* Сохранить VGM-состояние (rp уже за 0x66) */
-                vgm_cur_page   = cpg;
-                vgm_read_ptr   = (uint16_t)rp;
-                vgm_wait_accum = wacc;
+                vgm_cur_page   = fb_cpg;
+                vgm_read_ptr   = (uint16_t)fb_rp;
+                vgm_wait_accum = fb_wacc;
             }
             vgm_hl_pos++;
-            goto next_hl;   /* продолжить заполнение из следующей HL-команды */
+            goto next_hl;
         }
 
         /* ═══════ Data block (0x67) — rare ═══════ */
-        if (op == 0x67)
+        if (fb_op == 0x67)
         {
-            uint32_t sz;
-            rp++; PAGE_CHK();  /* 0x66 */
-            rp++; PAGE_CHK();  /* type */
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            sz = (uint16_t)b1 | ((uint16_t)b2 << 8);
-            b1 = *rp++; PAGE_CHK();
-            b2 = *rp++; PAGE_CHK();
-            sz |= ((uint32_t)b1 << 16) | ((uint32_t)b2 << 24);
+            fb_rp++; PAGE_CHK();  /* 0x66 */
+            fb_rp++; PAGE_CHK();  /* type */
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_t32 = (uint16_t)fb_b1 | ((uint16_t)fb_b2 << 8);
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+            fb_t32 |= ((uint32_t)fb_b1 << 16) | ((uint32_t)fb_b2 << 24);
             /* save → call vgm_skip → reload */
-            vgm_read_ptr = (uint16_t)rp;
-            vgm_cur_page = cpg;
-            vgm_skip(sz);
-            rp  = (uint8_t *)vgm_read_ptr;
-            cpg = vgm_cur_page;
+            vgm_read_ptr = (uint16_t)fb_rp;
+            vgm_cur_page = fb_cpg;
+            vgm_skip(fb_t32);
+            fb_rp  = (uint8_t *)vgm_read_ptr;
+            fb_cpg = vgm_cur_page;
             continue;
         }
 
         /* ═══════ PCM RAM write (0x68) — rare ═══════ */
-        if (op == 0x68)
+        if (fb_op == 0x68)
         {
-            vgm_read_ptr = (uint16_t)rp;
-            vgm_cur_page = cpg;
+            vgm_read_ptr = (uint16_t)fb_rp;
+            vgm_cur_page = fb_cpg;
             vgm_skip(11);
-            rp  = (uint8_t *)vgm_read_ptr;
-            cpg = vgm_cur_page;
+            fb_rp  = (uint8_t *)vgm_read_ptr;
+            fb_cpg = vgm_cur_page;
             continue;
         }
 
         /* ═══════ DAC Stream (0x90-0x95) — rare ═══════ */
-        if (op >= 0x90 && op <= 0x95)
+        if (fb_op >= 0x90 && fb_op <= 0x95)
         {
             static const uint8_t dac_len[] = {4, 4, 5, 10, 1, 4};
-            uint8_t n = dac_len[op - 0x90];
-            while (n--) { rp++; PAGE_CHK(); }
+            fb_n = dac_len[fb_op - 0x90];
+            while (fb_n--) { fb_rp++; PAGE_CHK(); }
             continue;
         }
 
@@ -844,47 +847,47 @@ next_hl:
          * Все явно обработанные опкоды (0x5A,0x5B,..,0xA0,0xBD,
          * 0x61-0x63,0x66-0x68,0x7n,0x90-0x95) сюда не попадают.    */
         {
-            uint8_t n = 0;
-            if      (op < 0x30)  n = 0;   /* ниже 0x30 — нет данных  */
-            else if (op < 0x40)  n = 1;   /* 0x30-0x3F: reserved 1-op */
-            else if (op < 0x4F)  n = 2;   /* 0x40-0x4E: reserved 2-op */
-            else if (op <= 0x50) n = 1;   /* 0x4F GG PSG / 0x50 SN76489 */
-            else if (op < 0x60)  n = 2;   /* 0x51-0x5F: chip writes 2-op */
-            else if (op == 0x64) n = 3;   /* 0x64: wait override (cc nn nn) */
-            else if (op < 0xA0)  n = 0;   /* 0x8n DAC+wait, прочее 0x6x/9x */
-            else if (op < 0xC0)  n = 2;   /* 0xA0-0xBF: chip writes 2-op */
-            else if (op < 0xE0)  n = 3;   /* 0xC0-0xDF: chip writes 3-op */
-            else                 n = 4;   /* 0xE0-0xFF: chip writes 4-op */
-            while (n--) { rp++; PAGE_CHK(); }
+            fb_n = 0;
+            if      (fb_op < 0x30)  fb_n = 0;   /* ниже 0x30 — нет данных  */
+            else if (fb_op < 0x40)  fb_n = 1;   /* 0x30-0x3F: reserved 1-op */
+            else if (fb_op < 0x4F)  fb_n = 2;   /* 0x40-0x4E: reserved 2-op */
+            else if (fb_op <= 0x50) fb_n = 1;   /* 0x4F GG PSG / 0x50 SN76489 */
+            else if (fb_op < 0x60)  fb_n = 2;   /* 0x51-0x5F: chip writes 2-op */
+            else if (fb_op == 0x64) fb_n = 3;   /* 0x64: wait override (cc nn nn) */
+            else if (fb_op < 0xA0)  fb_n = 0;   /* 0x8n DAC+wait, прочее 0x6x/9x */
+            else if (fb_op < 0xC0)  fb_n = 2;   /* 0xA0-0xBF: chip writes 2-op */
+            else if (fb_op < 0xE0)  fb_n = 3;   /* 0xC0-0xDF: chip writes 3-op */
+            else                    fb_n = 4;   /* 0xE0-0xFF: chip writes 4-op */
+            while (fb_n--) { fb_rp++; PAGE_CHK(); }
         }
         continue;
 
     do_budget:
-        if (--budget == 0)
+        if (--fb_budget == 0)
         {
-            emit_wait(buf, &off, 1);
-            budget = VGM_FILL_CMD_BUDGET;
+            emit_wait(1);
+            fb_budget = VGM_FILL_CMD_BUDGET;
         }
     }
 
 #undef PAGE_CHK
 
     /* Буфер заполнен — сохранить VGM-состояние если читали файл */
-    if (is_vgm) {
-        vgm_cur_page    = cpg;
-        vgm_read_ptr    = (uint16_t)rp;
-        vgm_wait_accum  = wacc;
+    if (fb_is_vgm) {
+        vgm_cur_page    = fb_cpg;
+        vgm_read_ptr    = (uint16_t)fb_rp;
+        vgm_wait_accum  = fb_wacc;
     }
 
 finish:
     /* Принудительная пауза перед CMD_END_BUF — гарантирует, что ISR
      * не обработает хвост этого буфера + голову следующего за один тик
      * (иначе пропуск INT-позиции и падение темпа в десятки раз).       */
-    buf[off] = CMD_SKIP_TICKS;
-    buf[off + 1] = 0;
-    off += 4;
+    fb_wp[0] = CMD_SKIP_TICKS;
+    fb_wp[1] = 0;
+    fb_wp += 4;
 
-    buf[off] = CMD_END_BUF;
+    fb_wp[0] = CMD_END_BUF;
 }
 
 /* ── GD3 metadata buffers ────────────────────────────────────────── */
