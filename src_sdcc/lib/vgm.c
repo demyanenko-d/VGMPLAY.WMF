@@ -380,21 +380,17 @@ static void emit_wait(uint8_t *buf, uint16_t *poff, uint16_t tk)
                 buf[off] = CMD_WAIT;
                 buf[off+1] = (uint8_t)(w - 1);
                 buf[off+2] = (uint8_t)((w - 1) >> 8);
-                buf[off+3] = 0;
                 off += 4;
                 buf[off] = CMD_SKIP_TICKS;
                 buf[off+1] = ISR_TICKS_PER_FRAME - 1;
-                buf[off+2] = 0; buf[off+3] = 0;
                 off += 4;
             } else if (ns >= 1) {
                 buf[off] = CMD_SKIP_TICKS;
                 buf[off+1] = (uint8_t)(ns - 1);
-                buf[off+2] = 0; buf[off+3] = 0;
                 off += 4;
             }
             /* CMD_INC_SEC */
             buf[off] = CMD_INC_SEC;
-            buf[off+1] = 0; buf[off+2] = 0; buf[off+3] = 0;
             off += 4;
 
             tk -= vgm_sec_budget;
@@ -409,7 +405,6 @@ static void emit_wait(uint8_t *buf, uint16_t *poff, uint16_t tk)
             buf[off] = CMD_WAIT;
             buf[off+1] = (uint8_t)(w - 1);
             buf[off+2] = (uint8_t)((w - 1) >> 8);
-            buf[off+3] = 0;
             off += 4;
             vgm_sec_budget -= w;
             tk = ISR_TICKS_PER_FRAME;
@@ -417,7 +412,6 @@ static void emit_wait(uint8_t *buf, uint16_t *poff, uint16_t tk)
         /* Последние ≤ISR_TICKS_PER_FRAME тиков через SKIP (экономия CPU) */
         buf[off] = CMD_SKIP_TICKS;
         buf[off+1] = (uint8_t)(tk - 1);
-        buf[off+2] = 0; buf[off+3] = 0;
         off += 4;
         vgm_sec_budget -= tk;
         tk = 0;
@@ -460,8 +454,8 @@ void vgm_fill_buffer(uint8_t buf_idx)
 
     /* Пауза — заполнить тишиной */
     if (vgm_paused) {
-        buf[0] = CMD_SKIP_TICKS; buf[1] = ISR_TICKS_PER_FRAME - 1; buf[2] = 0; buf[3] = 0;
-        buf[4] = CMD_END_BUF;    buf[5] = 0;  buf[6] = 0; buf[7] = 0;
+        buf[0] = CMD_SKIP_TICKS; buf[1] = ISR_TICKS_PER_FRAME - 1;
+        buf[4] = CMD_END_BUF;
         return;
     }
 
@@ -483,7 +477,7 @@ next_hl:
     if (vgm_hl_pos >= vgm_hl_len) {
         /* Очередь исчерпана — заполнить остаток тишиной */
         if (off == 0) {
-            buf[0] = CMD_SKIP_TICKS; buf[1] = ISR_TICKS_PER_FRAME - 1; buf[2] = 0; buf[3] = 0;
+            buf[0] = CMD_SKIP_TICKS; buf[1] = ISR_TICKS_PER_FRAME - 1;
             off = 4;
         }
         goto finish;
@@ -526,7 +520,6 @@ next_hl:
 
         case HLCMD_ISR_DONE:
             buf[off] = CMD_ISR_DONE;
-            buf[off+1] = 0; buf[off+2] = 0; buf[off+3] = 0;
             off += 4;
             vgm_hl_pos++;
             goto finish;
@@ -554,7 +547,7 @@ next_hl:
             b1 = *rp++; PAGE_CHK();
             b2 = *rp++; PAGE_CHK();
             buf[off] = CMD_WRITE_B0;
-            buf[off + 1] = b1; buf[off + 2] = b2; buf[off + 3] = 0;
+            buf[off + 1] = b1; buf[off + 2] = b2;
             off += 4;
             goto do_budget;
         }
@@ -621,7 +614,7 @@ next_hl:
             b1 = *rp++; PAGE_CHK();
             b2 = *rp++; PAGE_CHK();
             buf[off] = CMD_WRITE_B0;
-            buf[off + 1] = b1; buf[off + 2] = b2; buf[off + 3] = 0;
+            buf[off + 1] = b1; buf[off + 2] = b2;
             off += 4;
             goto do_budget;
         }
@@ -632,7 +625,7 @@ next_hl:
             b1 = *rp++; PAGE_CHK();
             b2 = *rp++; PAGE_CHK();
             buf[off] = CMD_WRITE_B0;
-            buf[off + 1] = b1; buf[off + 2] = b2; buf[off + 3] = 0;
+            buf[off + 1] = b1; buf[off + 2] = b2;
             off += 4;
             goto do_budget;
         }
@@ -643,7 +636,7 @@ next_hl:
             b1 = *rp++; PAGE_CHK();
             b2 = *rp++; PAGE_CHK();
             buf[off] = CMD_WRITE_B0;
-            buf[off + 1] = b1; buf[off + 2] = b2; buf[off + 3] = 0;
+            buf[off + 1] = b1; buf[off + 2] = b2;
             off += 4;
             goto do_budget;
         }
@@ -654,7 +647,7 @@ next_hl:
             b1 = *rp++; PAGE_CHK();
             b2 = *rp++; PAGE_CHK();
             buf[off] = CMD_WRITE_B1;
-            buf[off + 1] = b1; buf[off + 2] = b2; buf[off + 3] = 0;
+            buf[off + 1] = b1; buf[off + 2] = b2;
             off += 4;
             goto do_budget;
         }
@@ -683,13 +676,11 @@ next_hl:
                     buf[off] = CMD_WRITE_AY;
                     buf[off + 1] = ch << 1;  /* reg = 0,2,4 */
                     buf[off + 2] = (uint8_t)(scaled & 0xFF);
-                    buf[off + 3] = 0;
                     off += 4;
                     /* Emit hi nibble (reg 1,3,5) */
                     buf[off] = CMD_WRITE_AY;
                     buf[off + 1] = (ch << 1) | 1;  /* reg = 1,3,5 */
                     buf[off + 2] = (uint8_t)((scaled >> 8) & 0x0F);
-                    buf[off + 3] = 0;
                     off += 4;
                     goto do_budget;
                 }
@@ -721,20 +712,18 @@ next_hl:
                 buf[off] = CMD_WRITE_AY;
                 buf[off + 1] = 0xA4 + ch;
                 buf[off + 2] = (uint8_t)((block << 3) | ((fnum >> 8) & 0x07));
-                buf[off + 3] = 0;
                 off += 4;
                 /* Emit lo byte (0xA0+ch) — защёлка */
                 buf[off] = CMD_WRITE_AY;
                 buf[off + 1] = b1;
                 buf[off + 2] = (uint8_t)(fnum & 0xFF);
-                buf[off + 3] = 0;
                 off += 4;
                 goto do_budget;
             }
           }
 #endif /* VGM_FREQ_SCALE */
             buf[off] = CMD_WRITE_AY;
-            buf[off + 1] = b1; buf[off + 2] = b2; buf[off + 3] = 0;
+            buf[off + 1] = b1; buf[off + 2] = b2;
             off += 4;
             goto do_budget;
         }
@@ -762,12 +751,10 @@ next_hl:
                     buf[off] = (b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
                     buf[off + 1] = ch << 1;  /* lo reg */
                     buf[off + 2] = (uint8_t)(scaled & 0xFF);
-                    buf[off + 3] = 0;
                     off += 4;
                     buf[off] = (b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
                     buf[off + 1] = (ch << 1) | 1;  /* hi reg */
                     buf[off + 2] = (uint8_t)((scaled >> 8) & 0x0F);
-                    buf[off + 3] = 0;
                     off += 4;
                     goto do_budget;
                 }
@@ -781,7 +768,6 @@ next_hl:
             buf[off]     = (b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
             buf[off + 1] = b1 & 0x7F;
             buf[off + 2] = b2;
-            buf[off + 3] = 0;
             off += 4;
             goto do_budget;
         }
@@ -794,7 +780,6 @@ next_hl:
             buf[off]     = (b1 & 0x80) ? CMD_WRITE_SAA2 : CMD_WRITE_SAA;
             buf[off + 1] = b1 & 0x7F;
             buf[off + 2] = b2;
-            buf[off + 3] = 0;
             off += 4;
             goto do_budget;
         }
@@ -855,17 +840,21 @@ next_hl:
         }
 
         /* ═══════ Generic skip (all other commands) ═══════ */
+        /* Размеры операндов по VGM spec v1.71.
+         * Все явно обработанные опкоды (0x5A,0x5B,..,0xA0,0xBD,
+         * 0x61-0x63,0x66-0x68,0x7n,0x90-0x95) сюда не попадают.    */
         {
             uint8_t n = 0;
-            if      (op < 0x30)  n = 0;
-            else if (op < 0x40)  n = 1;
-            else if (op < 0x4F)  n = 2;
-            else if (op <= 0x50) n = 1;
-            else if (op < 0x60)  n = 2;
-            else if (op < 0xA0)  n = 0;   /* 0x80-0x9F: 1-byte cmds */
-            else if (op < 0xC0)  n = 2;
-            else if (op < 0xE0)  n = 3;
-            else                 n = 4;
+            if      (op < 0x30)  n = 0;   /* ниже 0x30 — нет данных  */
+            else if (op < 0x40)  n = 1;   /* 0x30-0x3F: reserved 1-op */
+            else if (op < 0x4F)  n = 2;   /* 0x40-0x4E: reserved 2-op */
+            else if (op <= 0x50) n = 1;   /* 0x4F GG PSG / 0x50 SN76489 */
+            else if (op < 0x60)  n = 2;   /* 0x51-0x5F: chip writes 2-op */
+            else if (op == 0x64) n = 3;   /* 0x64: wait override (cc nn nn) */
+            else if (op < 0xA0)  n = 0;   /* 0x8n DAC+wait, прочее 0x6x/9x */
+            else if (op < 0xC0)  n = 2;   /* 0xA0-0xBF: chip writes 2-op */
+            else if (op < 0xE0)  n = 3;   /* 0xC0-0xDF: chip writes 3-op */
+            else                 n = 4;   /* 0xE0-0xFF: chip writes 4-op */
             while (n--) { rp++; PAGE_CHK(); }
         }
         continue;
@@ -892,11 +881,10 @@ finish:
      * не обработает хвост этого буфера + голову следующего за один тик
      * (иначе пропуск INT-позиции и падение темпа в десятки раз).       */
     buf[off] = CMD_SKIP_TICKS;
-    buf[off + 1] = 0; buf[off + 2] = 0; buf[off + 3] = 0;
+    buf[off + 1] = 0;
     off += 4;
 
     buf[off] = CMD_END_BUF;
-    buf[off + 1] = 0; buf[off + 2] = 0; buf[off + 3] = 0;
 }
 
 /* ── GD3 metadata buffers ────────────────────────────────────────── */
