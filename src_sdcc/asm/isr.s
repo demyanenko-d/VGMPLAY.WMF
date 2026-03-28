@@ -80,7 +80,7 @@ AY_DATA_B  = 0xBF       ; B-byte, C=#FD  → #BFFD
 ;   SAA1:  addr=#00FF  data=#01FF
 ;   SAA2:  addr=#02FF  data=#03FF
 
-ISR_FREQ = 1367
+ISR_FREQ = 1367   ; informational only (actual timing from pos_table)
 
 ;==============================================================================
 ; isr_init() — Перехват вектора IM2 WC и настройка 2734 Hz

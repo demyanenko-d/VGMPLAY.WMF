@@ -30,8 +30,14 @@ set CFLAGS=-mz80 --sdcccall 1 --no-std-crt0 --opt-code-size -I inc --disable-war
 REM --- Флаги ассемблера (sdas) ---
 set ASFLAGS=-plosff
 
+REM --- Читаем параметры варианта из variant_cfg.h ---
+for /f "tokens=3" %%a in ('findstr /C:"#define VARIANT_POS_ENTRIES" inc\variant_cfg.h') do set POS_ENTRIES=%%a
+for /f "tokens=3" %%a in ('findstr /C:"#define VARIANT_POS_STEP" inc\variant_cfg.h') do set POS_STEP=%%a
+for /f "tokens=3" %%a in ('findstr /C:"#define VARIANT_DATA_LOC" inc\variant_cfg.h') do set DATA_LOC=%%a
+echo   variant_cfg: entries=%POS_ENTRIES% step=%POS_STEP% data-loc=%DATA_LOC%
+
 echo [1/8] Генерация pos_table.s...
-node scripts\gen_pos_table.js --entries 28 --step 2560
+node scripts\gen_pos_table.js --entries %POS_ENTRIES% --step %POS_STEP%
 if errorlevel 1 ( echo FAIL gen_pos_table && goto :err )
 
 echo [2/8] Генерация freq_tables.bin...
@@ -91,7 +97,7 @@ REM Layout: CODE #8000–#B83F, DATA #B8A0–#BFFF
 REM   Все секции (DATA + GSINIT + HOME + INITIALIZER) должны
 REM   уместиться до #BFFF (Win2).  Если CODE вырастет →
 REM   понизить --data-loc или оптимизировать код.
-sdcc -mz80 --no-std-crt0 --out-fmt-ihx --code-loc 0x8000 --data-loc 0xB820 ^
+sdcc -mz80 --no-std-crt0 --out-fmt-ihx --code-loc 0x8000 --data-loc %DATA_LOC% ^
     build\crt0.rel ^
     build\main.rel ^
     build\vgm.rel  ^

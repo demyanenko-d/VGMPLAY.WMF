@@ -104,12 +104,7 @@ static uint8_t  fb_block;  /* temp: FM block                           */
 static uint8_t  fb_reg;    /* temp: AY register (0xA0 handler)         */
 #endif
 
-/* ── Лимит команд между принудительными yield ──────────────────────── */
-/* Вариант v4_b16_hf: step=2560, ISR_FREQ=1367, TPF=28.
- * Бюджет ISR-тика: 2560 T-states @ 7 МГц.
- * ИНВАРИАНТ: N_cmds × worst_cmd_T + overhead ≤ step.
- * build_variants.ps1 переопределяет это значение per-variant.         */
-#define VGM_FILL_CMD_BUDGET 16u
+/* VGM_FILL_CMD_BUDGET определён в variant_cfg.h (через isr.h) */
 
 
 /* ── Chip scan table (ROM-const) ────────────────────────────────────── */
@@ -590,6 +585,7 @@ next_hl:
         }
 
         /* ═══════ Short wait 1-16 samples (0x70-0x7F) ═══════ */
+#ifndef VGM_NO_SHORT_WAITS
         if ((fb_op & 0xF0) == 0x70)
         {
             fb_t  = fb_wacc + (uint16_t)((fb_op & 0x0Fu) + 1u);
@@ -601,6 +597,10 @@ next_hl:
             }
             continue;
         }
+#else
+        /* VGM_NO_SHORT_WAITS: пропуск коротких пауз 0x70-0x7F */
+        if ((fb_op & 0xF0) == 0x70) continue;
+#endif
 
         /* ═══════ Arbitrary wait (0x61) ═══════ */
         if (fb_op == 0x61)

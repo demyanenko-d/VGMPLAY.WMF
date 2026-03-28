@@ -91,16 +91,8 @@
 /* ── Размер командного буфера ────────────────────────────────────── */
 #define CMD_BUF_SIZE  512   /* байт; 128 команд по 4 байта           */
 
-/* ── Частота ISR ─────────────────────────────────────────────────── */
-#define ISR_FREQ              1367  /* тиков/сек = 3500000 / STEP       */
-
-/* Тиков ISR на TV-кадр (= 71680 / STEP).  56@2734, 28@1367, 112@5468 */
-#define ISR_TICKS_PER_FRAME   28
-
-/* VGM 44100 Hz → ISR тики: divisor = 44100/ISR_FREQ ≈ 2^SHIFT        */
-/*   SHIFT=4 (÷16) @2734,  SHIFT=5 (÷32) @1367,  SHIFT=3 (÷8) @5468  */
-#define VGM_SAMPLE_SHIFT      5
-#define VGM_SAMPLE_MASK       0x1Fu
+/* ── Параметры варианта (ISR_FREQ, VGM_SAMPLE_*, budget) ───── */
+#include "variant_cfg.h"
 
 /* ── Переменные ISR (volatile = разделяемые между ISR и main) ────── */
 

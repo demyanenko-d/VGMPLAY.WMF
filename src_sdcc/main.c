@@ -25,6 +25,10 @@
 #include "inc/keys.h"
 #include <string.h>
 
+/* Stringify helpers for compile-time ISR_FREQ / budget in title */
+#define _STR(x) #x
+#define STR(x)  _STR(x)
+
 /* ── Inflate progress bar params (defined in inflate_call.s _DATA) ────── */
 extern uint8_t  ifl_pb_text_pg;
 extern uint16_t ifl_pb_attr_ofs;
@@ -320,7 +324,7 @@ static void draw_pre_load_info(void)
     uint8_t row = 1;
 
     buf_clear(work_buf);
-    buf_append_str(work_buf, "              VGM Player ver 0.4 (beta)");
+    buf_append_str(work_buf, "    VGM Player v0.4 " STR(ISR_FREQ) "Hz/b" STR(VGM_FILL_CMD_BUDGET));
     print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
     row = 3;
 
@@ -346,7 +350,7 @@ uint8_t drow_ui(void)
 
     // Заголовок ---------------------------------------------------------------------------------------
     buf_clear(work_buf);
-    buf_append_str(work_buf, "       VGM Player ver 0.4 (beta)");
+    buf_append_str(work_buf, "    VGM Player v0.4 " STR(ISR_FREQ) "Hz/b" STR(VGM_FILL_CMD_BUDGET));
     print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
     row += 2;
 
