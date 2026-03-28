@@ -7,9 +7,16 @@
 ;
 ; Memory layout during decompression (interrupts disabled):
 ;   Win 0 (0x0000–0x3FFF): Source VGZ data (rotating pages)
-;   Win 1 (0x4000–0x7FFF): History page for backref (dest_page - 1)
+;   Win 1 (0x4000–0x7FFF): Source VGZ next page (contiguous 32K src window)
+;                           Temporarily: backref history (dest_page - 1) during LDIR
 ;   Win 2 (0x8000–0xBFFF): Decode working buffer (fixed page PAGE_DECODE)
 ;   Win 3 (0xC000–0xFFFF): This code + RAM tables (extra WMF page)
+;
+; SamFlate was designed for SAM Coupe where LMPR gives a 32K contiguous
+; source window (sections A+B).  On TSConfig, Win 0+Win 1 together provide
+; the same 32K window so that source reads never fall off the page boundary
+; between output flushes.  Win 1 is briefly remapped for backref LDIR, then
+; immediately restored to src_page + 1.
 ;
 ; Entry: Called via JP 0xC200 (inflate_init) from inflate_call.s
 ;   A  = source start physical page (e.g. #A1 for TAP)
@@ -129,6 +136,24 @@ entry:
 ;  inflate_init MUST start at or after 0xC102 to survive.
 ;  We place it at 0xC200 for a clean round address.
 ; ============================================================================
+        DS #C1F0 - $, 0
+
+; ── Progress bar parameter block ────────────────────────────────────────
+; Written by inflate_call.s before JP 0xC200.
+; Safe from LDIR overflow (max 258 bytes → 0xC102 < 0xC1F0).
+;
+; inflate_call.s uses absolute addresses 0xC1F0–0xC1F7 to write these.
+; ────────────────────────────────────────────────────────────────────────
+pb_text_pg:     DB 0            ; 0xC1F0: text screen physical page
+pb_attr_lo:     DB 0            ; 0xC1F1: attr base offset low byte (bit7=1, attr area)
+pb_attr_hi:     DB 0            ; 0xC1F2: attr base offset high byte
+pb_total:       DB 0            ; 0xC1F3: estimated total output pages (0=disabled)
+pb_bar_w:       DB 0            ; 0xC1F4: bar width in columns
+pb_green:       DB 0            ; 0xC1F5: green attr value
+pb_error:       DB 0            ; 0xC1F6: Bresenham error accumulator (runtime)
+pb_col:         DB 0            ; 0xC1F7: current filled column (runtime)
+
+        ASSERT $ <= #C200, "progress block overflows past inflate_init!"
         DS #C200 - $, 0
 
 ; ============================================================================
@@ -160,9 +185,12 @@ inflate_init:
         ld      a, PAGE_DECODE
         OUT_W2
 
-        ; Remap Win 0 = first source page
+        ; Remap Win 0+1 = first two source pages (32K contiguous window)
         ld      a, (src_page + 1)
         OUT_W0
+        inc     a
+        ld      b, HIGH PORT_W1         ; C still = #AF from OUT_W0
+        out     (c), a                  ; Win 1 = src_page + 1
 
         ; Source pointer at start of Win 0, decode buffer at 0x8000
         ld      hl, #0000
@@ -314,6 +342,8 @@ bt0_flushed:
         ld      (dst + 1), hl
         ld      a, (dst_page + 1)
         inc     a
+        cp      #60                     ; megabuffer limit (0x20-0x5F)
+        jp      nc, fail                ; overflow → abort
         ld      (dst_page + 1), a
         dec     a
         dec     a
@@ -337,6 +367,10 @@ bt0_no_srcroll:
 
         ld      a, (src_page + 1)
         OUT_W0
+        inc     a
+        ld      b, HIGH PORT_W1         ; C still = #AF from OUT_W0
+        out     (c), a                  ; Win 1 = src_page + 1
+        call    progress_update
 
         ld      de, #8000
 bt0_remaining   EQU     $
@@ -705,10 +739,13 @@ dst_page_m2     EQU     $
 
         ldir
 
-        ; Restore Win 0 = source (BC=0 after LDIR)
+        ; Restore Win 0+1 = source pages (BC=0 after LDIR)
 src_page        EQU     $
         ld      a, 0
         OUT_W0
+        inc     a
+        ld      b, HIGH PORT_W1         ; C still = #AF from OUT_W0
+        out     (c), a                  ; Win 1 = src_page + 1
 
         bit     6, d
         jp      z, decode_tableloop
@@ -755,6 +792,8 @@ cpd_done:
         ld      (dst + 1), hl
         ld      a, (dst_page + 1)
         inc     a
+        cp      #60                     ; megabuffer limit (0x20-0x5F)
+        jp      nc, fail                ; overflow → abort
         ld      (dst_page + 1), a
         dec     a
         dec     a
@@ -790,6 +829,10 @@ cpd_no_srcroll:
         exx
         ld      a, (src_page + 1)
         OUT_W0
+        inc     a
+        ld      b, HIGH PORT_W1         ; C still = #AF from OUT_W0
+        out     (c), a                  ; Win 1 = src_page + 1
+        call    progress_update
         jp      decode_tableloop
 
 
@@ -841,6 +884,89 @@ fail:
         OUT_W2
         ld      a, 1
         scf
+        ret
+
+
+; ============================================================================
+;  PROGRESS BAR UPDATE (Bresenham proportional column fill)
+;
+;  Called after each output page flush (from copy_decoded_page and bt0 flush).
+;  Briefly remaps Win 0 to the text screen page, writes green attr bytes
+;  to fill the progress bar proportionally, restores Win 0 to source page.
+;
+;  Destroys: A, BC, DE, HL.  Alternate registers untouched.
+;  Parameters in pb_* block at 0xC1F0 (set by inflate_call.s before entry).
+; ============================================================================
+progress_update:
+        ld      a, (pb_total)
+        or      a
+        ret     z                       ; 0 = disabled
+
+        ; Bar already full?
+        ld      a, (pb_col)
+        ld      hl, pb_bar_w
+        cp      (hl)
+        ret     nc                      ; col >= width → done
+
+        ; Bresenham: error += bar_width
+        ld      a, (pb_error)
+        add     a, (hl)                 ; (hl) still = pb_bar_w
+        ld      d, a                    ; D = new error
+
+        ; E = total
+        ld      a, (pb_total)
+        ld      e, a
+
+        ; error < total → no column this time
+        ld      a, d
+        cp      e
+        jr      c, pb_save_err          ; skip fill, just save error
+
+        ; ═══ At least one column to fill ═══
+        ; Map Win 0 → text screen page
+        ld      a, (pb_text_pg)
+        OUT_W0                          ; destroys BC
+
+        ; HL = attr base address (bit7 of L is already set)
+        ld      a, (pb_attr_hi)
+        ld      h, a
+        ld      a, (pb_attr_lo)
+        ld      l, a
+        ld      a, (pb_col)
+        add     a, l
+        ld      l, a                    ; attr area: stride 1, no overflow
+        ; C = green attr value, B = bar width limit
+        ld      a, (pb_green)
+        ld      c, a
+        ld      a, (pb_bar_w)
+        ld      b, a
+
+pb_fill_loop:
+        ld      (hl), c                 ; write green attr
+        inc     l                       ; next column (stride 1, same row)
+
+        ; pb_col++
+        ld      a, (pb_col)
+        inc     a
+        ld      (pb_col), a
+        cp      b                       ; col >= bar_width?
+        jr      nc, pb_fill_done
+
+        ; error -= total
+        ld      a, d
+        sub     e
+        ld      d, a
+        cp      e                       ; still >= total?
+        jr      nc, pb_fill_loop
+
+pb_fill_done:
+        ; Restore Win 0 → source page
+        ld      a, (src_page + 1)
+        OUT_W0                          ; destroys BC
+
+pb_save_err:
+        ld      a, d
+        ld      (pb_error), a
         ret
 
 

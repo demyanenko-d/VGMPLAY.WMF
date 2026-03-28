@@ -15,11 +15,11 @@ _wc_gadrw::
         pop     ix                      ; IX = win
         ld      a, #0x05
         call    WC_ENTRY                ; HL = result addr
-        pop     de                      ; remove saved win
+        ex      de, hl                  ; DE = result (sdcccall(1) uint16)
+        pop     hl                      ; remove saved win (use HL, keep DE)
         pop     ix                      ; restore caller IX
-        ; callee cleans 2 bytes (y+x); preserve HL = return value
-        pop     de                      ; DE = return address
+        ; callee cleans 2 bytes (y+x); preserve DE = return value
+        pop     hl                      ; HL = return address
         inc     sp
         inc     sp                      ; discard y(1)+x(1)
-        push    de                      ; push return address back
-        ret                             ; return, HL preserved
+        jp      (hl)                    ; return, DE = result

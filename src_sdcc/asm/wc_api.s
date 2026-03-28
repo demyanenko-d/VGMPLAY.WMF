@@ -12,7 +12,7 @@
 ;  Остальные:        стек правым аргументом первым
 ;                    uint8 = 1 байт на стеке, uint16 = 2 байта (без выравнивания!)
 ;                    callee обязан очистить стековые аргументы (callee-cleans)
-;  Возврат:          uint8  → A,   uint16 → HL
+;  Возврат:          uint8  → A,   uint16 → DE
 ;
 ; ── Стековый фрейм (типичный, внутри функции после PUSH IX, PUSH DE) ──
 ;   IX+0:  win_lo (сохранённый DE = win ptr, если PUSH DE производился)
@@ -254,7 +254,8 @@ _wc_prsrw_attr::
 ; uint16_t wc_gadrw(win, y, x) — адрес ячейки экрана (#05)
 ; sdcccall(1): HL=win(1st ptr), stack: y(1 byte), x(1 byte) = 2 bytes
 ; WC: IX=win, D=y, E=x → HL=адрес
-; Callee cleans 2 bytes. Return HL.
+; sdcccall(1) returns uint16_t in DE.
+; Callee cleans 2 bytes.
 ; Stack after push ix, push hl: 0,1=win 2,3=IX 4,5=ret 6=y 7=x
 ;------------------------------------------------------------------
         .globl _wc_gadrw
@@ -271,14 +272,14 @@ _wc_gadrw::
         pop     ix                      ; IX = win
         ld      a, #0x05
         call    WC_ENTRY                ; HL = result addr
-        pop     de                      ; remove saved win
+        ex      de, hl                  ; DE = result (sdcccall(1) uint16)
+        pop     hl                      ; remove saved win (use HL, keep DE)
         pop     ix                      ; restore caller IX
-        ; callee cleans 2 bytes (y+x); preserve HL = return value
-        pop     de                      ; DE = return address
+        ; callee cleans 2 bytes (y+x); preserve DE = return value
+        pop     hl                      ; HL = return address
         inc     sp
         inc     sp                      ; discard y(1)+x(1)
-        push    de                      ; push return address back
-        ret                             ; return, HL preserved
+        jp      (hl)                    ; return, DE = result
 
 ;------------------------------------------------------------------
 ; uint8_t wc_yn(uint8_t mode) — меню Да/Нет (#08)

@@ -38,6 +38,13 @@
         .globl _inflate_vgz
         .globl _copy_pages_to_tap
 
+        ; Progress bar params (filled by C before inflate_vgz)
+        .globl _ifl_pb_text_pg
+        .globl _ifl_pb_attr_ofs
+        .globl _ifl_pb_total
+        .globl _ifl_pb_bw
+        .globl _ifl_pb_green
+
 ;--- Константы ---------------------------------------------------------------
 INFLATE_PAGE_IDX  = 4           ; индекс inflate в плагине (1 code + 3 LUT)
                                 ; физ. страница = base_page + INFLATE_PAGE_IDX
@@ -55,6 +62,13 @@ _ifl_sv_pg1:    .ds 1           ; saved Win 1 physical page
 _ifl_sv_pg2:    .ds 1           ; saved Win 2 physical page → inflate D reg
 _ifl_sv_sp:     .ds 2           ; saved SP
 _ifl_inflate_pg: .ds 1          ; computed inflate phys page (debug/scan)
+
+; Progress bar parameters (set by C, copied to inflate page at 0xC1F0)
+_ifl_pb_text_pg:  .ds 1         ; text screen physical page
+_ifl_pb_attr_ofs: .ds 2         ; attr base offset within text page (lo, hi)
+_ifl_pb_total:    .ds 1         ; estimated total output pages (0=disabled)
+_ifl_pb_bw:       .ds 1         ; bar width in columns
+_ifl_pb_green:    .ds 1         ; green attr value
 
 ;--- CODE (0x8000+) ----------------------------------------------------------
         .area _CODE
@@ -164,6 +178,24 @@ _ifl_scan_loop:
         ld      bc, #0xFDAF
         out     (c), a
 .endif
+
+        ;--- 6b. Copy progress bar params to inflate page (0xC1F0+) ---
+        ;    Win 3 = inflate page (mapped in step 5)
+        ;    Win 2 = _CODE/_DATA (still accessible for reading _ifl_pb_*)
+        ld      a, (_ifl_pb_text_pg)
+        ld      (0xC1F0), a
+        ld      hl, (_ifl_pb_attr_ofs)
+        ld      (0xC1F1), hl
+        ld      a, (_ifl_pb_total)
+        ld      (0xC1F3), a
+        ld      a, (_ifl_pb_bw)
+        ld      (0xC1F4), a
+        ld      a, (_ifl_pb_green)
+        ld      (0xC1F5), a
+        ;    Initialize runtime state
+        xor     a
+        ld      (0xC1F6), a             ; pb_error = 0
+        ld      (0xC1F7), a             ; pb_col = 0
 
         ;--- 7. входные регистры inflate: A=src, E=dst, D=saved_pg2 ---
         ld      a, (_ifl_sv_pg2)

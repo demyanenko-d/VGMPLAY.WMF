@@ -25,6 +25,13 @@
 #include "inc/keys.h"
 #include <string.h>
 
+/* ── Inflate progress bar params (defined in inflate_call.s _DATA) ────── */
+extern uint8_t  ifl_pb_text_pg;
+extern uint16_t ifl_pb_attr_ofs;
+extern uint8_t  ifl_pb_total;
+extern uint8_t  ifl_pb_bw;
+extern uint8_t  ifl_pb_green;
+
 /* ── Бордюр-отладка ─────────────────────────────────────────────────── */
 static void border(uint8_t c) { sfr_zx_fe = c; }
 
@@ -485,6 +492,13 @@ uint8_t load_vgm(void)
         /* Копировать VGZ из мегабуфера → TAP-страницы (DI/EI внутри) */
         copy_pages_to_tap(vgz_pages);
 
+        /* Set progress bar total (estimated output pages) */
+        {
+            uint8_t est = (uint8_t)(vgz_pages * 3u);
+            if (est > 64) est = 64;
+            ifl_pb_total = est;
+        }
+
         /* DBG: 0xA2 = after copy_pages_to_tap, before inflate_vgz */
         dbg_trace2(0xA2, WC_PAGE_TAP_START, WC_PAGE_TVBPG);
 
@@ -687,7 +701,17 @@ void main(void)
     if (is_vgz_filename()) {
         buf_clear(work_buf);
         buf_append_str(work_buf, "             Unpacking...");
-        print_line(&s_wnd, 7, work_buf, WC_COLOR(WC_GREEN, WC_BLACK));
+        print_line(&s_wnd, 7, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
+
+        /* Setup progress bar: get text screen address for row 7 col 2 */
+        {
+            uint16_t bar_addr = wc_gadrw(&s_wnd, 7, 2);
+            ifl_pb_text_pg  = wc_get_pgc();   /* phys page of text screen */
+            ifl_pb_attr_ofs = (bar_addr & 0x3FFF) | 0x0080; /* SET 7,L = attr area */
+            ifl_pb_bw       = get_content_width(&s_wnd);
+            ifl_pb_green    = WC_COLOR(WC_GREEN, WC_BLACK);
+            ifl_pb_total    = 0;  /* will be set in load_vgm() */
+        }
     }
 
     uint8_t loaded_pages = load_vgm();
