@@ -1,6 +1,7 @@
-// TSConfig memory manager for inflate debugger
-// Emulates 256 pages × 16KB with 4 windows (Win0–Win3)
+// TsMemory — TSConfig 256-page × 16KB paged memory with page protection
+// Enhanced: write protection, dirty tracking, violation logging
 using System;
+using System.Collections.Generic;
 
 namespace InflateDebugger
 {
@@ -23,13 +24,28 @@ namespace InflateDebugger
         public const ushort PORT_W2 = 0x12AF;
         public const ushort PORT_W3 = 0x13AF;
 
-        // Simulated WC system variables area (in page mapped to Win1 normally)
-        // 0x6000 = Win0 page, 0x6001 = Win1, 0x6002 = Win2, 0x6003 = Win3
-        // We store these in the actual mapped memory
-        public byte SysVarWin0Page { get; set; }
-        public byte SysVarWin1Page { get; set; }
-        public byte SysVarWin2Page { get; set; }
-        public byte SysVarWin3Page { get; set; }
+        // ── Page protection ──────────────────────────────────────────
+
+        /// <summary>Set of physical page numbers that are write-protected</summary>
+        private readonly HashSet<int> _protectedPages = new();
+
+        /// <summary>Pages that have been written to (dirty tracking)</summary>
+        private readonly HashSet<int> _dirtyPages = new();
+
+        /// <summary>Protection violation log</summary>
+        public List<ProtectionViolation> Violations { get; } = new();
+
+        /// <summary>Max violations to log before stopping (0 = unlimited)</summary>
+        public int MaxViolations { get; set; } = 100;
+
+        /// <summary>If true, throw on protection violation</summary>
+        public bool ThrowOnViolation { get; set; } = false;
+
+        /// <summary>Callback invoked on every write. Args: z80addr, page, offset, value</summary>
+        public Action<ushort, byte, int, byte> OnWrite { get; set; }
+
+        /// <summary>Callback invoked on protection violation</summary>
+        public Action<ProtectionViolation> OnViolation { get; set; }
 
         public TsMemory()
         {
@@ -37,6 +53,26 @@ namespace InflateDebugger
             for (int i = 0; i < TotalPages; i++)
                 _pages[i] = new byte[PageSize];
         }
+
+        // ── Page protection API ──────────────────────────────────────
+
+        public void ProtectPage(int page) => _protectedPages.Add(page);
+        public void UnprotectPage(int page) => _protectedPages.Remove(page);
+        public void ProtectRange(int startPage, int count)
+        {
+            for (int i = 0; i < count; i++) _protectedPages.Add(startPage + i);
+        }
+        public void UnprotectRange(int startPage, int count)
+        {
+            for (int i = 0; i < count; i++) _protectedPages.Remove(startPage + i);
+        }
+        public bool IsProtected(int page) => _protectedPages.Contains(page);
+        public void ClearProtection() => _protectedPages.Clear();
+
+        public IReadOnlyCollection<int> DirtyPages => _dirtyPages;
+        public void ClearDirtyTracking() => _dirtyPages.Clear();
+
+        // ── Window management ────────────────────────────────────────
 
         /// <summary>Set window mapping (0–3) to physical page</summary>
         public void SetWindow(int win, byte page)
@@ -46,6 +82,8 @@ namespace InflateDebugger
 
         public byte GetWindow(int win) => _winPage[win];
 
+        // ── Memory access ────────────────────────────────────────────
+
         /// <summary>Read byte at 16-bit Z80 address through page windows</summary>
         public byte Read(ushort addr)
         {
@@ -54,8 +92,39 @@ namespace InflateDebugger
             return _pages[_winPage[win]][offset];
         }
 
-        /// <summary>Write byte at 16-bit Z80 address through page windows</summary>
+        /// <summary>Write byte at 16-bit Z80 address (with protection check)</summary>
         public void Write(ushort addr, byte val)
+        {
+            int win = addr >> 14;
+            int offset = addr & 0x3FFF;
+            byte page = _winPage[win];
+
+            _dirtyPages.Add(page);
+            OnWrite?.Invoke(addr, page, offset, val);
+
+            if (_protectedPages.Contains(page))
+            {
+                var v = new ProtectionViolation
+                {
+                    Z80Addr = addr,
+                    PhysPage = page,
+                    Offset = offset,
+                    Value = val,
+                    OldValue = _pages[page][offset],
+                    Window = win
+                };
+                if (Violations.Count < MaxViolations || MaxViolations == 0)
+                    Violations.Add(v);
+                OnViolation?.Invoke(v);
+                if (ThrowOnViolation)
+                    throw new ProtectionViolationException(v);
+            }
+
+            _pages[page][offset] = val;
+        }
+
+        /// <summary>Direct write bypassing protection (for initial data loading)</summary>
+        public void WriteUnprotected(ushort addr, byte val)
         {
             int win = addr >> 14;
             int offset = addr & 0x3FFF;
@@ -100,6 +169,16 @@ namespace InflateDebugger
             return result;
         }
 
+        /// <summary>Update WC system variable area (0x6000–0x600E)</summary>
+        public void UpdateSysVars()
+        {
+            byte sysPage = _winPage[1];
+            _pages[sysPage][0x2000] = _winPage[0];  // 0x6000 = PG0
+            _pages[sysPage][0x2001] = _winPage[1];  // 0x6001 = PG4
+            _pages[sysPage][0x2002] = _winPage[2];  // 0x6002 = PG8
+            _pages[sysPage][0x2003] = _winPage[3];  // 0x6003 = PGC
+        }
+
         /// <summary>Dump 16 bytes around an address for debugging</summary>
         public string HexDump(ushort addr, int before = 8, int after = 8)
         {
@@ -115,5 +194,28 @@ namespace InflateDebugger
             }
             return sb.ToString();
         }
+    }
+
+    // ── Protection violation types ───────────────────────────────────
+
+    public struct ProtectionViolation
+    {
+        public ushort Z80Addr;
+        public byte   PhysPage;
+        public int    Offset;
+        public byte   Value;
+        public byte   OldValue;
+        public int    Window;
+
+        public override string ToString() =>
+            $"PROTECT VIOLATION: [{Z80Addr:X4}] pg={PhysPage:X2} off={Offset:X4} " +
+            $"old={OldValue:X2} new={Value:X2} win={Window}";
+    }
+
+    public class ProtectionViolationException : Exception
+    {
+        public ProtectionViolation Violation { get; }
+        public ProtectionViolationException(ProtectionViolation v)
+            : base(v.ToString()) { Violation = v; }
     }
 }

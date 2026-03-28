@@ -1,11 +1,20 @@
-// InflateDebugger — Z80 emulator for debugging TSConfig inflate decompressor
+// InflateDebugger — Z80 emulator for TSConfig inflate + WC plugin debugging
 //
-// Loads VGZ file into emulated TSConfig memory pages (as tape loader would),
-// loads inflate.bin into Win3, sets up registers as inflate_call.s would,
-// and runs the Z80 CPU with debug port monitoring and watchdog.
+// MODE 1 — inflate (default):
+//   Loads VGZ file into emulated TSConfig memory pages (as tape loader would),
+//   loads inflate.bin into Win3, sets up registers as inflate_call.s would,
+//   and runs the Z80 CPU with debug port monitoring and watchdog.
 //
-// Usage: dotnet run [--vgz <path>] [--ref <path>] [--inflate <path>]
-//                   [--dump-on-hang] [--max-cycles <N>] [--watchdog <N>]
+//   Usage: dotnet run [--vgz <path>] [--ref <path>] [--inflate <path>]
+//                     [--dump-on-hang] [--max-cycles <N>] [--watchdog <N>]
+//
+// MODE 2 — plugin:
+//   Loads a WMF plugin binary, emulates WC kernel API (P8000 dispatch),
+//   emulates disk I/O from test_data directory, runs the full plugin lifecycle
+//   with CPU trace, page protection, and WC call logging.
+//
+//   Usage: dotnet run --mode plugin --wmf <path> [--file <vgz>]
+//                     [--max-cycles <N>] [--verbose]
 
 using System;
 using System.IO;
@@ -57,6 +66,96 @@ namespace InflateDebugger
         static int Main(string[] args)
         {
             string basePath = FindProjectRoot();
+
+            // ── Detect mode ──
+            string mode = "inflate";  // default
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--mode" && i + 1 < args.Length)
+                {
+                    mode = args[++i].ToLowerInvariant();
+                    break;
+                }
+            }
+
+            return mode switch
+            {
+                "plugin" => RunPluginMode(args, basePath),
+                _        => RunInflateMode(args, basePath)
+            };
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Plugin mode — runs full WMF plugin with WC API emulation
+        // ═══════════════════════════════════════════════════════════════
+
+        static int RunPluginMode(string[] args, string basePath)
+        {
+            string? wmfPath = null;
+            string? testFile = null;
+            string? diskRoot = Path.Combine(basePath, "Debuger", "test_data");
+            long maxCyclesP = 2_000_000_000;
+            bool verbose = true;
+            bool verbosePages = false;
+
+            for (int i = 0; i < args.Length; i++)
+            {
+                switch (args[i])
+                {
+                    case "--wmf" when i + 1 < args.Length:
+                        wmfPath = args[++i]; break;
+                    case "--file" when i + 1 < args.Length:
+                        testFile = args[++i]; break;
+                    case "--disk-root" when i + 1 < args.Length:
+                        diskRoot = args[++i]; break;
+                    case "--max-cycles" when i + 1 < args.Length:
+                        maxCyclesP = long.Parse(args[++i]); break;
+                    case "--verbose":
+                        verbose = true; break;
+                    case "--quiet":
+                        verbose = false; break;
+                    case "--verbose-pages":
+                        verbosePages = true; break;
+                }
+            }
+
+            // Default WMF: look in DiskRef/WC/VGMPLAY.WMF or variants/
+            if (wmfPath == null)
+            {
+                wmfPath = Path.Combine(basePath, @"DiskRef\WC\VGMPLAY.WMF");
+                if (!File.Exists(wmfPath))
+                    wmfPath = Path.Combine(basePath, @"variants\VGMPLAY_v1_b8.WMF");
+            }
+
+            // Default test file: first .vgz in test_data
+            if (testFile == null && Directory.Exists(diskRoot!))
+            {
+                var firstVgz = Directory.GetFiles(diskRoot!, "*.vgz")
+                    .OrderBy(f => f).FirstOrDefault();
+                if (firstVgz != null)
+                    testFile = Path.GetFileName(firstVgz);
+            }
+
+            var runner = new PluginRunner
+            {
+                MaxCycles = maxCyclesP,
+                VerboseWcCalls = verbose,
+                VerbosePageSwitch = verbosePages,
+                DumpOnExit = true,
+                DumpDir = Path.Combine(basePath, @"Debuger\dumps"),
+                DiskRootPath = diskRoot!,
+                TestFileName = testFile
+            };
+
+            return runner.Run(wmfPath!);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Inflate mode — original inflate test harness
+        // ═══════════════════════════════════════════════════════════════
+
+        static int RunInflateMode(string[] args, string basePath)
+        {
             string vgzPath = Path.Combine(basePath,
                 @"DiskRef\Music\OPL2\Arcade\_\Act-Fancer_Cybernetick_Hyper_Weapon_(Arcade)\02 Sci-Vax (BGM 1).vgz");
             string inflatePath = Path.Combine(basePath, @"src_sdcc\build\inflate.bin");

@@ -832,7 +832,9 @@ cpd_no_srcroll:
         inc     a
         ld      b, HIGH PORT_W1         ; C still = #AF from OUT_W0
         out     (c), a                  ; Win 1 = src_page + 1
+        push    de                      ; save decode write ptr (DE clobbered by progress_update)
         call    progress_update
+        pop     de                      ; restore decode write ptr
         jp      decode_tableloop
 
 
