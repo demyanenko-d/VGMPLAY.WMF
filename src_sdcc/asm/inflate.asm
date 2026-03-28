@@ -11,7 +11,7 @@
 ;   Win 2 (0x8000–0xBFFF): Decode working buffer (fixed page PAGE_DECODE)
 ;   Win 3 (0xC000–0xFFFF): This code + RAM tables (extra WMF page)
 ;
-; Entry: JP 0xC000 with registers:
+; Entry: Called via JP 0xC200 (inflate_init) from inflate_call.s
 ;   A  = source start physical page (e.g. #A1 for TAP)
 ;   E  = destination start physical page (e.g. #20 for megabuffer)
 ;   D  = saved Win 2 page (to restore on exit)
@@ -114,18 +114,9 @@ lbl:
 ;  (up to 258 bytes past 0xBFFF).  That's fine: by the time the overflow
 ;  happens, we've already jumped to init and are deep inside inflate_core.
 ;
-;  CRITICAL: on the SECOND call, this JP is STILL needed — the caller
-;  does JP 0xC000 every time.  The backref overflow writes decoded data
-;  bytes here; we MUST ensure they don't corrupt the JP opcode.
-;
-;  Solution: inflate_init lives at 0xC102+ (safe zone), the entry JP
-;  survives because backref LDIR writes at most 258 bytes past 0xBFFF
-;  starting from the current DE.  The overflow only happens when
-;  DE wraps 0xBFFF → 0xC000, writing max 258 bytes (0xC000–0xC101).
-;  Our JP at 0xC000 (3 bytes) IS in the danger zone.
-;
-;  REAL solution: we restore the entry JP from inflate_call.s before
-;  each call, since the inflate binary page is mapped to Win 3.
+;  inflate_call.s calls JP 0xC200 directly (inflate_init in safe zone).
+;  The JP at 0xC000 is NOT used at runtime; it exists only as a
+;  fallback marker and will be overwritten by LDIR on first call.
 ; ============================================================================
 entry:
         jp      inflate_init

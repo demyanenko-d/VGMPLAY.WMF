@@ -250,7 +250,7 @@ static void draw_pre_load_info(void)
     uint8_t row = 1;
 
     buf_clear(work_buf);
-    buf_append_str(work_buf, "                   VGM Player ver 2.0a");
+    buf_append_str(work_buf, "              VGM Player ver 0.3 (alpha)");
     print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
     row = 3;
 
@@ -275,7 +275,8 @@ uint8_t drow_ui(void)
     uint8_t row = 1;
 
     // Заголовок ---------------------------------------------------------------------------------------
-    buf_append_str(work_buf, "       VGM Player ver 0.2 (alpha)");
+    buf_clear(work_buf);
+    buf_append_str(work_buf, "       VGM Player ver 0.3 (alpha)");
     print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
     row += 2;
 
@@ -741,40 +742,46 @@ void main(void)
      * or the isr_done handler would misinterpret it as ESC. */
     wc_exit_code = WC_EXIT_NEXT;
 
-    /* Главный цикл: isr_tick_ctr меняется ~ISR_FREQ раз/сек,
-       опрос клавиатуры и UI-обновление делаем каждые ISR_TICKS_PER_FRAME тиков (~50 Гц) */
+    /* Главный цикл: опрос клавиатуры на каждой итерации (порты — мгновенно),
+       UI-обновление каждые ISR_TICKS_PER_FRAME тиков (~50 Гц) */
     while (state == STATE_PLAYBACK)
     {
-        uint8_t tick = isr_tick_ctr;
-        uint8_t tick_delta = tick - tick_prev;
+        /* ── Клавиатура: опрос на каждой итерации ──────────────
+         * read_keys() — 4 порт-чтения, ~40 T-states.  Если опрос
+         * привязан к tick_delta, при тяжёлом vgm_fill_buffer
+         * (весь цикл занят заполнением) кнопки не успевают
+         * считываться. */
+        key = read_keys();
 
-        if (tick_delta >= ISR_TICKS_PER_FRAME)
+        if (key == KEY_ESC)
         {
-            tick_prev = tick;
+            vgm_hl_pos = vgm_hl_abort_pos;
+            vgm_song_ended = 0;
+            wc_exit_code = WC_EXIT_ESC;
+        }
+        if (key == KEY_NEXT)
+        {
+            vgm_hl_pos = vgm_hl_abort_pos;
+            vgm_song_ended = 0;
+            wc_exit_code = WC_EXIT_NEXT;
+        }
+        if (key == KEY_PREV)
+        {
+            vgm_hl_pos = vgm_hl_abort_pos;
+            vgm_song_ended = 0;
+            wc_exit_code = WC_EXIT_PREV;
+        }
 
-            key = read_keys();
+        /* ── UI-обновление: ~50 Гц ────────────────────────── */
+        {
+            uint8_t tick = isr_tick_ctr;
+            uint8_t tick_delta = tick - tick_prev;
 
-            if (key == KEY_ESC)
+            if (tick_delta >= ISR_TICKS_PER_FRAME)
             {
-                vgm_hl_pos = vgm_hl_abort_pos;
-                vgm_song_ended = 0;
-                wc_exit_code = WC_EXIT_ESC;
+                tick_prev = tick;
+                update_playback_info();
             }
-
-            if (key == KEY_NEXT)
-            {
-                vgm_hl_pos = vgm_hl_abort_pos;
-                vgm_song_ended = 0;
-                wc_exit_code = WC_EXIT_NEXT;
-            }
-            if (key == KEY_PREV)
-            {
-                vgm_hl_pos = vgm_hl_abort_pos;
-                vgm_song_ended = 0;
-                wc_exit_code = WC_EXIT_PREV;
-            }
-
-            update_playback_info();
         }
 
         if (state == STATE_PLAYBACK)
