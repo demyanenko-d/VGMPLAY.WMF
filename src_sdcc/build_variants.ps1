@@ -20,18 +20,35 @@ $root     = Split-Path -Parent $MyInvocation.MyCommand.Path   # src_sdcc
 $projRoot = Split-Path -Parent $root                           # project root
 $cfgFile  = "$root\inc\variant_cfg.h"
 
-# ── Variant definitions ──────────────────────────────────────────────
-$baseVariants = @(
-  @{ Name='v1_b8';      Budget=8;  Entries=56;  Step=1280; Freq=2734; Shift=4; Mask='0x0Fu'; TPF=56;  DataLoc='0xB600'; NS=$false }
-  @{ Name='v2_b32';     Budget=32; Entries=56;  Step=1280; Freq=2734; Shift=4; Mask='0x0Fu'; TPF=56;  DataLoc='0xB600'; NS=$false }
-  @{ Name='v3_b32_hf';  Budget=32; Entries=28;  Step=2560; Freq=1367; Shift=5; Mask='0x1Fu'; TPF=28;  DataLoc='0xB600'; NS=$false }
-  @{ Name='v4_b16_hf';  Budget=16; Entries=28;  Step=2560; Freq=1367; Shift=5; Mask='0x1Fu'; TPF=28;  DataLoc='0xB600'; NS=$false }
-  @{ Name='v5_b8_df';   Budget=8;  Entries=112; Step=640;  Freq=5468; Shift=3; Mask='0x07u'; TPF=112; DataLoc='0xB600'; NS=$false }
-  @{ Name='v6_b16_df';  Budget=16; Entries=112; Step=640;  Freq=5468; Shift=3; Mask='0x07u'; TPF=112; DataLoc='0xB600'; NS=$false }
-  @{ Name='v7_b24';     Budget=24; Entries=56;  Step=1280; Freq=2734; Shift=4; Mask='0x0Fu'; TPF=56;  DataLoc='0xB600'; NS=$false }
-  @{ Name='v8_b64';     Budget=64; Entries=56;  Step=1280; Freq=2734; Shift=4; Mask='0x0Fu'; TPF=56;  DataLoc='0xB600'; NS=$false }
-  @{ Name='v9_b32_df';  Budget=32; Entries=112; Step=640;  Freq=5468; Shift=3; Mask='0x07u'; TPF=112; DataLoc='0xB600'; NS=$false }
-)
+# ── Frequency tiers ──────────────────────────────────────────────────
+# ISR_FREQ = 3 500 000 / Step;  Entries = 71 680 / Step;  TPF = Entries
+# Shift = log2(44100 / Freq) rounded down
+$freqTiers = @{
+  '2734' = @{ Tag='';   Freq=2734; Step=1280; Entries=56; Shift=4; Mask='0x0Fu'; TPF=56;  Budgets=@(8,16)     }
+  '1367' = @{ Tag='hf'; Freq=1367; Step=2560; Entries=28; Shift=5; Mask='0x1Fu'; TPF=28;  Budgets=@(8,16,32)  }
+  '683'  = @{ Tag='qf'; Freq=683;  Step=5120; Entries=14; Shift=6; Mask='0x3Fu'; TPF=14;  Budgets=@(16,32,64) }
+}
+
+# ── Generate variants: 2+3+3 = 8 base × 2 NS = 16 total ─────────────
+$baseVariants = @()
+foreach ($ft in $freqTiers.Values | Sort-Object Freq -Descending) {
+  foreach ($b in $ft.Budgets) {
+    $suffix = if ($ft.Tag) { "_$($ft.Tag)" } else { '' }
+    $name   = "b${b}${suffix}"
+    $baseVariants += @{
+      Name    = $name
+      Budget  = $b
+      Entries = $ft.Entries
+      Step    = $ft.Step
+      Freq    = $ft.Freq
+      Shift   = $ft.Shift
+      Mask    = $ft.Mask
+      TPF     = $ft.TPF
+      DataLoc = '0xB600'
+      NS      = $false
+    }
+  }
+}
 
 # Auto-generate _ns (no short waits) clones
 $nsVariants = foreach ($bv in $baseVariants) {
@@ -151,15 +168,14 @@ Write-Host "  Done." -ForegroundColor Green
 
 # ── Summary ──────────────────────────────────────────────────────────
 Write-Host "`n========== VARIANT SUMMARY ==========" -ForegroundColor Cyan
-$hdr = "{0,-22} {1,7} {2,6} {3,6} {4,4} {5,6} {6,5}" -f 'Name','Budget','Freq','Code','NS','Free','Status'
-$sep = "{0,-22} {1,7} {2,6} {3,6} {4,4} {5,6} {6,5}" -f '----','------','----','----','--','----','------'
-Write-Host $hdr
-Write-Host $sep
+$fmt = "{0,-18} {1,6} {2,6} {3,6} {4,3} {5,5} {6,5}"
+Write-Host ($fmt -f 'Name','Budget','Freq','Code','NS','Free','St')
+Write-Host ($fmt -f '----','------','----','----','--','----','--')
 foreach ($r in $results) {
   $v = $variants | Where-Object { $_.Name -eq $r.Name }
-  $nsTag = if ($v.NS) { 'yes' } else { '-' }
+  $nsTag = if ($v.NS) { 'yes' } else { ' - ' }
   $color = if ($r.Status -eq 'OK') { 'Green' } else { 'Red' }
-  Write-Host ("{0,-22} {1,7} {2,6} {3,6} {4,4} {5,6} {6,5}" -f $r.Name, $v.Budget, $v.Freq, $r.Code, $nsTag, $r.Free, $r.Status) -ForegroundColor $color
+  Write-Host ($fmt -f $r.Name, $v.Budget, $v.Freq, $r.Code, $nsTag, $r.Free, $r.Status) -ForegroundColor $color
 }
 Write-Host "`nImages in: $outDir"
 
@@ -171,10 +187,13 @@ Variants of VGM player for A/B testing
 Parameters stored in inc\variant_cfg.h (single config file).
 build_variants.ps1 regenerates variant_cfg.h for each variant.
 
-Notation:
+Frequency tiers:
+  qf     - quarter freq (ISR  683 Hz, step 5120, 14 ticks/frame)
+  (none) - base freq    (ISR 2734 Hz, step 1280, 56 ticks/frame)
+  hf     - half freq    (ISR 1367 Hz, step 2560, 28 ticks/frame)
+
+Other tags:
   b<N>   - command budget (max commands between forced pauses)
-  hf     - half frequency  (ISR 1367 Hz)
-  df     - double frequency (ISR 5468 Hz)
   ns     - no short waits (0x70-0x7F pauses skipped)
 
 "@
@@ -192,14 +211,14 @@ $readme += @"
 
 What to test
 ------------
-1. Lag disappears on v2/v7/v8 -> budget too low.
+1. Higher budget helps (b32/b48/b64 vs b8/b16)
    -> Increase VGM_FILL_CMD_BUDGET.
 
-2. Lag disappears on v3/v4 (hf) -> ISR too frequent.
-   -> Decrease ISR frequency.
+2. Lower freq helps (hf or qf better than base)
+   -> ISR overhead is the bottleneck, reduce frequency.
 
-3. Lag disappears on v5/v6 (df) -> ISR too infrequent.
-   -> Increase ISR frequency.
+3. Higher freq helps (base better than hf/qf)
+   -> More granular timing needed, keep higher ISR.
 
 4. _ns variants better -> short waits 0x70-0x7F are the problem.
 
@@ -210,7 +229,8 @@ Set-Content "$outDir\README.txt" -Value $readme -NoNewline -Encoding UTF8
 Write-Host "`nREADME.txt written to $outDir" -ForegroundColor Green
 
 Write-Host "`nLegend:" -ForegroundColor DarkGray
+Write-Host "  qf = quarter freq (683 Hz)" -ForegroundColor DarkGray
 Write-Host "  hf = half freq (1367 Hz)" -ForegroundColor DarkGray
-Write-Host "  df = double freq (5468 Hz)" -ForegroundColor DarkGray
+Write-Host "  (no suffix) = base freq (2734 Hz)" -ForegroundColor DarkGray
 Write-Host "  bN = budget N commands per ISR tick" -ForegroundColor DarkGray
 Write-Host "  ns = no short waits (0x70-0x7F skipped)" -ForegroundColor DarkGray

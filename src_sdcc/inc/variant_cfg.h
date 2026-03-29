@@ -13,23 +13,23 @@
 
 /* ── Частота ISR (тиков/сек) ─────────────────────────────────────── */
 /* ISR_FREQ = 3 500 000 / VARIANT_POS_STEP                            */
-#define ISR_FREQ              1367
+#define ISR_FREQ              683
 
 /* Тиков ISR на TV-кадр (= 71680 / STEP)                              */
-/* 56@2734, 28@1367, 112@5468                                          */
-#define ISR_TICKS_PER_FRAME   28
+/* 14@683, 28@1367, 56@2734                                            */
+#define ISR_TICKS_PER_FRAME   14
 
 /* ── Маппинг VGM 44100→ISR тиков ─────────────────────────────────── */
-/* SHIFT = log2(44100/ISR_FREQ): 4@2734, 5@1367, 3@5468               */
-#define VGM_SAMPLE_SHIFT      5
-#define VGM_SAMPLE_MASK       0x1Fu
+/* SHIFT = log2(44100/ISR_FREQ): 6@683, 5@1367, 4@2734                */
+#define VGM_SAMPLE_SHIFT      6
+#define VGM_SAMPLE_MASK       0x3Fu
 
 /* ── Лимит команд между принудительными yield ──────────────────────── */
-#define VGM_FILL_CMD_BUDGET   16
+#define VGM_FILL_CMD_BUDGET   32
 
 /* ── Параметры pos_table (для build.bat → gen_pos_table.js) ──────── */
-#define VARIANT_POS_ENTRIES   28
-#define VARIANT_POS_STEP      2560
+#define VARIANT_POS_ENTRIES   14
+#define VARIANT_POS_STEP      5120
 
 /* ── Адрес начала сегмента данных (для линковщика) ────────────────── */
 #define VARIANT_DATA_LOC      0xB600
