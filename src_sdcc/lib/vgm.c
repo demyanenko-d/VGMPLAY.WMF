@@ -63,11 +63,7 @@ static uint16_t vgm_wait_accum = 0;
 /* ── Масштабирование частот PSG/FM (только LUT) ─────────────────────── */
 uint8_t vgm_freq_mode;
 uint16_t *freq_lut_base;
-
-/* Буфер hi-байтов FM F-Number: хранит последний записанный 0xA4/A5/A6
- * (Block[2:0] | F-Num[10:8]).  Записывается при write 0xA4-0xA6,
- * используется при защёлке через 0xA0-0xA2. */
-static uint8_t fm_fnum_hi[3];   /* каналы 0,1,2 */
+static uint8_t freq_lut_page;   /* plugin page для Window 0 (LUT)       */
 
 /* Shadow-регистры PSG: полные 12-бит tone period на канал.
  * Обновляются при записи lo/hi, используются для LUT lookup. */
@@ -99,8 +95,6 @@ static hl_entry_t *fb_e;   /* temp: HL queue entry pointer              */
 #ifdef VGM_FREQ_SCALE
 static uint8_t  fb_ch;     /* temp: PSG/FM channel index               */
 static uint16_t fb_scaled; /* temp: scaled frequency value              */
-static uint8_t  fb_fhi;    /* temp: FM F-Num hi byte                   */
-static uint8_t  fb_block;  /* temp: FM block                           */
 static uint8_t  fb_reg;    /* temp: AY register (0xA0 handler)         */
 #endif
 
@@ -273,7 +267,7 @@ uint8_t vgm_parse_header(void)
      * PSG-часть YM2203 = fclk/2, AY8910 = fclk как есть. */
     vgm_freq_mode = FREQ_MODE_NATIVE;
     freq_lut_base = (uint16_t *)0;
-    fm_fnum_hi[0] = 0; fm_fnum_hi[1] = 0; fm_fnum_hi[2] = 0;
+    freq_lut_page = 0;
     psg_shadow[0] = 0; psg_shadow[1] = 0; psg_shadow[2] = 0;
     for (i = 0; i < vgm_chip_count; i++) {
         uint16_t psg_khz;
@@ -307,7 +301,8 @@ uint8_t vgm_parse_header(void)
                                : (freq_lut_map[j].clk_khz - psg_khz);
                     if (d <= freq_lut_map[j].tol_khz) {
                         /* Матч! Подключаем LUT страницу в Window 0 */
-                        wc_mng0_pl(freq_lut_map[j].page);
+                        freq_lut_page = freq_lut_map[j].page;
+                        wc_mng0_pl(freq_lut_page);
                         freq_lut_base = (uint16_t *)freq_lut_map[j].offset;
                         vgm_freq_mode = FREQ_MODE_TABLE;
                         break;
@@ -507,6 +502,11 @@ next_hl:
         fb_cpg  = vgm_cur_page;
         fb_rp   = (uint8_t *)vgm_read_ptr;
         wc_mngcvpl(fb_cpg);
+#ifdef VGM_FREQ_SCALE
+        /* Re-map LUT page: WC API (print_line etc.) may remap Window 0 */
+        if (vgm_freq_mode == FREQ_MODE_TABLE)
+            wc_mng0_pl(freq_lut_page);
+#endif
         fb_is_vgm = 1;
         break;
 
@@ -522,6 +522,10 @@ next_hl:
         fb_rp   = (uint8_t *)vgm_read_ptr;
         fb_wacc = vgm_wait_accum;
         wc_mngcvpl(fb_cpg);
+#ifdef VGM_FREQ_SCALE
+        if (vgm_freq_mode == FREQ_MODE_TABLE)
+            wc_mng0_pl(freq_lut_page);
+#endif
         fb_is_vgm = 1;
         break;
 
@@ -696,39 +700,13 @@ next_hl:
             else if (fb_b1 == 0x06) {
                 fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
-            /* ── FM F-Number hi+Block (reg 0xA4-0xA6): буферизовать ── */
-            else if (fb_b1 >= 0xA4 && fb_b1 <= 0xA6) {
-                fm_fnum_hi[fb_b1 - 0xA4] = fb_b2;
-                /* НЕ записываем в буфер — дождёмся защёлки 0xA0-0xA2 */
-                goto do_budget;
-            }
-            /* ── FM F-Number lo (reg 0xA0-0xA2): защёлка → пересчёт ── */
-            else if (fb_b1 >= 0xA0 && fb_b1 <= 0xA2) {
-                fb_ch = fb_b1 - 0xA0;
-                fb_fhi = fm_fnum_hi[fb_ch];
-                fb_scaled = ((uint16_t)(fb_fhi & 0x07) << 8) | fb_b2;
-                fb_block = (fb_fhi >> 3) & 0x07;
-                fb_scaled = freq_lut_base[fb_scaled]; /* LUT: 0..2047 */
-                /* Overflow: если fnum > 2047 → увеличить block */
-                while (fb_scaled > 2047 && fb_block < 7) {
-                    fb_scaled >>= 1;
-                    fb_block++;
-                }
-                if (fb_scaled > 2047) fb_scaled = 2047;
-                /* Emit hi byte (0xA4+ch) */
-                fb_wp[0] = CMD_WRITE_AY;
-                fb_wp[1] = 0xA4 + fb_ch;
-                fb_wp[2] = (uint8_t)((fb_block << 3) | ((fb_scaled >> 8) & 0x07));
-                fb_wp += 4;
-                /* Emit lo byte (0xA0+ch) — защёлка */
-                fb_wp[0] = CMD_WRITE_AY;
-                fb_wp[1] = fb_b1;
-                fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
-                fb_wp += 4;
-                goto do_budget;
-            }
+            /* ── FM regs (>0x0D): skip — нет FM-железа, AY-only ── */
           }
 #endif /* VGM_FREQ_SCALE */
+            /* Фильтр: только PSG-регистры 0x00-0x0D → CMD_WRITE_AY.     *
+             * FM-регистры YM2203 (0x0E+) портят AY: reg&0x0F попадает    *
+             * в PSG-пространство (0x28 → AY reg 8 = vol A, и т.д.)      */
+            if (fb_b1 > 0x0D) continue;
             fb_wp[0] = CMD_WRITE_AY;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;

@@ -141,13 +141,15 @@ static void build_playback_queue(void)
 {
     vgm_hl_len = 0;
 
-    /* Init phase: enable clocks + chip init */
+    /* Init phase: enable clocks + silence (clear residual state) + init */
     if (s_has_saa || s_has_saa2)
         hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_ON);
-    if (s_has_opl)
+    if (s_has_opl) {
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_OPL);
         hl_push(HLCMD_CMDBLK,
                 (vgm_chip_type == VGM_CHIP_OPL3) ? CMDBLK_INIT_OPL3
                                                   : CMDBLK_INIT_OPL2);
+    }
 
     /* Main playback */
     hl_push(HLCMD_PLAY, 0);

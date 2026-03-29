@@ -99,23 +99,34 @@ ptr_table:
         dw blk_silence_ym2203_2    ; 10 = CMDBLK_SILENCE_YM2203_2
 
 ; ═══════════════════════════════════════════════════════════════════════
-; CMDBLK_INIT_OPL3 — OPL3 init (NEW=1, Waveform Select Enable)
+; CMDBLK_INIT_OPL3 — OPL3 init (NEW=1, clean state)
 ;
-; VGM stream:  5F 05 01  5E 01 20  66
+; OPL3 NEW=1 enables full OPL3 register set.  4-op connections are
+; cleared (reg 0x104=0) to avoid leftover pairing from a previous
+; track.  Test/WSE register 0x01 is zeroed — OPL3 does not use WSE;
+; waveform select is implicit via E0-F5 registers.
+;
+; VGM stream:  5F 05 01  5F 04 00  5E 01 00  66
 ; ═══════════════════════════════════════════════════════════════════════
 blk_init_opl3:
         opl3_bank1 #05, #01        ; VGM: 5F 05 01 — OPL3 NEW=1
-        opl3_bank0 #01, #20        ; VGM: 5E 01 20 — Waveform Select Enable
+        opl3_bank1 #04, #00        ; VGM: 5F 04 00 — 4-op OFF (clean)
+        opl3_bank0 #01, #00        ; VGM: 5E 01 00 — Test/WSE=0
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════
-; CMDBLK_INIT_OPL2 — OPL2 compat init (NEW=0, Waveform Select)
+; CMDBLK_INIT_OPL2 — OPL2 compat init (NEW=0, clean state)
 ;
-; VGM stream:  5F 05 00  5E 01 20  66
+; Forces OPL2 compatibility mode.  Critically: 0x104=0 clears any
+; residual 4-op state that would persist after an OPL3 track (the
+; most common cause of OPL2 artifacts).  Test/WSE register = 0.
+;
+; VGM stream:  5F 05 00  5F 04 00  5E 01 00  66
 ; ═══════════════════════════════════════════════════════════════════════
 blk_init_opl2:
         opl3_bank1 #05, #00        ; VGM: 5F 05 00 — OPL3 NEW=0 (OPL2)
-        opl3_bank0 #01, #20        ; VGM: 5E 01 20 — Waveform Select Enable
+        opl3_bank1 #04, #00        ; VGM: 5F 04 00 — 4-op OFF (clean)
+        opl3_bank0 #01, #00        ; VGM: 5E 01 00 — Test/WSE=0
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════
@@ -188,6 +199,46 @@ blk_silence_opl:
         opl3_bank1 #53, #3F
         opl3_bank1 #54, #3F
         opl3_bank1 #55, #3F
+        ; ── Waveform reset: Bank 0 — VGM: 5E {E0-E5,E8-ED,F0-F5} 00 ──
+        ; Clears non-sine waveforms that linger between tracks.
+        ; Critical for clean OPL2 playback after OPL3 usage.
+        opl3_bank0 #E0, #00
+        opl3_bank0 #E1, #00
+        opl3_bank0 #E2, #00
+        opl3_bank0 #E3, #00
+        opl3_bank0 #E4, #00
+        opl3_bank0 #E5, #00
+        opl3_bank0 #E8, #00
+        opl3_bank0 #E9, #00
+        opl3_bank0 #EA, #00
+        opl3_bank0 #EB, #00
+        opl3_bank0 #EC, #00
+        opl3_bank0 #ED, #00
+        opl3_bank0 #F0, #00
+        opl3_bank0 #F1, #00
+        opl3_bank0 #F2, #00
+        opl3_bank0 #F3, #00
+        opl3_bank0 #F4, #00
+        opl3_bank0 #F5, #00
+        ; ── Waveform reset: Bank 1 — VGM: 5F {E0-E5,E8-ED,F0-F5} 00 ──
+        opl3_bank1 #E0, #00
+        opl3_bank1 #E1, #00
+        opl3_bank1 #E2, #00
+        opl3_bank1 #E3, #00
+        opl3_bank1 #E4, #00
+        opl3_bank1 #E5, #00
+        opl3_bank1 #E8, #00
+        opl3_bank1 #E9, #00
+        opl3_bank1 #EA, #00
+        opl3_bank1 #EB, #00
+        opl3_bank1 #EC, #00
+        opl3_bank1 #ED, #00
+        opl3_bank1 #F0, #00
+        opl3_bank1 #F1, #00
+        opl3_bank1 #F2, #00
+        opl3_bank1 #F3, #00
+        opl3_bank1 #F4, #00
+        opl3_bank1 #F5, #00
         ; ── Percussion Off — VGM: 5E BD 00 ──
         opl3_bank0 #BD, #00
         blk_end

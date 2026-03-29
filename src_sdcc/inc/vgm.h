@@ -256,9 +256,9 @@ const char *vgm_chip_name(uint8_t id);
 #define CMDBLK_PAGE         5
 
 /** Block indices in the pointer table at 0xC000 */
-#define CMDBLK_INIT_OPL3    0   /* OPL3 init: NEW=1, wavesel          */
-#define CMDBLK_INIT_OPL2    1   /* OPL2 compat: NEW=0, wavesel        */
-#define CMDBLK_SILENCE_OPL  2   /* OPL3 silence: Key Off + TL max     */
+#define CMDBLK_INIT_OPL3    0   /* OPL3 init: NEW=1, 4-op=0, test=0   */
+#define CMDBLK_INIT_OPL2    1   /* OPL2 compat: NEW=0, 4-op=0, test=0 */
+#define CMDBLK_SILENCE_OPL  2   /* OPL silence: KeyOff+TL+waveform+BD */
 #define CMDBLK_SILENCE_AY   3   /* AY chip 1: mixer off, vol=0        */
 #define CMDBLK_SILENCE_AY2  4   /* AY chip 2 (TS): mixer off, vol=0   */
 #define CMDBLK_SILENCE_SAA  5   /* SAA1099 chip 1: reset + amp=0      */
