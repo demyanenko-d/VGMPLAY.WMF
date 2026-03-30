@@ -27,6 +27,7 @@
 
         .module isr_mod
 
+        .globl  _isr_ms_ctrl
         .globl  _isr_active_buf
         .globl  _isr_enabled
         .globl  _isr_tick_ctr
@@ -338,7 +339,7 @@ _isr_do_wait:
 ;--- AY8910 chip 1 write: [reg, val, pad] --------------------------------
 _isr_write_ay:
         ld      bc, #0xFFFD
-        ld      a, #0xFF            ; select first AY (TurboSound)
+        ld      a, (_isr_ms_ctrl)   ; MultiSound ctrl (bit0=0 → chip1)
         out     (c), a
         ld      a, (de)             ; reg
         out     (c), a              ; select AY register
@@ -353,7 +354,8 @@ _isr_write_ay:
 ;--- AY8910 chip 2 write (TurboSound): [reg, val, pad] -------------------
 _isr_write_ay2:
         ld      bc, #0xFFFD
-        ld      a, #0xFE            ; select second AY
+        ld      a, (_isr_ms_ctrl)   ; MultiSound ctrl base
+        or      a, #0x01            ; bit0=1 → chip2
         out     (c), a
         ld      a, (de)             ; reg
         out     (c), a              ; select register
@@ -363,10 +365,6 @@ _isr_write_ay2:
         out     (c), a
         inc     de
         inc     de                  ; pad
-        ; Switch back to chip 1
-        ld      bc, #0xFFFD
-        ld      a, #0xFF
-        out     (c), a
         jp      _isr_cmd_loop
 
 ;--- SAA1099 chip 1 write: [reg, val, pad] --------------------------------
@@ -497,6 +495,7 @@ _call_wc_handler::
 ;==============================================================================
         .area _DATA
 
+_isr_ms_ctrl::      .db 0xFE       ; MultiSound ctrl: FM OFF + SAA OFF (idle)
 _isr_active_buf::   .db 0
 _isr_enabled::      .db 0
 _isr_tick_ctr::     .db 0          ; инкрементируется каждые ISR тик (2734/сек, wrap 256)

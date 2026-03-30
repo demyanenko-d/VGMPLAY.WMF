@@ -9,12 +9,13 @@
  * Покрывает:
  *   - PSG (AY/YM2149): 12-bit tone period (regs 0x00–0x05), 0..4095
  *   - PSG noise: 5-bit (reg 0x06), 0..31 — первые 32 записи
- *   - FM F-Number (YM2203): 11-bit (0..2047) — первые 2048 записей
- *     (FM ratio = PSG ratio для YM2203, т.к. PSG=fclk/2 → 1.75M, FM=fclk → 3.5M)
  *
- * Формула: table[i] = round(i × f_source / f_target)
+ * Формула: table[i] = round(i × f_target / f_source)
  *   Для PSG: f_source = VGM PSG clock, f_target = 1750000 Hz
- *   Для FM:  f_source = VGM YM2203 clock, f_target = 3500000 Hz (тот же ratio)
+ *   Период УМЕНЬШАЕТСЯ при target < source → частота сохраняется.
+ *
+ * FM F-Number масштабирование требует ОБРАТНОГО ratio (source/target)
+ * и реализуется отдельно (TODO: shadow-регистры FM каналов).
  *
  * При использовании build-time подхода (6 таблиц в WMF):
  *   --binary freq_tables.bin  → 6 × 8 КБ = 48 КБ raw data
@@ -132,7 +133,7 @@ const PAGE_SIZE    = 16384;  /* 16 КБ */
 /* ── Генерация одной таблицы ─────────────────────────────────────────── */
 function generateTable(srcPsgHz, targetHz) {
     const buf = Buffer.alloc(TABLE_BYTES);
-    const ratio = srcPsgHz / targetHz;
+    const ratio = targetHz / srcPsgHz;  /* PSG: period shrinks when target < source */
 
     for (let i = 0; i < TABLE_ENTRIES; i++) {
         let scaled = Math.round(i * ratio);

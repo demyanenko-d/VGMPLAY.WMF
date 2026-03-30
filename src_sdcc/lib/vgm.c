@@ -783,13 +783,12 @@ next_hl:
             else if (fb_b1 == 0x06) {
                 fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
-            /* ── FM regs (>0x0D): skip — нет FM-железа, AY-only ── */
+            /* FM regs (>0x0D): без масштабирования (TODO: F-Number shadow) */
           }
 #endif /* VGM_FREQ_SCALE */
-            /* Фильтр: только PSG-регистры 0x00-0x0D → CMD_WRITE_AY.     *
-             * FM-регистры YM2203 (0x0E+) портят AY: reg&0x0F попадает    *
-             * в PSG-пространство (0x28 → AY reg 8 = vol A, и т.д.)      */
-            if (fb_b1 > 0x0D) continue;
+            /* YM2203: все регистры (PSG 0x00-0x0D, FM 0x0E+,
+             * MultiSound ctrl 0xF0-0xFF) идут через CMD_WRITE_AY.
+             * Физический YM2203 обрабатывает полный 8-бит адрес. */
             fb_wp[0] = CMD_WRITE_AY;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -839,12 +838,16 @@ next_hl:
         }
 
         /* ═══════ SAA1099 dual (0xBD) ═══════ */
+        /* MultiSound имеет только один физический SAA1099 —
+         * chip 2 (bit7=1) пропускаем, играем только chip 1. */
         if (fb_op == 0xBD)
         {
             fb_b1 = *fb_rp++; PAGE_CHK();
             fb_b2 = *fb_rp++; PAGE_CHK();
-            fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_SAA2 : CMD_WRITE_SAA;
-            fb_wp[1] = fb_b1 & 0x7F;
+            if (fb_b1 & 0x80)
+                goto do_budget;     /* skip chip 2 */
+            fb_wp[0] = CMD_WRITE_SAA;
+            fb_wp[1] = fb_b1;
             fb_wp[2] = fb_b2;
             fb_wp += 4;
             goto do_budget;

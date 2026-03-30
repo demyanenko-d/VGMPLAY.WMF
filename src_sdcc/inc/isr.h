@@ -96,6 +96,15 @@
 
 /* ── Переменные ISR (volatile = разделяемые между ISR и main) ────── */
 
+/** Управляющий байт MultiSound (пишется в #FFFD перед каждой записью AY).
+ *  bit0: chip select (0=chip1, 1=chip2) — ISR управляет автоматически.
+ *  bit1: 1=normal read (всегда 1).
+ *  bit2: 0=FM ON (high-Z), 1=FM OFF (forced low).
+ *  bit3: 0=SAA CLK ON, 1=SAA CLK OFF.
+ *  bit[7:4]: 0xF (маркер MultiSound ctrl).
+ *  Idle = 0xFE (FM OFF, SAA OFF). */
+extern volatile uint8_t  isr_ms_ctrl;
+
 /** Индекс активного буфера: 0 = A, 1 = B.
  *  Записывается ISR при CMD_END_BUF, читается main loop. */
 extern volatile uint8_t  isr_active_buf;

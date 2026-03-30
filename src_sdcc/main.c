@@ -141,9 +141,7 @@ static void build_playback_queue(void)
 {
     vgm_hl_len = 0;
 
-    /* Init phase: enable clocks + silence (clear residual state) + init */
-    if (s_has_saa || s_has_saa2)
-        hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_ON);
+    /* Init phase: silence (clear residual state) + init */
     if (s_has_opl) {
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_OPL);
         hl_push(HLCMD_CMDBLK,
@@ -175,10 +173,7 @@ static void build_playback_queue(void)
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_AY2);
     if (s_has_saa)
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_SAA);
-    if (s_has_saa2)
-        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_SAA2);
-    if (s_has_saa || s_has_saa2)
-        hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_OFF);
+    /* SAA2 silence не нужен — MultiSound имеет только один SAA1099 */
 
     hl_push(HLCMD_ISR_DONE, 0);
 
@@ -631,6 +626,22 @@ void start_playback(void)
         isr_wait_ctr = 0;
         isr_done = 0;
 
+        /* MultiSound ctrl: enable FM/SAA only for chips present.
+         * 0xF2 = FM ON + SAA ON + normal read + chip1 (base).
+         * bit2: 1 = FM OFF  (set when no YM2203)
+         * bit3: 1 = SAA OFF (set when no SAA1099) */
+        isr_ms_ctrl = 0xF2
+            | (s_has_ym2203 ? 0x00 : 0x04)
+            | (s_has_saa ? 0x00 : 0x08);
+
+        /* Apply MultiSound config to hardware immediately
+         * (needed for SAA-only music where no AY writes occur) */
+        __asm
+            ld   bc, #0xFFFD
+            ld   a, (_isr_ms_ctrl)
+            out  (c), a
+        __endasm;
+
         /* Build HL command queue for this track */
         build_playback_queue();
 
@@ -664,6 +675,14 @@ void stop_playback(void)
     ints_disable();
     isr_enabled = 0;
     isr_deinit();   /* восстановить вектор WC */
+
+    /* MultiSound: disable FM + SAA, select chip1 (hardware + variable) */
+    isr_ms_ctrl = 0xFE;
+    __asm
+        ld   bc, #0xFFFD
+        ld   a, #0xFE          ;; chip1 + FM OFF + SAA CLK OFF
+        out  (c), a
+    __endasm;
 
     /* Disable cache before returning to WC.
      * CacheConfig = 0 disables all per-window caches.
