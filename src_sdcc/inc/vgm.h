@@ -195,8 +195,16 @@ extern uint8_t  vgm_loop_page;
 /** Общая длительность воспроизведения (секунды), с учётом loop rewinds */
 extern uint16_t vgm_total_seconds;
 
+/** Флаг: использовать ли loop при воспроизведении.
+ *  Устанавливается в vgm_parse_header() с учётом loop policy. */
+extern uint8_t  vgm_loop_enabled;
+
 /** Количество повторов петли после первого проигрывания */
 #define MAX_LOOP_REWINDS 1
+
+/* ── Loop policy (TODO: перенести в INI-параметры) ──────────────── */
+#define LOOP_MIN_BASE_SEC  10   /* базовый трек < 10 с → loop не нужен  */
+#define LOOP_MAX_TOTAL_SEC 240  /* с лупом > 4 мин → loop не нужен      */
 
 /* ── GD3 метаданные (только English, ASCII) ──────────────────────── */
 #define VGM_GD3_LEN  48   /* макс. длина одного поля (+1 для '\0')   */

@@ -48,6 +48,7 @@ vgm_chip_entry_t vgm_chip_list[VGM_MAX_CHIPS];
 uint16_t vgm_loop_addr;
 uint8_t vgm_loop_page;
 uint16_t vgm_total_seconds;
+uint8_t  vgm_loop_enabled;
 
 /* ── High-level command queue globals ──────────────────────────────── */
 hl_entry_t vgm_hl_queue[HL_QUEUE_MAX];
@@ -349,32 +350,44 @@ uint8_t vgm_parse_header(void)
         }
     }
 
-    /* ── Total playback duration (seconds) ────────────────────────────
+    /* ── Total playback duration + loop policy ────────────────────────
      * total_samples (0x18) = samples in entire file (before loop).
      * loop_samples  (0x20) = samples in one loop iteration.
-     * Effective total = total_samples + loop_samples * MAX_LOOP_REWINDS.
-     * Divide by 44100 to get seconds.
      *
-     * Full-track loop: если loop_start == data_start, loop-секция = весь
-     * трек.  Дополнительные LOOP-повторы просто переигрывают всё
-     * с начала — пропускаем их, трек играет 1 раз.
+     * Loop отключается если:
+     *  1) loop_addr == 0 (нет лупа в файле)
+     *  2) full-track loop (loop_start == data_start)
+     *  3) базовый трек < LOOP_MIN_BASE_SEC
+     *  4) с лупом получается > LOOP_MAX_TOTAL_SEC
      */
     {
         uint32_t ts = (uint32_t)base[0x18]
                     | ((uint32_t)base[0x19] << 8)
                     | ((uint32_t)base[0x1A] << 16)
                     | ((uint32_t)base[0x1B] << 24);
+        uint16_t base_sec = (uint16_t)(ts / 44100UL);
+
+        vgm_loop_enabled = 0;
+
         if (vgm_loop_addr &&
             !(vgm_loop_page == vgm_cur_page &&
-              vgm_loop_addr == vgm_read_ptr)) {
-            /* Частичный loop — добавляем loop_samples */
+              vgm_loop_addr == vgm_read_ptr) &&
+            base_sec >= LOOP_MIN_BASE_SEC) {
+            /* Частичный loop, трек достаточно длинный — пробуем */
             uint32_t ls = (uint32_t)base[0x20]
                         | ((uint32_t)base[0x21] << 8)
                         | ((uint32_t)base[0x22] << 16)
                         | ((uint32_t)base[0x23] << 24);
-            ts += ls * MAX_LOOP_REWINDS;
+            uint32_t total_with_loop = ts + ls * MAX_LOOP_REWINDS;
+            uint16_t total_sec = (uint16_t)(total_with_loop / 44100UL);
+
+            if (total_sec <= LOOP_MAX_TOTAL_SEC) {
+                vgm_loop_enabled = 1;
+                base_sec = total_sec;
+            }
         }
-        vgm_total_seconds = (uint16_t)(ts / 44100UL);
+
+        vgm_total_seconds = base_sec;
     }
 
     return VGM_OK;

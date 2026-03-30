@@ -153,12 +153,9 @@ static void build_playback_queue(void)
     /* Main playback */
     hl_push(HLCMD_PLAY, 0);
 
-    /* Loop repeats (if the VGM has a loop point).
-     * Full-track loop (луп с начала данных) пропускаем:
-     * такие файлы просто переигрывают всё с начала. */
-    if (vgm_loop_addr &&
-        !(vgm_loop_page == vgm_cur_page &&
-          vgm_loop_addr == vgm_read_ptr)) {
+    /* Loop repeats — только если vgm_parse_header разрешил loop.
+     * Policy: без full-track loop, без коротких (<10с), без длинных (>4мин). */
+    if (vgm_loop_enabled) {
         for (uint8_t i = 0; i < MAX_LOOP_REWINDS; i++)
             hl_push(HLCMD_LOOP, 0);
     }
