@@ -1728,7 +1728,13 @@ extern uint32_t  wc_file_size;         /* 32-bit LE: [+0]=lo, [+2]=hi   */
 /* Код возврата плагина: запись в wc_exit_code перед return из main() */
 extern uint8_t   wc_exit_code;
 
-#define WC_EXIT_ESC         0   /* закрыть плагин / выйти             */
+/** Номер текущего объекта в панели (от 1). Передаётся WC в HL'. */
+extern uint16_t  wc_file_idx;
+/** Количество объектов в панели (включая ".."). Передаётся WC в DE'.
+ *  Если wc_file_idx == wc_file_count — это последний файл. */
+extern uint16_t  wc_file_count;
+
+#define WC_EXIT_ESC         0   /* закрыть плагин / выйти (стоп)      */
 #define WC_EXIT_UNRECOGNIZED 1  /* файл не распознан → другому плагину */
 #define WC_EXIT_NEXT        2   /* перейти к следующему файлу           */
 #define WC_EXIT_RELOAD_DIR  3   /* перечитать каталог WC               */

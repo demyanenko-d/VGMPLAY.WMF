@@ -27,6 +27,8 @@
         .module crt0
         .globl  _main
         .globl  _wc_exit_code
+        .globl  _wc_file_idx
+        .globl  _wc_file_count
 
         ; Линкер-символы для runtime-инициализации C
         .globl  s__DATA
@@ -59,6 +61,12 @@ _plugin_entry::
         push    af              ; file_ext (в A)
         ex      af, af'
 
+        ;--- Сохранить HL'/DE' (номер объекта / кол-во файлов) ---
+        exx
+        push    hl              ; file_idx  (HL')
+        push    de              ; file_count (DE')
+        exx
+
         ;--------------------------------------------------------------
         ; Инициализировать C runtime (обнулить _DATA,
         ; скопировать начальные значения в _INITIALIZED)
@@ -68,6 +76,11 @@ _plugin_entry::
         ;--------------------------------------------------------------
         ; Восстановить параметры WC из стека в (теперь чистые) глобалы
         ;--------------------------------------------------------------
+        pop     de              ; file_count (DE')
+        ld      (_wc_file_count), de
+        pop     hl              ; file_idx (HL')
+        ld      (_wc_file_idx), hl
+
         pop     af
         ld      (_wc_file_ext), a
 
@@ -97,6 +110,8 @@ _wc_file_ext::  .db 0
 _wc_file_name:: .dw 0
 _wc_file_size:: .dw 0, 0   ; 32-bit LE
 _wc_exit_code:: .db 0
+_wc_file_idx::  .dw 0       ; HL': номер объекта в панели (от 1)
+_wc_file_count::.dw 0       ; DE': кол-во объектов в панели (вкл. "..")
 
 ;------------------------------------------------------------------------------
 ; Инициализация C runtime (SDCC: _GSINIT выполняется при старте)

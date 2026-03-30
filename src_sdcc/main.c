@@ -702,6 +702,56 @@ void stop_playback(void)
     ints_enable();
 }
 
+/**
+ * Мгновенный abort воспроизведения.
+ *
+ * При обычном abort через vgm_hl_abort_pos main loop ждёт, пока ISR
+ * доиграет активный буфер (включая CMD_WAIT, до ~1 сек задержки).
+ *
+ * instant_abort() обходит это за ~1.5 мс:
+ *   1. isr_enabled = 0 → ISR пропускает команды (pos_table работает).
+ *   2. HALT — CPU спит до следующего INT.  После пробуждения ISR
+ *      гарантированно отработал один проход с enabled=0.
+ *   3. Обнуляем isr_wait_ctr (отменяем CMD_WAIT).
+ *   4. Заполняем НЕАКТИВНЫЙ буфер shutdown-цепочкой
+ *      (silence + CMD_ISR_DONE) — ISR его не читает.
+ *   5. Переключаем isr_active_buf + isr_read_ptr на этот буфер.
+ *   6. isr_enabled = 1 → ISR мгновенно выполняет shutdown.
+ *
+ * Вызывать ПОСЛЕ установки vgm_hl_pos = vgm_hl_abort_pos.
+ * После возврата isr_done будет установлен через 1-2 ISR-тика.
+ *
+ * Нулевой overhead на горячем пути ISR — без дополнительных флагов.
+ */
+static void instant_abort(void)
+{
+    uint8_t free_idx;
+
+    /* ── 1. Заморозить ISR (команды не выполняются) ─────────── */
+    isr_enabled = 0;
+
+    /* ── 2. HALT: спать до следующего INT ──────────────────── *
+     * После HALT ISR гарантированно отработал с enabled=0,     *
+     * не тронул ни один буфер.  ~1.5 мс максимум.             */
+    __asm__( "halt" );
+
+    /* ── 3. Обнулить wait_ctr (отменить CMD_WAIT) ─────────── */
+    isr_wait_ctr = 0;
+
+    /* ── 4. Заполнить НЕАКТИВНЫЙ буфер shutdown-цепочкой ───── *
+     * vgm_hl_pos уже установлен на vgm_hl_abort_pos →         *
+     * vgm_fill_buffer выдаст silence + CMD_ISR_DONE.           */
+    free_idx = (isr_active_buf & 1) ^ 1;
+    vgm_fill_buffer(free_idx);
+
+    /* ── 5. Переключить ISR на заполненный буфер ─────────── */
+    isr_active_buf = free_idx;
+    isr_read_ptr = (uint16_t)(free_idx ? cmd_buf_b : cmd_buf_a);
+
+    /* ── 6. Разморозить → ISR обработает shutdown ───────── */
+    isr_enabled = 1;
+}
+
 void update_buffer(void)
 {
     uint8_t active;
@@ -865,8 +915,13 @@ void main(void)
 
     /* Default exit = next track; ESC/P override it.
      * WC_EXIT_ESC == 0, so we must not leave wc_exit_code at 0
-     * or the isr_done handler would misinterpret it as ESC. */
-    wc_exit_code = WC_EXIT_NEXT;
+     * or the isr_done handler would misinterpret it as ESC.
+     *
+     * Если это последний файл в каталоге (wc_file_idx == wc_file_count),
+     * переход на следующий не имеет смысла — выходим со STOP.           */
+    wc_exit_code = (wc_file_idx == wc_file_count)
+                       ? WC_EXIT_ESC
+                       : WC_EXIT_NEXT;
 
     /* FSM клавиатуры: стартуем в WAIT_RELEASE, чтобы дождаться
      * отпускания кнопки, оставшейся от предыдущего трека.     */
@@ -888,18 +943,21 @@ void main(void)
             vgm_hl_pos = vgm_hl_abort_pos;
             vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_ESC;
+            instant_abort();
         }
         else if (key == KEY_NEXT)
         {
             vgm_hl_pos = vgm_hl_abort_pos;
             vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_NEXT;
+            instant_abort();
         }
         else if (key == KEY_PREV)
         {
             vgm_hl_pos = vgm_hl_abort_pos;
             vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_PREV;
+            instant_abort();
         }
 
         /* ── UI-обновление: ~50 Гц ────────────────────────── */

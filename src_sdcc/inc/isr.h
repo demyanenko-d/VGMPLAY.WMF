@@ -109,8 +109,10 @@ extern volatile uint8_t  isr_ms_ctrl;
  *  Записывается ISR при CMD_END_BUF, читается main loop. */
 extern volatile uint8_t  isr_active_buf;
 
-/** Флаг включения: 0 = ISR проверяет, но НЕ выполняет команды.
- *  Записывается main loop, читается ISR. */
+/** Флаг включения: 0 = ISR пропускает выполнение команд
+ *  (pos_table и tick_ctr продолжают работать).
+ *  Записывается main loop, читается ISR.
+ *  instant_abort() использует это для заморозки без доп. флагов. */
 extern volatile uint8_t  isr_enabled;
 
 /** Счётчик тиков ISR. Инкрементируется каждые ~365 мкс (2734 Гц),
