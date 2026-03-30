@@ -359,6 +359,64 @@ const char *vgm_chip_name(uint8_t id)
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * asm_shift_mask — быстрый 16-бит сдвиг вправо на VGM_SAMPLE_SHIFT
+ *
+ * Читает fb_t,  пишет fb_tk  = fb_t >> VGM_SAMPLE_SHIFT
+ *                     fb_wacc = fb_t &  VGM_SAMPLE_MASK
+ * Чистый ASM: ~122..146 T  vs  SDCC цикл ~370..514 T (3-4× быстрее).
+ * Безопасно для fb_t ≤ 4095 (H ≤ 0x0F → H<<(8-N) вмещается в байт).
+ * Clobbers: A, B, H, L.
+ * ───────────────────────────────────────────────────────────────────── */
+static void asm_shift_mask(void) __naked {
+    __asm
+    ld  hl, (_fb_t)
+    ;; fb_wacc = fb_t & mask
+    ld  a, l
+#if VGM_SAMPLE_SHIFT == 6
+    and a, #0x3F
+#elif VGM_SAMPLE_SHIFT == 5
+    and a, #0x1F
+#elif VGM_SAMPLE_SHIFT == 4
+    and a, #0x0F
+#endif
+    ld  (_fb_wacc), a
+    ;; fb_tk = fb_t >> N  via  H<<(8-N) | L>>N
+    ld  a, h
+    add a, a
+    add a, a
+#if VGM_SAMPLE_SHIFT < 6
+    add a, a
+#endif
+#if VGM_SAMPLE_SHIFT < 5
+    add a, a
+#endif
+    ld  b, a
+    ld  a, l
+    rlca
+    rlca
+#if VGM_SAMPLE_SHIFT < 6
+    rlca
+#endif
+#if VGM_SAMPLE_SHIFT < 5
+    rlca
+#endif
+#if VGM_SAMPLE_SHIFT == 6
+    and a, #0x03
+#elif VGM_SAMPLE_SHIFT == 5
+    and a, #0x07
+#elif VGM_SAMPLE_SHIFT == 4
+    and a, #0x0F
+#endif
+    or  a, b
+    ld  (_fb_tk), a
+    xor a, a
+    ld  (_fb_tk+1), a
+    ld  (_fb_wacc+1), a
+    ret
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * emit_wait — вставить паузу tk тиков (ISR)
  *
  * Использует два механизма паузы:
@@ -565,11 +623,17 @@ next_hl:
         /* ═══════ Frame wait 1/60 (0x62) ═══════ */
         if (fb_op == 0x62)
         {
-            fb_t  = fb_wacc + 735u;
-            fb_tk = fb_t >> VGM_SAMPLE_SHIFT;
-            fb_wacc = fb_t & VGM_SAMPLE_MASK;
+            fb_t = fb_wacc + 735u;
+            asm_shift_mask();
             if (fb_tk) {
-                emit_wait(fb_tk);
+                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
+                    fb_wp[0] = CMD_SKIP_TICKS;
+                    fb_wp[1] = (uint8_t)(fb_tk - 1);
+                    fb_wp += 4;
+                    vgm_sec_budget -= fb_tk;
+                } else {
+                    emit_wait(fb_tk);
+                }
                 fb_budget = VGM_FILL_CMD_BUDGET;
             }
             continue;
@@ -578,11 +642,17 @@ next_hl:
         /* ═══════ Frame wait 1/50 (0x63) ═══════ */
         if (fb_op == 0x63)
         {
-            fb_t  = fb_wacc + 882u;
-            fb_tk = fb_t >> VGM_SAMPLE_SHIFT;
-            fb_wacc = fb_t & VGM_SAMPLE_MASK;
+            fb_t = fb_wacc + 882u;
+            asm_shift_mask();
             if (fb_tk) {
-                emit_wait(fb_tk);
+                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
+                    fb_wp[0] = CMD_SKIP_TICKS;
+                    fb_wp[1] = (uint8_t)(fb_tk - 1);
+                    fb_wp += 4;
+                    vgm_sec_budget -= fb_tk;
+                } else {
+                    emit_wait(fb_tk);
+                }
                 fb_budget = VGM_FILL_CMD_BUDGET;
             }
             continue;
@@ -592,11 +662,17 @@ next_hl:
 #ifndef VGM_NO_SHORT_WAITS
         if ((fb_op & 0xF0) == 0x70)
         {
-            fb_t  = fb_wacc + (uint16_t)((fb_op & 0x0Fu) + 1u);
-            fb_tk = fb_t >> VGM_SAMPLE_SHIFT;
-            fb_wacc = fb_t & VGM_SAMPLE_MASK;
+            fb_t = fb_wacc + (uint16_t)((fb_op & 0x0Fu) + 1u);
+            asm_shift_mask();
             if (fb_tk) {
-                emit_wait(fb_tk);
+                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
+                    fb_wp[0] = CMD_SKIP_TICKS;
+                    fb_wp[1] = (uint8_t)(fb_tk - 1);
+                    fb_wp += 4;
+                    vgm_sec_budget -= fb_tk;
+                } else {
+                    emit_wait(fb_tk);
+                }
                 fb_budget = VGM_FILL_CMD_BUDGET;
             }
             continue;
@@ -615,7 +691,14 @@ next_hl:
             fb_tk  = (uint16_t)(fb_t32 >> VGM_SAMPLE_SHIFT);
             fb_wacc = (uint16_t)(fb_t32 & (uint32_t)VGM_SAMPLE_MASK);
             if (fb_tk) {
-                emit_wait(fb_tk);
+                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
+                    fb_wp[0] = CMD_SKIP_TICKS;
+                    fb_wp[1] = (uint8_t)(fb_tk - 1);
+                    fb_wp += 4;
+                    vgm_sec_budget -= fb_tk;
+                } else {
+                    emit_wait(fb_tk);
+                }
                 fb_budget = VGM_FILL_CMD_BUDGET;
             }
             continue;
@@ -843,7 +926,14 @@ next_hl:
     do_budget:
         if (--fb_budget == 0)
         {
-            emit_wait(1);
+            if (vgm_sec_budget > 1) {
+                fb_wp[0] = CMD_SKIP_TICKS;
+                fb_wp[1] = 0;
+                fb_wp += 4;
+                vgm_sec_budget--;
+            } else {
+                emit_wait(1);
+            }
             fb_budget = VGM_FILL_CMD_BUDGET;
         }
     }
