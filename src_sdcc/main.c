@@ -11,7 +11,7 @@
  *   - OPL3: NEW=1 (L/R через C0-C8); OPL1/OPL2: NEW=0 (compat mode)
  *
  * Управление:
- *   ESC / Q  — выход
+ *   Q        — выход
  *   N        — следующий файл в каталоге
  *   P        — предыдущий файл
  */
@@ -126,7 +126,7 @@ static void detect_active_chips(void)
 /* ── HL queue helpers ────────────────────────────────────────────────
  * The queue itself and its state live in vgm.c (vgm_hl_queue etc.)
  * vgm_fill_buffer() reads them internally; main.c only builds
- * the queue and sets vgm_hl_pos on abort (ESC/N/P).               */
+ * the queue and sets vgm_hl_pos on abort (Q/N/P).               */
 
 static void hl_push(uint8_t cmd, uint8_t param)
 {
@@ -153,8 +153,12 @@ static void build_playback_queue(void)
     /* Main playback */
     hl_push(HLCMD_PLAY, 0);
 
-    /* Loop repeats (if the VGM has a loop point) */
-    if (vgm_loop_addr) {
+    /* Loop repeats (if the VGM has a loop point).
+     * Full-track loop (луп с начала данных) пропускаем:
+     * такие файлы просто переигрывают всё с начала. */
+    if (vgm_loop_addr &&
+        !(vgm_loop_page == vgm_cur_page &&
+          vgm_loop_addr == vgm_read_ptr)) {
         for (uint8_t i = 0; i < MAX_LOOP_REWINDS; i++)
             hl_push(HLCMD_LOOP, 0);
     }
@@ -211,8 +215,7 @@ static uint8_t  s_pb_text_pg;     /* physical page of text screen          */
 static uint16_t s_pb_char_ofs;    /* char area offset within text page     */
 static uint16_t s_pb_attr_ofs;    /* attr area offset within text page     */
 static uint8_t  s_pb_width;       /* bar width in columns                  */
-static uint16_t s_pb_sec_step;    /* seconds per column (precomputed)      */
-static uint16_t s_pb_next_sec;    /* threshold sec for next green col      */
+static uint16_t s_pb_err;         /* Bresenham error accumulator           */
 static uint8_t  s_pb_col;         /* current green column count            */
 
 /* Позиции изменяемых символов внутри строки progress bar:
@@ -227,7 +230,7 @@ static uint8_t  s_pb_col;         /* current green column count            */
 /* ── FSM-клавиатура (дебаунс без сжигания CPU) ───────────────────────
  * Состояния:
  *   WAIT_RELEASE — ждём отпускания ВСЕХ клавиш (защита от «залипания»
- *                  при перезапуске плагина с зажатой N/P/ESC)
+ *                  при перезапуске плагина с зажатой N/P/Q)
  *   IDLE         — ничего не нажато, ждём нажатия
  *   CONFIRM      — нажатие обнаружено, подтверждаем через
  *                  KBD_DEBOUNCE_TICKS (~3 мс) стабильного удержания
@@ -382,7 +385,7 @@ uint8_t drow_ui(void)
 
     // Инструкция --------------------------------------------------------------------------------------
     buf_clear(work_buf);
-    buf_append_str(work_buf, "[N]ext [P]rev [Q/ESC] Exit");
+    buf_append_str(work_buf, "[N]ext [P]rev [Q] Exit");
     print_line(&s_wnd, 22, work_buf, WC_COLOR(WC_WHITE, WC_BLUE));
 
     // Данные файла ------------------------------------------------------------------------------------
@@ -872,13 +875,19 @@ void update_playback_info(void)
             base[PB_OFS_LOOP] = '1' + vgm_loop_count;
         }
 
-        /* ── Progress bar: инкрементально красим столбцы зелёным.
-         * Только сравнение + сложение uint16, ноль делений. */
-        while (s_pb_col < s_pb_width && sec >= s_pb_next_sec) {
-            *(volatile uint8_t *)(0xC000 + s_pb_attr_ofs + s_pb_col) =
-                WC_COLOR(WC_GREEN, WC_BLACK);
-            s_pb_col++;
-            s_pb_next_sec += s_pb_sec_step;
+        /* ── Progress bar: Bresenham-аккумулятор.
+         * Каждую секунду добавляем s_pb_width к ошибке,
+         * когда ошибка >= total — красим колонку и вычитаем.
+         * Ноль делений.  Точно для любого соотношения sec/width. */
+        if (sec_changed && vgm_total_seconds) {
+            s_pb_err += s_pb_width;
+            while (s_pb_col < s_pb_width &&
+                   s_pb_err >= vgm_total_seconds) {
+                *(volatile uint8_t *)(0xC000 + s_pb_attr_ofs + s_pb_col) =
+                    WC_COLOR(WC_GREEN, WC_BLACK);
+                s_pb_col++;
+                s_pb_err -= vgm_total_seconds;
+            }
         }
 
         sfr_page3 = saved_pg;
@@ -894,7 +903,7 @@ void main(void)
 
     state = STATE_INIT;
 
-    wc_turbopl(2, 0);
+    wc_turbopl(WC_TURBO_CPU, 0x02);  /* 14 МГц */
     wc_strset((char *)&s_wnd, sizeof(s_wnd), 0);
 
     // SOW — однолинейная рамка, без буфера фона
@@ -983,15 +992,7 @@ void main(void)
         s_pb_attr_ofs = s_pb_char_ofs | 0x0080;
         s_pb_width    = get_content_width(&s_wnd);
         s_pb_col      = 0;
-        /* Предвычислить порог и шаг — одно деление здесь,
-         * ноль делений в цикле */
-        if (vgm_total_seconds && s_pb_width) {
-            s_pb_sec_step = vgm_total_seconds / s_pb_width;
-            if (!s_pb_sec_step) s_pb_sec_step = 1;
-        } else {
-            s_pb_sec_step = 0xFFFF;
-        }
-        s_pb_next_sec = s_pb_sec_step;
+        s_pb_err      = 0;
     }
 
     /* Печатаем полную строку progress bar ОДИН РАЗ через WC API.
@@ -1011,42 +1012,27 @@ void main(void)
         start_playback();
 
     uint8_t key = 0;
-
-    uint8_t tick_prev = isr_tick_ctr;
-
-    /* Default exit = next track; ESC/P override it.
-     * WC_EXIT_ESC == 0, so we must not leave wc_exit_code at 0
-     * or the isr_done handler would misinterpret it as ESC.
-     *
-     * Если это последний файл в каталоге (wc_file_idx == wc_file_count),
-     * переход на следующий не имеет смысла — выходим со STOP.           */
-    wc_exit_code = (wc_file_idx == wc_file_count)
-                       ? WC_EXIT_ESC
-                       : WC_EXIT_NEXT;
+    wc_exit_code = (wc_file_idx == wc_file_count) ? WC_EXIT_ESC : WC_EXIT_NEXT;
 
     /* FSM клавиатуры: стартуем в WAIT_RELEASE, чтобы дождаться
      * отпускания кнопки, оставшейся от предыдущего трека.     */
     kbd_init();
 
-    /* Главный цикл: опрос клавиатуры на каждой итерации (порты — мгновенно),
-       UI-обновление каждые ISR_TICKS_PER_FRAME тиков (~50 Гц) */
+    /* Главный цикл: приоритет — update_buffer (буфер не должен голодать),
+       клавиатура + UI — по остаточному принципу.                           */
     while (state == STATE_PLAYBACK)
     {
-        /* ── Клавиатура: FSM дебаунс (~3 мс) ──────────────────
-         * kbd_poll() = read_keys() + FSM подтверждение.
-         * Защита: стартует в WAIT_RELEASE (зажатая N/P не
-         * сработает повторно). После подтверждения → снова
-         * WAIT_RELEASE (нет авто-повтора).                     */
+        /* ── 1. Буфер: максимальный приоритет ──────────────── */
+        update_buffer();
+
+        /* ISR замер на CMD_ISR_DONE → чистый выход */
+        if (isr_done)
+            break;
+
+        /* ── 2. Клавиатура: FSM дебаунс (~3 мс) ───────────── */
         key = kbd_poll();
 
-        if (key == KEY_ESC)
-        {
-            vgm_hl_pos = vgm_hl_abort_pos;
-            vgm_song_ended = 0;
-            wc_exit_code = WC_EXIT_ESC;
-            instant_abort();
-        }
-        else if (key == KEY_NEXT)
+        if (key == KEY_NEXT)
         {
             vgm_hl_pos = vgm_hl_abort_pos;
             vgm_song_ended = 0;
@@ -1060,29 +1046,16 @@ void main(void)
             wc_exit_code = WC_EXIT_PREV;
             instant_abort();
         }
-
-        /* ── UI-обновление: ~50 Гц ────────────────────────── */
+        else if (key == KEY_ESC)
         {
-            uint8_t tick = isr_tick_ctr;
-            uint8_t tick_delta = tick - tick_prev;
-
-            if (tick_delta >= ISR_TICKS_PER_FRAME)
-            {
-                tick_prev = tick;
-                update_playback_info();
-            }
+            vgm_hl_pos = vgm_hl_abort_pos;
+            vgm_song_ended = 0;
+            wc_exit_code = WC_EXIT_ESC;
+            instant_abort();
         }
 
-        if (state == STATE_PLAYBACK)
-        {
-            update_buffer();
-
-            /* ISR замер на CMD_ISR_DONE → чистый выход */
-            if (isr_done)
-            {
-                break;
-            }
-        }
+        if (isr_play_seconds != s_last_displayed_sec || vgm_loop_count  != s_last_loop_count)
+            update_playback_info();
     }
 
     stop_playback();

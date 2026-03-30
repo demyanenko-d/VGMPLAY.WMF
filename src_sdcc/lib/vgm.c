@@ -354,13 +354,20 @@ uint8_t vgm_parse_header(void)
      * loop_samples  (0x20) = samples in one loop iteration.
      * Effective total = total_samples + loop_samples * MAX_LOOP_REWINDS.
      * Divide by 44100 to get seconds.
+     *
+     * Full-track loop: если loop_start == data_start, loop-секция = весь
+     * трек.  Дополнительные LOOP-повторы просто переигрывают всё
+     * с начала — пропускаем их, трек играет 1 раз.
      */
     {
         uint32_t ts = (uint32_t)base[0x18]
                     | ((uint32_t)base[0x19] << 8)
                     | ((uint32_t)base[0x1A] << 16)
                     | ((uint32_t)base[0x1B] << 24);
-        if (vgm_loop_addr) {
+        if (vgm_loop_addr &&
+            !(vgm_loop_page == vgm_cur_page &&
+              vgm_loop_addr == vgm_read_ptr)) {
+            /* Частичный loop — добавляем loop_samples */
             uint32_t ls = (uint32_t)base[0x20]
                         | ((uint32_t)base[0x21] << 8)
                         | ((uint32_t)base[0x22] << 16)
@@ -655,6 +662,7 @@ next_hl:
 
     fb_e = &vgm_hl_queue[vgm_hl_pos];
 
+    // обработка высокоуровневой команды — установка fb_rp, fb_cpg, fb_is_vgm
     switch (fb_e->cmd) {
 
     case HLCMD_CMDBLK:
@@ -684,7 +692,7 @@ next_hl:
             goto next_hl;
         }
         vgm_loop_count++;
-        fb_e->cmd = HLCMD_PLAY;   /* морфируем, чтобы не перематывать снова */
+        fb_e->cmd = HLCMD_PLAY;   /* чтобы не перематывать снова */
         fb_cpg  = vgm_cur_page;
         fb_rp   = (uint8_t *)vgm_read_ptr;
         fb_wacc = vgm_wait_accum;
@@ -713,7 +721,7 @@ next_hl:
      * Горячий цикл — разбор VGM-опкодов → ISR-команды
      * EOF-проверка удалена (гарантирован 0x66-сентинел в данных).
      * ═══════════════════════════════════════════════════════════════ */
-    while (fb_wp < fb_buf + (CMD_BUF_SIZE - 48))
+    while (fb_wp < fb_buf + (CMD_BUF_SIZE - 48)) // зазор 48 байт для emit_wait (макс. 32 байта) + CMD_END_BUF (4 байта) + safety
     {
         /* ── Читаем опкод ──────────────────────────────────────── */
         fb_op = asm_read_byte();
@@ -733,8 +741,10 @@ next_hl:
         {
             fb_t = fb_wacc + 735u;
             asm_shift_mask();
-            if (fb_tk) {
-                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
+            if (fb_tk) // оптимизация для коротких пауз 1-12 мс (типично для 60 FPS)
+            {
+                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) // CMD_SKIP_TICKS для коротких пауз (экономия CPU), иначе обычная пауза с emit_wait
+                {
                     fb_wp[0] = CMD_SKIP_TICKS;
                     fb_wp[1] = (uint8_t)(fb_tk - 1);
                     fb_wp += 4;
@@ -752,8 +762,10 @@ next_hl:
         {
             fb_t = fb_wacc + 882u;
             asm_shift_mask();
-            if (fb_tk) {
-                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
+            if (fb_tk) // оптимизация для коротких пауз 1-12 мс (типично для 50 FPS)
+            {
+                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) // CMD_SKIP_TICKS для коротких пауз (экономия CPU), иначе обычная пауза с emit_wait
+                {
                     fb_wp[0] = CMD_SKIP_TICKS;
                     fb_wp[1] = (uint8_t)(fb_tk - 1);
                     fb_wp += 4;
@@ -966,7 +978,8 @@ next_hl:
                 fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
           }
-#endif
+#endif /* VGM_FREQ_SCALE */
+
             fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
             fb_wp[1] = fb_b1 & 0x7F;
             fb_wp[2] = fb_b2;
@@ -1197,6 +1210,13 @@ void vgm_parse_gd3(void)
 
 /* ─────────────────────────────────────────────────────────────────────
  * vgm_rewind_to_loop
+ * Перематывает к loop-точке, если она есть, и сбрасывает флаг окончания песни.
+ * Возвращает 1 если перемотано, 0 если loop-точки нет.
+ * Loop-точка устанавливается при загрузке VGM-файла, если в нём есть loop_offset.
+ * Loop-точка — абсолютный адрес в VGM-данных, который может быть в любом месте файла
+ * (обычно после заголовка, но может быть и в середине данных).
+ * При перемотке к loop-точке нужно восстановить состояние чтения (текущая страница, указатель чтения, накопленные паузы),
+ * чтобы продолжить воспроизведение оттуда без сбоев.
  * ───────────────────────────────────────────────────────────────────── */
 uint8_t vgm_rewind_to_loop(void)
 {
