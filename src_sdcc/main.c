@@ -23,6 +23,7 @@
 #include "inc/vgm.h"
 #include "inc/isr.h"
 #include "inc/keys.h"
+#include "inc/version.h"
 #include <string.h>
 
 /* Stringify helpers for compile-time ISR_FREQ / budget in title */
@@ -321,7 +322,7 @@ static void draw_pre_load_info(void)
     uint8_t row = 1;
 
     buf_clear(work_buf);
-    buf_append_str(work_buf, "    VGM Player v0.4 " STR(ISR_FREQ) "Hz/b" STR(VGM_FILL_CMD_BUDGET));
+    buf_append_str(work_buf, "    VGM Player " APP_VERSION " " STR(ISR_FREQ) "Hz/b" STR(VGM_FILL_CMD_BUDGET));
     print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
     row = 3;
 
@@ -347,7 +348,7 @@ uint8_t drow_ui(void)
 
     // Заголовок ---------------------------------------------------------------------------------------
     buf_clear(work_buf);
-    buf_append_str(work_buf, "    VGM Player v0.4 " STR(ISR_FREQ) "Hz/b" STR(VGM_FILL_CMD_BUDGET));
+    buf_append_str(work_buf, "    VGM Player " APP_VERSION " " STR(ISR_FREQ) "Hz/b" STR(VGM_FILL_CMD_BUDGET));
     print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
     row += 2;
 

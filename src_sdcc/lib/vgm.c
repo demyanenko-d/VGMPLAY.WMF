@@ -430,6 +430,80 @@ static void asm_shift_mask(void) __naked {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * asm_read_byte — read one byte from fb_rp, handle page crossing
+ * Returns A = byte.  Clobbers C, HL.
+ * Fast-path: 74 T  (+ call 17 + ret 10 = 101 T total)
+ * ───────────────────────────────────────────────────────────────────── */
+static uint8_t asm_read_byte(void) __naked
+{
+    __asm
+    ld   hl, (_fb_rp)       ;16  load read pointer
+    ld   c, (hl)            ; 7  byte → C
+    inc  hl                 ; 6
+    ld   a, h               ; 4
+    or   a, l               ; 4  Z if HL wrapped to 0x0000
+    jr   Z, 150$            ; 7  page-cross (rare)
+    ld   (_fb_rp), hl       ;16  store updated pointer
+    ld   a, c               ; 4  result → A
+    ret                     ;10  fast-path 74 T
+150$:
+    ld   hl, #_fb_cpg       ;10
+    inc  (hl)               ;11
+    ld   a, (hl)            ; 7
+    push bc                 ;11  save result
+    call _wc_mngcvpl        ;17+ switch VPL page (A = fb_cpg)
+    pop  bc                 ;10
+    ld   hl, #0xC000        ;10
+    ld   (_fb_rp), hl       ;16
+    ld   a, c               ; 4  result → A
+    ret                     ;10
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * asm_read_2bytes — read two consecutive bytes → fb_b1, fb_b2
+ * Writes directly to statics.  Handles page-cross per byte.
+ * Fast-path: 124 T  (+ call 17 = 141 T total)
+ * ───────────────────────────────────────────────────────────────────── */
+static void asm_read_2bytes(void) __naked
+{
+    __asm
+    ld   hl, (_fb_rp)       ;16
+    ld   a, (hl)            ; 7  byte1
+    ld   (_fb_b1), a        ;13
+    inc  hl                 ; 6
+    ld   a, h               ; 4
+    or   a, l               ; 4
+    jr   Z, 161$            ; 7  page-cross after byte1 (rare)
+160$:
+    ld   a, (hl)            ; 7  byte2
+    ld   (_fb_b2), a        ;13
+    inc  hl                 ; 6
+    ld   a, h               ; 4
+    or   a, l               ; 4
+    jr   Z, 163$            ; 7  page-cross after byte2 (rare)
+162$:
+    ld   (_fb_rp), hl       ;16
+    ret                     ;10  fast-path 124 T
+161$:
+    ld   hl, #_fb_cpg       ;10
+    inc  (hl)               ;11
+    ld   a, (hl)            ; 7
+    call _wc_mngcvpl        ;17+
+    ld   hl, #0xC000        ;10
+    jr   160$               ;12
+163$:
+    ld   hl, #_fb_cpg       ;10
+    inc  (hl)               ;11
+    ld   a, (hl)            ; 7
+    call _wc_mngcvpl        ;17+
+    ld   hl, #0xC000        ;10
+    ld   (_fb_rp), hl       ;16
+    ret                     ;10
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * emit_wait — вставить паузу tk тиков (ISR)
  *
  * Использует два механизма паузы:
@@ -620,13 +694,12 @@ next_hl:
     while (fb_wp < fb_buf + (CMD_BUF_SIZE - 48))
     {
         /* ── Читаем опкод ──────────────────────────────────────── */
-        fb_op = *fb_rp++; PAGE_CHK();
+        fb_op = asm_read_byte();
 
         /* ═══════ OPL2 write (0x5A) — самая частая ═══════ */
         if (fb_op == 0x5A)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             fb_wp[0] = CMD_WRITE_B0;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -698,8 +771,7 @@ next_hl:
         /* ═══════ Arbitrary wait (0x61) ═══════ */
         if (fb_op == 0x61)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             fb_t32 = (uint32_t)fb_wacc + ((uint16_t)fb_b1 | ((uint16_t)fb_b2 << 8));
             fb_tk  = (uint16_t)(fb_t32 >> VGM_SAMPLE_SHIFT);
             fb_wacc = (uint16_t)(fb_t32 & (uint32_t)VGM_SAMPLE_MASK);
@@ -720,8 +792,7 @@ next_hl:
         /* ═══════ OPL3 Bank 0 (0x5E) ═══════ */
         if (fb_op == 0x5E)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             fb_wp[0] = CMD_WRITE_B0;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -731,8 +802,7 @@ next_hl:
         /* ═══════ OPL1 (0x5B) ═══════ */
         if (fb_op == 0x5B)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             fb_wp[0] = CMD_WRITE_B0;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -742,8 +812,7 @@ next_hl:
         /* ═══════ Y8950 / MSX-AUDIO (0x5C) ═══════ */
         if (fb_op == 0x5C)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             fb_wp[0] = CMD_WRITE_B0;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -753,8 +822,7 @@ next_hl:
         /* ═══════ OPL3 Bank 1 (0x5F) ═══════ */
         if (fb_op == 0x5F)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             fb_wp[0] = CMD_WRITE_B1;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -764,8 +832,7 @@ next_hl:
         /* ═══════ YM2203 SSG+FM (0x55) ═══════ */
         if (fb_op == 0x55)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             /* ── PSG tone period (reg 0x00-0x05): 12-bit, парами lo/hi ── */
@@ -781,12 +848,11 @@ next_hl:
                 }
                 fb_scaled = freq_lut_base[psg_shadow[fb_ch]];
                 if (fb_scaled > 0x0FFF) fb_scaled = 0x0FFF;
-                /* Emit lo byte (reg 0,2,4) */
+                /* Emit оба lo+hi: scaled меняет оба байта одновременно */
                 fb_wp[0] = CMD_WRITE_AY;
                 fb_wp[1] = fb_ch << 1;  /* reg = 0,2,4 */
                 fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
                 fb_wp += 4;
-                /* Emit hi nibble (reg 1,3,5) */
                 fb_wp[0] = CMD_WRITE_AY;
                 fb_wp[1] = (fb_ch << 1) | 1;  /* reg = 1,3,5 */
                 fb_wp[2] = (uint8_t)((fb_scaled >> 8) & 0x0F);
@@ -800,9 +866,6 @@ next_hl:
             /* FM regs (>0x0D): без масштабирования (TODO: F-Number shadow) */
           }
 #endif /* VGM_FREQ_SCALE */
-            /* YM2203: все регистры (PSG 0x00-0x0D, FM 0x0E+,
-             * MultiSound ctrl 0xF0-0xFF) идут через CMD_WRITE_AY.
-             * Физический YM2203 обрабатывает полный 8-бит адрес. */
             fb_wp[0] = CMD_WRITE_AY;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -813,8 +876,7 @@ next_hl:
          * VGM dual chip: 0x55 → 0xA5 (последняя цифра 0x5n → 0xAn) */
         if (fb_op == 0xA5)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             if (fb_b1 <= 0x05) {
@@ -851,8 +913,7 @@ next_hl:
         /* ═══════ AY8910 dual (0xA0) ═══════ */
         if (fb_op == 0xA0)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             fb_reg = fb_b1 & 0x7F;
@@ -896,8 +957,7 @@ next_hl:
          * chip 2 (bit7=1) пропускаем, играем только chip 1. */
         if (fb_op == 0xBD)
         {
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             if (fb_b1 & 0x80)
                 goto do_budget;     /* skip chip 2 */
             fb_wp[0] = CMD_WRITE_SAA;
@@ -925,11 +985,9 @@ next_hl:
         {
             fb_rp++; PAGE_CHK();  /* 0x66 */
             fb_rp++; PAGE_CHK();  /* type */
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             fb_t32 = (uint16_t)fb_b1 | ((uint16_t)fb_b2 << 8);
-            fb_b1 = *fb_rp++; PAGE_CHK();
-            fb_b2 = *fb_rp++; PAGE_CHK();
+            asm_read_2bytes();
             fb_t32 |= ((uint32_t)fb_b1 << 16) | ((uint32_t)fb_b2 << 24);
             /* save → call vgm_skip → reload */
             vgm_read_ptr = (uint16_t)fb_rp;
