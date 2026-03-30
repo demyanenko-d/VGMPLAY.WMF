@@ -1,8 +1,11 @@
-# WC API - Полный справочник функций
+# WC API — Полный справочник функций
+
+> Источники: `inc/wc_api.h` (1878 стр.), `asm/wc_api.s` (1339 стр.),
+> `DiskRef/WC_History.txt` (история изменений API)
 
 ## Вызов функций
 
-Все функции вызываются через точку доступа **#6006**:
+Все функции вызываются через точку доступа **#6006** (`JP` к диспетчеру):
 
 ```asm
 WLD EQU #6006
@@ -13,6 +16,14 @@ LD A, функция_номер
 JP WLD
 ```
 
+**Регистровые соглашения:**
+- **Портит**: AF, BC, DE, HL, IX
+- **Сохраняет**: IY, AF’, BC’, DE’, HL’, SP
+- Функции с параметром в **A’** используют `EX AF,AF'` перед вызовом
+
+> ⚠️ **Win 3 (#C000) сбрасывается** на текстовую страницу после **каждого** вызова
+> `CALL #6006`. Плагин обязан повторить `mngcvpl()`/`mngc_pl()` после любого API-вызова.
+
 ## Категории функций
 
 1. [Управление памятью](#управление-памятью)
@@ -22,6 +33,8 @@ JP WLD
 5. [Работа с графикой](#работа-с-графикой)
 6. [Системные функции](#системные-функции)
 7. [DMA операции](#dma-операции)
+8. [Константы и структуры](#константы-и-структуры)
+9. [Таблица кодов функций](#таблица-кодов-функций)
 
 ---
 
@@ -391,9 +404,13 @@ FILE_STRUCT:
 
 **Вход:**
 - B - выбор Z80/AY:
-  - #00 - частота Z80, C = %00 (3.5MHz), %01 (7MHz), %10 (14MHz)
-  - #01 - частота AY, C = %00 (1.75MHz), %01 (1.7733MHz), %10 (3.5MHz), %11 (3.546MHz)
-  - #FF - восстановить значения из WC
+  - #00 (`WC_TURBO_CPU`) - частота Z80:
+    - C = %00 (3.5 МГц), %01 (7 МГц), %10 (14 МГц), %11 (28 МГц)
+  - #01 (`WC_TURBO_AY`) - частота AY:
+    - C = %00 (1.75 МГц), %01 (1.7733 МГц), %10 (3.5 МГц), %11 (3.546 МГц)
+  - #FF (`WC_TURBO_RESTORE`) - восстановить значения из настроек WC
+
+> AY частоты 1.7733/3.546 МГц — это NTSC-кварц (315/88 МГц ÷ 2).
 
 ### #0F - GEDPL
 Восстановление текстового режима
@@ -895,3 +912,240 @@ int main(void) {
     return 0;
 }
 ```
+---
+
+## Константы и структуры
+
+### Цветовая палитра (EGA-совместимая)
+
+```c
+#define WC_COLOR(bg, fg)    ((uint8_t)(((bg) << 4) | (fg)))
+
+#define WC_BLACK            0      #define WC_DARK_GRAY        8
+#define WC_BLUE             1      #define WC_BRIGHT_BLUE      9
+#define WC_RED              2      #define WC_BRIGHT_RED       10
+#define WC_MAGENTA          3      #define WC_BRIGHT_MAGENTA   11
+#define WC_GREEN            4      #define WC_BRIGHT_GREEN     12
+#define WC_CYAN             5      #define WC_BRIGHT_CYAN      13
+#define WC_YELLOW           6      #define WC_BRIGHT_YELLOW    14
+#define WC_WHITE            7      #define WC_BRIGHT_WHITE     15
+```
+
+### Стили окон
+
+| Константа | Значение | Описание |
+|-----------|----------|----------|
+| `WC_WIN_NO_BORDER` | 0x00 | Без рамки, со стандартным курсором |
+| `WC_WIN_SINGLE` | 0x01 | Одинарная рамка, без курсора |
+| `WC_WIN_DOUBLE` | 0x02 | Двойная рамка + курсор |
+| `WC_WIN_TYPE3`..`TYPE8` | 0x03..0x08 | Рамки 2/3 типа ± курсор/заголовки |
+
+**Флаги (OR с типом):**
+
+| Флаг | Значение | Описание |
+|------|----------|----------|
+| `WC_WIN_HEADER` | 0x10 | Инверсный заголовок сверху |
+| `WC_WIN_WIDE_CURSOR` | 0x40 | Курсор на всю ширину |
+| `WC_WIN_SHADOW` | 0x80 | Тень у окна |
+
+### Структура `wc_window_t` (16 байт)
+
+```c
+typedef struct {
+    uint8_t  type;       /* +0:  стиль+флаги (WC_WIN_*)                */
+    uint8_t  cur_mask;   /* +1:  маска цвета курсора                   */
+    uint8_t  x;          /* +2:  X (255=по центру)                     */
+    uint8_t  y;          /* +3:  Y (255=по центру)                     */
+    uint8_t  width;      /* +4:  ширина (0=весь экран)                 */
+    uint8_t  height;     /* +5:  высота (0=весь экран)                 */
+    uint8_t  color;      /* +6:  WC_COLOR(bg, fg)                      */
+    uint8_t  _reserved;  /* +7:  ВСЕГДА 0!                             */
+    uint16_t buf_addr;   /* +8:  буфер фона (0=авто, 0xFFFF=без буфера)*/
+    uint8_t  divider1;   /* +10: разделитель 1 (смещение от верха)     */
+    uint8_t  divider2;   /* +11: разделитель 2 (смещение от низа)      */
+    uint8_t  cursor_pos; /* +12: позиция курсора (от 1)                */
+    uint8_t  cursor_bot; /* +13: нижний ограничитель курсора           */
+    uint8_t  cursor_clr; /* +14: цвет курсора                          */
+    uint8_t  under_clr;  /* +15: цвет под курсором                     */
+} wc_window_t;
+```
+
+> Авто-центрирование (x=255, y=255) работает для режимов 80×25, 80×30, 90×36.
+> Добавлено в WC v1.02.
+
+### Структура FAT-записи (32 байта)
+
+```c
+typedef struct {
+    uint8_t  name[11];    /* +0:  короткое имя 8.3 (без точки)        */
+    uint8_t  attr;        /* +11: атрибуты FAT (см. WC_FAT_ATTR_*)    */
+    uint8_t  _res1;       /* +12: NTRes                                */
+    uint8_t  crt_time_ms; /* +13: время создания (0.1 сек)             */
+    uint16_t crt_time;    /* +14: время создания (FAT format)          */
+    uint16_t crt_date;    /* +16: дата создания                        */
+    uint16_t acc_date;    /* +18: дата доступа                         */
+    uint16_t cluster_hi;  /* +20: старшее слово кластера               */
+    uint16_t mod_time;    /* +22: время модификации                    */
+    uint16_t mod_date;    /* +24: дата модификации                     */
+    uint16_t cluster_lo;  /* +26: младшее слово кластера               */
+    uint32_t file_size;   /* +28: размер файла                         */
+} wc_fat_entry_t;
+```
+
+**Атрибуты FAT:**
+
+| Константа | Значение | Описание |
+|-----------|----------|----------|
+| `WC_FAT_ATTR_RDONLY` | 0x01 | Только чтение |
+| `WC_FAT_ATTR_HIDDEN` | 0x02 | Скрытый |
+| `WC_FAT_ATTR_SYSTEM` | 0x04 | Системный |
+| `WC_FAT_ATTR_VOLLBL` | 0x08 | Метка тома |
+| `WC_FAT_ATTR_DIR` | 0x10 | Каталог |
+| `WC_FAT_ATTR_ARCHIVE` | 0x20 | Архивный |
+| `WC_FAT_ATTR_LFN` | 0x0F | LFN-запись (RDONLY\|HIDDEN\|SYSTEM\|VOLLBL) |
+
+### Структура FindNext
+
+```c
+typedef struct {
+    uint32_t size;    /* опционально, если WC_FIND_WITH_SIZE         */
+    uint16_t date;    /* опционально, если WC_FIND_WITH_DATE         */
+    uint16_t time;    /* опционально, если WC_FIND_WITH_TIME         */
+    uint8_t  flag;    /* 0x10=каталог, 0x00=файл                     */
+    char     name[1]; /* имя, z-string (длина переменная)            */
+} wc_findnext_entry_t;
+```
+
+**Флаги для `wc_findnext(entry_buf, flags)`:**
+
+| Константа | Значение | Описание |
+|-----------|----------|----------|
+| `WC_FIND_ALL` | 0x00 | Все записи |
+| `WC_FIND_FILES` | 0x01 | Только файлы |
+| `WC_FIND_DIRS` | 0x02 | Только каталоги |
+| `WC_FIND_WITH_SIZE` | 0x04 | Включить поле size |
+| `WC_FIND_WITH_DATE` | 0x08 | Включить поле date |
+| `WC_FIND_WITH_TIME` | 0x10 | Включить поле time |
+| `WC_FIND_FULL` | 0x1C | Все опциональные поля |
+| `WC_FIND_SHORT_ONLY` | 0x80 | Только короткие имена 8.3 |
+
+### Коды ошибок файловых операций
+
+| Константа | Значение | Описание |
+|-----------|----------|----------|
+| `WC_EOF` | 0x0F | Конец файла / конец цепочки |
+| `WC_ERR_LONG_NAME` | 1 | Недопустимое длинное имя |
+| `WC_ERR_SHORT_IDX` | 2 | Короткое имя требует индекса |
+| `WC_ERR_LONG_EXISTS` | 3 | Длинное имя уже существует |
+| `WC_ERR_SHORT_EXISTS` | 4 | Короткое имя уже существует |
+| `WC_ERR_NOT_FOUND` | 8 | Файл/каталог не найден |
+| `WC_ERR_NO_SPACE` | 16 | Нет свободного места |
+| `WC_ERR_UNKNOWN` | 255 | Неизвестная ошибка |
+
+### Константы скроллинга (`wc_scrlwow`)
+
+| Константа | Значение | Описание |
+|-----------|----------|----------|
+| `WC_SCRL_DOWN` | 0x00 | Прокрутка вниз |
+| `WC_SCRL_UP` | 0x01 | Прокрутка вверх |
+| `WC_SCRL_WITH_ATTRS` | 0x80 | Прокручивать и атрибуты |
+| `WC_SCRL_CLEAR_SRC` | 0x40 | Очистить источник после сдвига |
+
+### Константы потоков (`wc_stream`)
+
+| Константа | Значение | Описание |
+|-----------|----------|----------|
+| `WC_STREAM_ROOT` | 0xFF | Корневой каталог |
+| `WC_STREAM_CLONE` | 0xFE | Клонировать текущий поток в #00 и #01 |
+| `WC_STREAM_WCDIR` | 0xFD | Каталог WC (для INI) |
+| 0x00, 0x01 | — | Выбрать поток 0 или 1 |
+
+### Константы видеобуферов
+
+| Константа | Значение | Описание |
+|-----------|----------|----------|
+| `WC_VIDEO_TXT` | 0x00 | Текстовый режим WC |
+| `WC_VIDEO_BUF1` | 0x01 | Видеобуфер 1 (стр. #20–#2F) |
+| `WC_VIDEO_BUF2` | 0x02 | Видеобуфер 2 (стр. #30–#3F) |
+| `WC_VIDEO_BUF3` | 0x03 | Видеобуфер 3 (стр. #40–#4F) |
+| `WC_VIDEO_BUF4` | 0x04 | Видеобуфер 4 (стр. #50–#5F) |
+
+> Мегабуфер (64 стр.) и видеобуферы **пересекаются** физически:
+> VPL-страница N = физическая `WC_PAGE_TVBPG + N` = `#20 + N`.
+
+### Размеры TXT-экрана
+
+| Константа | Значение |
+|-----------|----------|
+| `WC_SCREEN_80x25` | 25 |
+| `WC_SCREEN_80x30` | 30 |
+| `WC_SCREEN_90x36` | 36 |
+
+---
+
+## Таблица кодов функций
+
+> Полный маппинг ASM → WC API code → C wrapper
+
+| Код A | ASM | C функция | Параметр в A' (EXA)? | Примечание |
+|-------|-----|-----------|----------------------|------------|
+| #00 | MNGC_PL | `wc_mngc_pl(page)` | **Да** (page) | #FF=font, #FE=TXT |
+| #01 | PRWOW | `wc_prwow(win)` | — | IX=win |
+| #02 | RRESB | `wc_rresb(win)` | — | IX=win |
+| #03 | PRSRW | `wc_prsrw(win,str,y,x,len)` | — | |
+| #04 | PRIAT | (часть prsrw_attr) | **Да** (color) | Вызывается сразу после #03 |
+| #05 | GADRW | `wc_gadrw(win,y,x)` | — | → HL=addr |
+| #06 | CURSOR | `wc_cursor(win)` | — | |
+| #07 | CURSER | `wc_curser(win)` | — | |
+| #08 | YN | `wc_yn(mode)` | **Да** (mode) | |
+| #09 | ISTR | `wc_istr(win,mode)` | **Да** (mode) | |
+| #0A | NORK | `wc_nork(addr,val)` | **Да** (val) | |
+| #0B | TXTPR | `wc_txtpr(win,str,y,x)` | — | → A=next_y |
+| #0C | MEZZ | `wc_mezz(win,msg,str,y,x)` | **Да** (msg_num) | |
+| #0D | DMAPL | `wc_dmapl(subfunc)` | **Да** (subfunc) | |
+| #0E | TURBOPL | `wc_turbopl(mode,param)` | — | B=mode, C=param |
+| #0F | GEDPL | `wc_gedpl()` | — | ⚠ Портит #1000–#1447 |
+| #10..#29 | Keys | `wc_key_*()` | — | → NZ=нажата |
+| #2A | KBSCN | `wc_kbscn(mode)` | **Да** (mode) | |
+| #2B | DEL | `wc_key_del()` | — | |
+| #2C | CAPS | `wc_key_caps()` | — | |
+| #2D | ANYK | `wc_key_any()` | — | |
+| #2E | USPO | `wc_key_wait_release()` | — | |
+| #2F | NUSP | `wc_key_wait_any()` | — | |
+| #30 | LOAD512 | `wc_load512(dest,blocks)` | — | B=blocks |
+| #31 | SAVE512 | `wc_save512(src,blocks)` | — | |
+| #32 | GIPAGPL | `wc_gipagpl()` | — | |
+| #33 | TENTRY | `wc_tentry(addr)` | — | |
+| #34 | CHTOSEP | `wc_chtosep(buf,bufend)` | — | |
+| #36 | TMRKDFL | `wc_tmrkdfl(panel,fnum,buf)` | — | |
+| #38 | ADIR | `wc_adir(mode)` | **Да** (mode) | |
+| #39 | STREAM | `wc_stream(mode)` | — | D=mode |
+| #3A | FINDNEXT | `wc_findnext(buf,flags)` | **Да** (flags) | |
+| #3B | FENTRY | `wc_fentry(name)` | — | → Z/NZ |
+| #3C | LOAD256 | `wc_load256(dest,blocks)` | — | |
+| #3D | LOADNONE | `wc_loadnone(sectors)` | — | B=sectors |
+| #3E | GFILE | `wc_gfile()` | — | |
+| #3F | GDIR | `wc_gdir()` | — | |
+| #40 | MNGV_PL | `wc_mngv_pl(mode)` | **Да** (mode) | |
+| #41 | MNGCVPL | `wc_mngcvpl(vpage)` | **Да** (vpage) | |
+| #42 | GVmod | `wc_gvmod(mode)` | **Да** (mode) | |
+| #43 | GYOFF | `wc_gyoff(y)` | — | HL=y |
+| #44 | GXOFF | `wc_gxoff(x)` | — | HL=x |
+| #45 | GVtm | `wc_gvtm(page)` | — | C=page |
+| #46 | GVtl | `wc_gvtl(plane,page)` | — | B=plane,C=page |
+| #47 | GVsgp | `wc_gvsgp(page)` | — | C=page |
+| #48 | MKfile | `wc_mkfile(name)` | — | |
+| #49 | MKdir | `wc_mkdir(name)` | — | |
+| #4A | RENAME | `wc_rename(old,new)` | — | |
+| #4B | DELFL | `wc_delfl(name)` | — | |
+| #4E | MNG0_PL | `wc_mng0_pl(page)` | **Да** (page) | |
+| #4F | MNG8_PL | `wc_mng8_pl(page)` | **Да** (page) | |
+| #50 | MNG0VPL | `wc_mng0vpl(vpage)` | **Да** (vpage) | |
+| #51 | MNG8VPL | `wc_mng8vpl(vpage)` | **Да** (vpage) | |
+| #53 | PRM_PL | `wc_prm_pl(param)` | **Да** (param) | → Z=нет, NZ: A=opt |
+| #54 | SCRLWOW | `wc_scrlwow(win,y,x,h,w,fl)` | **Да** (flags) | |
+| #55 | INS | `wc_key_ins()` | — | |
+| #56 | INT_PL | `wc_int_pl(mode)` | **Да** (mode) | |
+| — | PLRESAD | `wc_resident_jump(p,addr)` | — | CALL #6020, JP |
+| — | PLRESCALL | `wc_resident_call(p,addr)` | — | CALL #6028 |
+| — | STRSET | `wc_strset(dst,len,c)` | — | Утилита (LDIR) |
