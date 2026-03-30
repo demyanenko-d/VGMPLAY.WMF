@@ -67,7 +67,8 @@ static uint8_t freq_lut_page;   /* plugin page для Window 0 (LUT)       */
 
 /* Shadow-регистры PSG: полные 12-бит tone period на канал.
  * Обновляются при записи lo/hi, используются для LUT lookup. */
-static uint16_t psg_shadow[3];  /* каналы 0,1,2 */
+static uint16_t psg_shadow[3];   /* каналы 0,1,2 — chip 1 */
+static uint16_t psg_shadow2[3];  /* каналы 0,1,2 — chip 2 (0xA5) */
 #endif /* VGM_FREQ_SCALE */
 
 /* ── Бюджеты для вставки служебных ISR-команд ──────────────────────── */
@@ -261,21 +262,34 @@ uint8_t vgm_parse_header(void)
     }
 
 #ifdef VGM_FREQ_SCALE
-    /* ── Расчёт масштабов частот PSG и FM ─────────────────────────────
-     * Ищем clock YM2203 (cid 6) или AY8910 (cid 18) в chip_list.
-     * FM-часть YM2203 работает на полной частоте чипа,
-     * PSG-часть YM2203 = fclk/2, AY8910 = fclk как есть. */
+    /* ── Расчёт масштабов частот PSG ─────────────────────────────────
+     * YM2203: psg_khz = полный master clock → ищем в freq_lut_map_ym[]
+     * AY8910: psg_khz = clock как есть      → ищем в freq_lut_map_ay[]
+     * Ratio одинаковый: HW_AY/AY_src = HW_YM/YM_src, таблицы общие. */
     vgm_freq_mode = FREQ_MODE_NATIVE;
     freq_lut_base = (uint16_t *)0;
     freq_lut_page = 0;
     psg_shadow[0] = 0; psg_shadow[1] = 0; psg_shadow[2] = 0;
+    psg_shadow2[0] = 0; psg_shadow2[1] = 0; psg_shadow2[2] = 0;
     for (i = 0; i < vgm_chip_count; i++) {
         uint16_t psg_khz;
-        uint32_t fc = (uint32_t)vgm_chip_list[i].clock_khz * 1000UL;
+        uint16_t hw_khz;
+        uint16_t bypass_tol;
+        const freq_lut_entry_t *lut_map;
+        uint8_t lut_count;
+
         if (vgm_chip_list[i].id == VGM_OFF_YM2203) {
-            psg_khz = (uint16_t)(fc / 2000UL);  /* SSG = fclk/2 */
+            psg_khz    = vgm_chip_list[i].clock_khz;  /* полный master clock */
+            hw_khz     = FREQ_LUT_HW_YM_KHZ;          /* 3500 */
+            bypass_tol = FREQ_LUT_BYPASS_TOL_YM;       /* 70   */
+            lut_map    = freq_lut_map_ym;
+            lut_count  = FREQ_LUT_YM_COUNT;
         } else if (vgm_chip_list[i].id == VGM_OFF_AY8910) {
-            psg_khz = vgm_chip_list[i].clock_khz;
+            psg_khz    = vgm_chip_list[i].clock_khz;
+            hw_khz     = FREQ_LUT_HW_KHZ;              /* 1750 */
+            bypass_tol = FREQ_LUT_BYPASS_TOL;           /* 35   */
+            lut_map    = freq_lut_map_ay;
+            lut_count  = FREQ_LUT_AY_COUNT;
         } else {
             continue;
         }
@@ -285,25 +299,24 @@ uint8_t vgm_parse_header(void)
          * 2) LUT table match (±5%) → table mode (Window 0)
          * Нет match → остаётся native (экзотика <1% файлов) */
         {
-            uint16_t hw_khz = FREQ_LUT_HW_KHZ;
             uint16_t diff = (psg_khz > hw_khz)
                           ? (psg_khz - hw_khz)
                           : (hw_khz - psg_khz);
-            if (diff <= FREQ_LUT_BYPASS_TOL) {
+            if (diff <= bypass_tol) {
                 /* ±2% — native, no scaling needed */
                 vgm_freq_mode = FREQ_MODE_NATIVE;
             } else {
                 /* Ищем подходящую предрасчитанную таблицу (±5%) */
                 uint8_t j;
-                for (j = 0; j < FREQ_LUT_COUNT; j++) {
-                    uint16_t d = (psg_khz > freq_lut_map[j].clk_khz)
-                               ? (psg_khz - freq_lut_map[j].clk_khz)
-                               : (freq_lut_map[j].clk_khz - psg_khz);
-                    if (d <= freq_lut_map[j].tol_khz) {
+                for (j = 0; j < lut_count; j++) {
+                    uint16_t d = (psg_khz > lut_map[j].clk_khz)
+                               ? (psg_khz - lut_map[j].clk_khz)
+                               : (lut_map[j].clk_khz - psg_khz);
+                    if (d <= lut_map[j].tol_khz) {
                         /* Матч! Подключаем LUT страницу в Window 0 */
-                        freq_lut_page = freq_lut_map[j].page;
+                        freq_lut_page = lut_map[j].page;
                         wc_mng0_pl(freq_lut_page);
-                        freq_lut_base = (uint16_t *)freq_lut_map[j].offset;
+                        freq_lut_base = (uint16_t *)lut_map[j].offset;
                         vgm_freq_mode = FREQ_MODE_TABLE;
                         break;
                     }
@@ -767,6 +780,7 @@ next_hl:
                     psg_shadow[fb_ch] = (psg_shadow[fb_ch] & 0x0F00) | fb_b2;
                 }
                 fb_scaled = freq_lut_base[psg_shadow[fb_ch]];
+                if (fb_scaled > 0x0FFF) fb_scaled = 0x0FFF;
                 /* Emit lo byte (reg 0,2,4) */
                 fb_wp[0] = CMD_WRITE_AY;
                 fb_wp[1] = fb_ch << 1;  /* reg = 0,2,4 */
@@ -795,6 +809,45 @@ next_hl:
             goto do_budget;
         }
 
+        /* ═══════ YM2203 #2 SSG+FM (0xA5) ═══════
+         * VGM dual chip: 0x55 → 0xA5 (последняя цифра 0x5n → 0xAn) */
+        if (fb_op == 0xA5)
+        {
+            fb_b1 = *fb_rp++; PAGE_CHK();
+            fb_b2 = *fb_rp++; PAGE_CHK();
+#ifdef VGM_FREQ_SCALE
+          if (vgm_freq_mode != FREQ_MODE_NATIVE) {
+            if (fb_b1 <= 0x05) {
+                fb_ch = fb_b1 >> 1;
+                if (fb_b1 & 1) {
+                    psg_shadow2[fb_ch] = (psg_shadow2[fb_ch] & 0x00FF)
+                                       | ((uint16_t)(fb_b2 & 0x0F) << 8);
+                } else {
+                    psg_shadow2[fb_ch] = (psg_shadow2[fb_ch] & 0x0F00) | fb_b2;
+                }
+                fb_scaled = freq_lut_base[psg_shadow2[fb_ch]];
+                if (fb_scaled > 0x0FFF) fb_scaled = 0x0FFF;
+                fb_wp[0] = CMD_WRITE_AY2;
+                fb_wp[1] = fb_ch << 1;
+                fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
+                fb_wp += 4;
+                fb_wp[0] = CMD_WRITE_AY2;
+                fb_wp[1] = (fb_ch << 1) | 1;
+                fb_wp[2] = (uint8_t)((fb_scaled >> 8) & 0x0F);
+                fb_wp += 4;
+                goto do_budget;
+            }
+            else if (fb_b1 == 0x06) {
+                fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
+            }
+          }
+#endif /* VGM_FREQ_SCALE */
+            fb_wp[0] = CMD_WRITE_AY2;
+            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
+            fb_wp += 4;
+            goto do_budget;
+        }
+
         /* ═══════ AY8910 dual (0xA0) ═══════ */
         if (fb_op == 0xA0)
         {
@@ -813,6 +866,7 @@ next_hl:
                     psg_shadow[fb_ch] = (psg_shadow[fb_ch] & 0x0F00) | fb_b2;
                 }
                 fb_scaled = freq_lut_base[psg_shadow[fb_ch]];
+                if (fb_scaled > 0x0FFF) fb_scaled = 0x0FFF;
                 /* AY (0xA0): emit оба байта сразу */
                 fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
                 fb_wp[1] = fb_ch << 1;  /* lo reg */

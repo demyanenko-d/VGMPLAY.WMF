@@ -83,6 +83,12 @@ const RATIOS = [
         srcYM2203: 2500000,
         desc: 'Some boards (1.25 MHz AY / 2.5 MHz YM2203)',
     },
+    {
+        name: '1500_750',
+        srcPsgHz:   750000,  /* YM2203 @ 1.5M → SSG = 750 kHz */
+        srcYM2203: 1500000,
+        desc: 'Arcade/custom boards (1.5 MHz YM2203, SSG=750 kHz)',
+    },
 ];
 
 /**
@@ -205,6 +211,7 @@ function printInfo() {
         { name: 'Weird 1.3MHz',            hz: 1300000 },
         { name: 'Weird 1.6MHz',            hz: 1600000 },
         { name: 'Weird 900kHz',            hz: 900000 },
+        { name: 'YM2203 1.5MHz SSG',       hz: 750000 },
         { name: 'ZX 128 (1.7734 MHz)',     hz: 1773400 },
     ];
     for (const t of testClocks) {
@@ -308,11 +315,18 @@ function generateCHeader(outPath) {
     h += '#define FREQ_LUT_MAP_H\n\n';
     h += '#include "types.h"\n\n';
 
-    h += `/* Bypass: |psg_khz - ${Math.round(HW_CLK_AY/1000)}| <= ${Math.round(HW_CLK_AY/1000 * BYPASS_PCT / 100)} → no scaling */\n`;
-    h += `#define FREQ_LUT_HW_KHZ      ${Math.round(HW_CLK_AY/1000)}u\n`;
-    h += `#define FREQ_LUT_BYPASS_TOL   ${Math.round(HW_CLK_AY/1000 * BYPASS_PCT / 100)}u  /* ${BYPASS_PCT}% */\n\n`;
+    /* Count YM2203 entries (those with srcYM2203 > 0) */
+    const ymEntries = RATIOS.filter(r => r.srcYM2203 > 0);
 
-    h += `#define FREQ_LUT_COUNT        ${RATIOS.length}u\n`;
+    h += `/* AY/YM2149: bypass |psg_khz - ${Math.round(HW_CLK_AY/1000)}| <= ${Math.round(HW_CLK_AY/1000 * BYPASS_PCT / 100)} */\n`;
+    h += `#define FREQ_LUT_HW_KHZ        ${Math.round(HW_CLK_AY/1000)}u\n`;
+    h += `#define FREQ_LUT_BYPASS_TOL     ${Math.round(HW_CLK_AY/1000 * BYPASS_PCT / 100)}u  /* ${BYPASS_PCT}% */\n`;
+    h += `/* YM2203: bypass |psg_khz - ${Math.round(HW_CLK_YM2203/1000)}| <= ${Math.round(HW_CLK_YM2203/1000 * BYPASS_PCT / 100)} */\n`;
+    h += `#define FREQ_LUT_HW_YM_KHZ     ${Math.round(HW_CLK_YM2203/1000)}u\n`;
+    h += `#define FREQ_LUT_BYPASS_TOL_YM  ${Math.round(HW_CLK_YM2203/1000 * BYPASS_PCT / 100)}u  /* ${BYPASS_PCT}% */\n\n`;
+
+    h += `#define FREQ_LUT_AY_COUNT     ${RATIOS.length}u\n`;
+    h += `#define FREQ_LUT_YM_COUNT     ${ymEntries.length}u\n`;
     h += `#define FREQ_LUT_ENTRIES      ${TABLE_ENTRIES}u   /* 12-bit PSG */\n`;
     h += `#define FREQ_LUT_FM_MAX       2048u  /* 11-bit FM F-Number */\n`;
     h += `#define FREQ_LUT_BYTES        ${TABLE_BYTES}u     /* per table */\n\n`;
@@ -324,8 +338,8 @@ function generateCHeader(outPath) {
     h += '    uint16_t offset;    /* byte offset within page     */\n';
     h += '} freq_lut_entry_t;\n\n';
 
-    h += `/* Tolerance = ${MATCH_TOLERANCE_PCT}% of canonical clock */\n`;
-    h += 'static const freq_lut_entry_t freq_lut_map[FREQ_LUT_COUNT] = {\n';
+    h += `/* AY/YM2149 table map (tolerance = ${MATCH_TOLERANCE_PCT}% of canonical PSG clock) */\n`;
+    h += 'static const freq_lut_entry_t freq_lut_map_ay[FREQ_LUT_AY_COUNT] = {\n';
 
     for (let r = 0; r < RATIOS.length; r++) {
         const khz = Math.round(RATIOS[r].srcPsgHz / 1000);
@@ -334,6 +348,23 @@ function generateCHeader(outPath) {
         const off  = (r % 2) * TABLE_BYTES;
         const comma = (r < RATIOS.length - 1) ? ',' : ' ';
         h += `    { ${khz.toString().padStart(4)}u, ${tol.toString().padStart(3)}u, ${page}, 0x${off.toString(16).toUpperCase().padStart(4, '0')} }${comma}  /* ${RATIOS[r].name} */\n`;
+    }
+    h += '};\n\n';
+
+    /* YM2203 map: full master clock → same table pages (ratio identical) */
+    h += `/* YM2203 table map (full master clock, same tables as AY) */\n`;
+    h += 'static const freq_lut_entry_t freq_lut_map_ym[FREQ_LUT_YM_COUNT] = {\n';
+
+    let ymIdx = 0;
+    for (let r = 0; r < RATIOS.length; r++) {
+        if (!RATIOS[r].srcYM2203) continue;
+        const khz = Math.round(RATIOS[r].srcYM2203 / 1000);
+        const tol = Math.round(khz * MATCH_TOLERANCE_PCT / 100);
+        const page = Math.floor(r / 2) + PAGE_BASE;
+        const off  = (r % 2) * TABLE_BYTES;
+        ymIdx++;
+        const comma = (ymIdx < ymEntries.length) ? ',' : ' ';
+        h += `    { ${khz.toString().padStart(4)}u, ${tol.toString().padStart(3)}u, ${page}, 0x${off.toString(16).toUpperCase().padStart(4, '0')} }${comma}  /* ${RATIOS[r].name} (YM2203@${khz}kHz) */\n`;
     }
     h += '};\n\n';
 

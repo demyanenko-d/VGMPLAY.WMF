@@ -4,11 +4,15 @@
 
 #include "types.h"
 
-/* Bypass: |psg_khz - 1750| <= 35 → no scaling */
-#define FREQ_LUT_HW_KHZ      1750u
-#define FREQ_LUT_BYPASS_TOL   35u  /* 2% */
+/* AY/YM2149: bypass |psg_khz - 1750| <= 35 */
+#define FREQ_LUT_HW_KHZ        1750u
+#define FREQ_LUT_BYPASS_TOL     35u  /* 2% */
+/* YM2203: bypass |psg_khz - 3500| <= 70 */
+#define FREQ_LUT_HW_YM_KHZ     3500u
+#define FREQ_LUT_BYPASS_TOL_YM  70u  /* 2% */
 
-#define FREQ_LUT_COUNT        5u
+#define FREQ_LUT_AY_COUNT     6u
+#define FREQ_LUT_YM_COUNT     5u
 #define FREQ_LUT_ENTRIES      4096u   /* 12-bit PSG */
 #define FREQ_LUT_FM_MAX       2048u  /* 11-bit FM F-Number */
 #define FREQ_LUT_BYTES        8192u     /* per table */
@@ -20,13 +24,23 @@ typedef struct {
     uint16_t offset;    /* byte offset within page     */
 } freq_lut_entry_t;
 
-/* Tolerance = 5% of canonical clock */
-static const freq_lut_entry_t freq_lut_map[FREQ_LUT_COUNT] = {
+/* AY/YM2149 table map (tolerance = 5% of canonical PSG clock) */
+static const freq_lut_entry_t freq_lut_map_ay[FREQ_LUT_AY_COUNT] = {
     { 1790u,  90u, 1, 0x0000 },  /* NTSC_1790 */
     { 1500u,  75u, 1, 0x2000 },  /* 3MHz_1500 */
     { 2000u, 100u, 2, 0x0000 },  /* 4MHz_2000 */
     { 1000u,  50u, 2, 0x2000 },  /* CPC_1000 */
-    { 1250u,  63u, 3, 0x0000 }   /* 1250 */
+    { 1250u,  63u, 3, 0x0000 },  /* 1250 */
+    {  750u,  38u, 3, 0x2000 }   /* 1500_750 */
+};
+
+/* YM2203 table map (full master clock, same tables as AY) */
+static const freq_lut_entry_t freq_lut_map_ym[FREQ_LUT_YM_COUNT] = {
+    { 3580u, 179u, 1, 0x0000 },  /* NTSC_1790 (YM2203@3580kHz) */
+    { 3000u, 150u, 1, 0x2000 },  /* 3MHz_1500 (YM2203@3000kHz) */
+    { 4000u, 200u, 2, 0x0000 },  /* 4MHz_2000 (YM2203@4000kHz) */
+    { 2500u, 125u, 3, 0x0000 },  /* 1250 (YM2203@2500kHz) */
+    { 1500u,  75u, 3, 0x2000 }   /* 1500_750 (YM2203@1500kHz) */
 };
 
 /*

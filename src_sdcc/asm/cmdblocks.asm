@@ -43,7 +43,8 @@
 ; ── VGM opcodes ─────────────────────────────────────────────────────
 VGM_OPL_B0   EQU #5E    ; OPL3 bank 0: 5E rr vv
 VGM_OPL_B1   EQU #5F    ; OPL3 bank 1: 5F rr vv
-VGM_YM2203   EQU #55    ; YM2203 SSG+FM: 55 rr vv
+VGM_YM2203   EQU #55    ; YM2203 SSG+FM chip 1: 55 rr vv
+VGM_YM2203_2 EQU #A5    ; YM2203 SSG+FM chip 2: A5 rr vv
 VGM_AY       EQU #A0    ; AY8910: A0 rr vv (bit7 = chip 2)
 VGM_SAA      EQU #BD    ; SAA1099: BD rr vv (bit7 = chip 2)
 VGM_END      EQU #66    ; End of data
@@ -60,6 +61,10 @@ VGM_END      EQU #66    ; End of data
 
     MACRO ym2203_write reg, val
         db VGM_YM2203, reg, val
+    ENDM
+
+    MACRO ym2203_2_write reg, val
+        db VGM_YM2203_2, reg, val
     ENDM
 
     MACRO ay_write reg, val
@@ -388,48 +393,48 @@ blk_silence_ym2203:
 ; ═══════════════════════════════════════════════════════════════════════
 ; CMDBLK_SILENCE_YM2203_2 — Silence YM2203 chip 2 (TurboSound)
 ;
-; Uses AY opcode 0xA0 with bit7 set → vgm_fill_buffer generates
-; CMD_WRITE_AY2 which selects chip 2 via TurboSound protocol.
+; Uses VGM opcode 0xA5 (dual chip: 0x55 → 0xA5) → vgm_fill_buffer
+; generates CMD_WRITE_AY2 which selects chip 2 via isr_ms_ctrl.
 ;
 ; SSG (chip 2):
-;   A0 87 3F    Mixer: all tone+noise off
-;   A0 88 00    SSG Volume A = 0
-;   A0 89 00    SSG Volume B = 0
-;   A0 8A 00    SSG Volume C = 0
+;   A5 07 3F    Mixer: all tone+noise off
+;   A5 08 00    SSG Volume A = 0
+;   A5 09 00    SSG Volume B = 0
+;   A5 0A 00    SSG Volume C = 0
 ; FM — Key Off all 3 channels (chip 2):
-;   A0 A8 00    Key Off ch 0
-;   A0 A8 01    Key Off ch 1
-;   A0 A8 02    Key Off ch 2
+;   A5 28 00    Key Off ch 0
+;   A5 28 01    Key Off ch 1
+;   A5 28 02    Key Off ch 2
 ; FM — TL max (0x7F) all 12 operators (chip 2):
-;   A0 C0..C2 7F   slot 1 (M1): ch 0,1,2
-;   A0 C4..C6 7F   slot 3 (C1): ch 0,1,2
-;   A0 C8..CA 7F   slot 2 (M2): ch 0,1,2
-;   A0 CC..CE 7F   slot 4 (C2): ch 0,1,2
+;   A5 40..42 7F   slot 1 (M1): ch 0,1,2
+;   A5 44..46 7F   slot 3 (C1): ch 0,1,2
+;   A5 48..4A 7F   slot 2 (M2): ch 0,1,2
+;   A5 4C..4E 7F   slot 4 (C2): ch 0,1,2
 ; Total: 19 VGM commands + end = 58 bytes
 ; ═══════════════════════════════════════════════════════════════════════
 blk_silence_ym2203_2:
-        ; ── SSG silence (chip 2) — VGM: A0 (reg|80) vv ──
-        ay2_write 7, #3F            ; VGM: A0 87 3F — Mixer off
-        ay2_write 8, #00            ; VGM: A0 88 00 — SSG Vol A = 0
-        ay2_write 9, #00            ; VGM: A0 89 00 — SSG Vol B = 0
-        ay2_write 10, #00           ; VGM: A0 8A 00 — SSG Vol C = 0
-        ; ── FM Key Off (chip 2) — VGM: A0 (28|80) xx ──
-        ay2_write #28, #00          ; VGM: A0 A8 00 — Key Off ch 0
-        ay2_write #28, #01          ; VGM: A0 A8 01 — Key Off ch 1
-        ay2_write #28, #02          ; VGM: A0 A8 02 — Key Off ch 2
-        ; ── FM TL max (chip 2) — VGM: A0 (4x|80) 7F ──
-        ay2_write #40, #7F          ; VGM: A0 C0 7F — TL slot1 ch0
-        ay2_write #41, #7F          ; VGM: A0 C1 7F — TL slot1 ch1
-        ay2_write #42, #7F          ; VGM: A0 C2 7F — TL slot1 ch2
-        ay2_write #44, #7F          ; VGM: A0 C4 7F — TL slot3 ch0
-        ay2_write #45, #7F          ; VGM: A0 C5 7F — TL slot3 ch1
-        ay2_write #46, #7F          ; VGM: A0 C6 7F — TL slot3 ch2
-        ay2_write #48, #7F          ; VGM: A0 C8 7F — TL slot2 ch0
-        ay2_write #49, #7F          ; VGM: A0 C9 7F — TL slot2 ch1
-        ay2_write #4A, #7F          ; VGM: A0 CA 7F — TL slot2 ch2
-        ay2_write #4C, #7F          ; VGM: A0 CC 7F — TL slot4 ch0
-        ay2_write #4D, #7F          ; VGM: A0 CD 7F — TL slot4 ch1
-        ay2_write #4E, #7F          ; VGM: A0 CE 7F — TL slot4 ch2
+        ; ── SSG silence (chip 2) — VGM: A5 rr vv ──
+        ym2203_2_write 7, #3F       ; VGM: A5 07 3F — Mixer off
+        ym2203_2_write 8, #00       ; VGM: A5 08 00 — SSG Vol A = 0
+        ym2203_2_write 9, #00       ; VGM: A5 09 00 — SSG Vol B = 0
+        ym2203_2_write 10, #00      ; VGM: A5 0A 00 — SSG Vol C = 0
+        ; ── FM Key Off (chip 2) — VGM: A5 28 xx ──
+        ym2203_2_write #28, #00     ; VGM: A5 28 00 — Key Off ch 0
+        ym2203_2_write #28, #01     ; VGM: A5 28 01 — Key Off ch 1
+        ym2203_2_write #28, #02     ; VGM: A5 28 02 — Key Off ch 2
+        ; ── FM TL max (chip 2) — VGM: A5 4x 7F ──
+        ym2203_2_write #40, #7F     ; VGM: A5 40 7F — TL slot1 ch0
+        ym2203_2_write #41, #7F     ; VGM: A5 41 7F — TL slot1 ch1
+        ym2203_2_write #42, #7F     ; VGM: A5 42 7F — TL slot1 ch2
+        ym2203_2_write #44, #7F     ; VGM: A5 44 7F — TL slot3 ch0
+        ym2203_2_write #45, #7F     ; VGM: A5 45 7F — TL slot3 ch1
+        ym2203_2_write #46, #7F     ; VGM: A5 46 7F — TL slot3 ch2
+        ym2203_2_write #48, #7F     ; VGM: A5 48 7F — TL slot2 ch0
+        ym2203_2_write #49, #7F     ; VGM: A5 49 7F — TL slot2 ch1
+        ym2203_2_write #4A, #7F     ; VGM: A5 4A 7F — TL slot2 ch2
+        ym2203_2_write #4C, #7F     ; VGM: A5 4C 7F — TL slot4 ch0
+        ym2203_2_write #4D, #7F     ; VGM: A5 4D 7F — TL slot4 ch1
+        ym2203_2_write #4E, #7F     ; VGM: A5 4E 7F — TL slot4 ch2
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════
