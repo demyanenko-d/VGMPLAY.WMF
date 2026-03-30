@@ -45,10 +45,13 @@
         .globl  pos_table
 
 ; Порты TSConfig
-PORT_HSINT  = 0x22AF
-PORT_VSINTL = 0x23AF
-PORT_VSINTH = 0x24AF
+PORT_HSINT   = 0x22AF
+PORT_VSINTL  = 0x23AF
+PORT_VSINTH  = 0x24AF
 PORT_INTMASK = 0x2AAF
+PORT_SYSCONF = 0x20AF       ; System Config (turbo bits [1:0])
+TURBO_7MHZ   = 0x01        ; SysConf value: 7 MHz
+TURBO_14MHZ  = 0x02        ; SysConf value: 14 MHz
 
 ; Адрес вектора FRAME INT в IM2-таблице WC (I=#5B, vector=0xFF → #5BFF)
 WC_IM2_VEC = 0x5BFF
@@ -300,25 +303,37 @@ _isr_end_save_ptr:
         jp      _isr_cmd_loop
 
 _isr_write_b0:
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_7MHZ
+        out     (c), a              ; → 7 MHz
         ld      a, (de)             ; reg
-        ld      c, #OPL3_ADDR0      ; B don't-care for C4-C7
+        ld      c, #OPL3_ADDR0      ; B=#20, don't-care for C4-C7
         out     (c), a
         inc     de
         ld      a, (de)             ; val
         inc     c                   ; C5 = data port
         out     (c), a
+        ld      c, #0xAF            ; BC=#20AF (B still #20)
+        ld      a, #TURBO_14MHZ
+        out     (c), a              ; → 14 MHz
         inc     de
         inc     de                  ; pad
         jp      _isr_cmd_loop
 
 _isr_write_b1:
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_7MHZ
+        out     (c), a              ; → 7 MHz
         ld      a, (de)
-        ld      c, #OPL3_ADDR1      ; B don't-care for C4-C7
+        ld      c, #OPL3_ADDR1      ; B=#20, don't-care for C4-C7
         out     (c), a
         inc     de
         ld      a, (de)
         inc     c                   ; C7 = data port
         out     (c), a
+        ld      c, #0xAF            ; BC=#20AF (B still #20)
+        ld      a, #TURBO_14MHZ
+        out     (c), a              ; → 14 MHz
         inc     de
         inc     de
         jp      _isr_cmd_loop
@@ -338,6 +353,9 @@ _isr_do_wait:
 
 ;--- AY8910 chip 1 write: [reg, val, pad] --------------------------------
 _isr_write_ay:
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_7MHZ
+        out     (c), a              ; → 7 MHz
         ld      bc, #0xFFFD
         ld      a, (_isr_ms_ctrl)   ; MultiSound ctrl (bit0=0 → chip1)
         out     (c), a
@@ -347,12 +365,18 @@ _isr_write_ay:
         ld      a, (de)             ; val
         ld      b, #0xBF            ; BC = #BFFD
         out     (c), a              ; write data
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_14MHZ
+        out     (c), a              ; → 14 MHz
         inc     de
         inc     de                  ; pad
         jp      _isr_cmd_loop
 
 ;--- AY8910 chip 2 write (TurboSound): [reg, val, pad] -------------------
 _isr_write_ay2:
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_7MHZ
+        out     (c), a              ; → 7 MHz
         ld      bc, #0xFFFD
         ld      a, (_isr_ms_ctrl)   ; MultiSound ctrl base
         or      a, #0x01            ; bit0=1 → chip2
@@ -363,12 +387,18 @@ _isr_write_ay2:
         ld      a, (de)             ; val
         ld      b, #0xBF            ; BC = #BFFD
         out     (c), a
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_14MHZ
+        out     (c), a              ; → 14 MHz
         inc     de
         inc     de                  ; pad
         jp      _isr_cmd_loop
 
 ;--- SAA1099 chip 1 write: [reg, val, pad] --------------------------------
 _isr_write_saa:
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_7MHZ
+        out     (c), a              ; → 7 MHz
         ld      a, (de)             ; reg
         ld      bc, #0x00FF         ; SAA1 address port
         out     (c), a
@@ -376,12 +406,18 @@ _isr_write_saa:
         ld      a, (de)             ; val
         ld      b, #0x01            ; BC = #01FF  SAA1 data port
         out     (c), a
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_14MHZ
+        out     (c), a              ; → 14 MHz
         inc     de
         inc     de                  ; pad
         jp      _isr_cmd_loop
 
 ;--- SAA1099 chip 2 write: [reg, val, pad] --------------------------------
 _isr_write_saa2:
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_7MHZ
+        out     (c), a              ; → 7 MHz
         ld      a, (de)             ; reg
         ld      bc, #0x02FF         ; SAA2 address port
         out     (c), a
@@ -389,6 +425,9 @@ _isr_write_saa2:
         ld      a, (de)             ; val
         ld      b, #0x03            ; BC = #03FF  SAA2 data port
         out     (c), a
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_14MHZ
+        out     (c), a              ; → 14 MHz
         inc     de
         inc     de                  ; pad
         jp      _isr_cmd_loop
