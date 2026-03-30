@@ -198,7 +198,13 @@ static uint8_t s_playback_inited = 0;
 static uint8_t s_last_active_buf = 0;
 static uint8_t s_buf_ready[2] = {0, 0};
 static uint8_t s_last_loop_count = 0;
-static uint16_t s_last_displayed_sec = 0xFFFF;  /* форсить первую отрисовку */
+static uint16_t s_last_displayed_sec = 0;  /* 0 = совпадает с начальным sec */
+
+/* BCD-цифры времени (инкремент вместо делений) ─────────────────────── */
+static uint8_t s_pb_d_min10 = '0';
+static uint8_t s_pb_d_min1  = '0';
+static uint8_t s_pb_d_sec10 = '0';
+static uint8_t s_pb_d_sec1  = '0';
 
 /* ── Progress bar state (предвычисленные параметры) ───────────────── */
 static uint8_t  s_pb_text_pg;     /* physical page of text screen          */
@@ -641,7 +647,11 @@ void start_playback(void)
 
         /* Сброс счётчиков */
         isr_play_seconds = 0;
-        s_last_displayed_sec = 0xFFFF;
+        s_last_displayed_sec = 0;
+        s_pb_d_min10 = '0';
+        s_pb_d_min1  = '0';
+        s_pb_d_sec10 = '0';
+        s_pb_d_sec1  = '0';
         vgm_loop_count = 0;
 
         /* ISR-состояние */
@@ -811,17 +821,18 @@ void update_buffer(void)
 void update_playback_info(void)
 {
     uint16_t sec;
+    uint8_t sec_changed, loop_changed;
 
     if (state != STATE_PLAYBACK)
         return;
 
     sec = isr_play_seconds;
 
-    /* Обновлять только при смене секунды или loop */
-    if (sec == s_last_displayed_sec && vgm_loop_count == s_last_loop_count)
+    sec_changed  = (sec != s_last_displayed_sec);
+    loop_changed = (vgm_loop_count != s_last_loop_count);
+
+    if (!sec_changed && !loop_changed)
         return;
-    s_last_displayed_sec = sec;
-    s_last_loop_count = vgm_loop_count;
 
     /* ── Переключаем Window3 на текстовую страницу напрямую через порт.
      * Не используем wc_mngcvpl — она вызывает WC_ENTRY и обновляет
@@ -831,18 +842,35 @@ void update_playback_info(void)
         uint8_t saved_pg = sfr_page3;
         sfr_page3 = s_pb_text_pg;
 
-        /* Обновляем только 4 изменяющиеся цифры времени + 1 цифру loop */
         volatile uint8_t *base =
             (volatile uint8_t *)(0xC000 + s_pb_char_ofs);
 
-        uint16_t min = sec / 60U;
-        uint8_t s = (uint8_t)(sec % 60U);
+        /* ── Время: инкрементальный BCD-счётчик.
+         * Секунды всегда растут на 1 → вместо 6 делений (sec/60,
+         * sec%60, min/10, min%10, s/10, s%10) — только INC + CP.
+         * ~20 тактов вместо ~6000. */
+        if (sec_changed) {
+            s_last_displayed_sec = sec;
+            if (++s_pb_d_sec1 > '9') {
+                s_pb_d_sec1 = '0';
+                if (++s_pb_d_sec10 > '5') {
+                    s_pb_d_sec10 = '0';
+                    if (++s_pb_d_min1 > '9') {
+                        s_pb_d_min1 = '0';
+                        s_pb_d_min10++;
+                    }
+                }
+            }
+            base[PB_OFS_MIN10] = s_pb_d_min10;
+            base[PB_OFS_MIN1]  = s_pb_d_min1;
+            base[PB_OFS_SEC10] = s_pb_d_sec10;
+            base[PB_OFS_SEC1]  = s_pb_d_sec1;
+        }
 
-        base[PB_OFS_MIN10] = '0' + (uint8_t)(min / 10U);
-        base[PB_OFS_MIN1]  = '0' + (uint8_t)(min % 10U);
-        base[PB_OFS_SEC10] = '0' + (s / 10U);
-        base[PB_OFS_SEC1]  = '0' + (s % 10U);
-        base[PB_OFS_LOOP]  = '1' + vgm_loop_count;
+        if (loop_changed) {
+            s_last_loop_count = vgm_loop_count;
+            base[PB_OFS_LOOP] = '1' + vgm_loop_count;
+        }
 
         /* ── Progress bar: инкрементально красим столбцы зелёным.
          * Только сравнение + сложение uint16, ноль делений. */
@@ -976,8 +1004,7 @@ void main(void)
         fmt_mmss(tb, vgm_total_seconds);
         for (uint8_t i = 0; i < 5; i++) buf_append_char(work_buf, tb[i]);
         buf_append_str(work_buf, "  Loop 1");
-        print_line(&s_wnd, pbinfo_start_row, work_buf,
-                   WC_COLOR(WC_BLACK, WC_WHITE));
+        print_line(&s_wnd, pbinfo_start_row, work_buf, WC_COLOR(WC_BRIGHT_WHITE, WC_BLACK));
     }
 
     if (state == STATE_PLAYBACK)
