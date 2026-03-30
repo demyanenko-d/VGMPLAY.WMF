@@ -47,6 +47,7 @@ uint8_t vgm_chip_count;
 vgm_chip_entry_t vgm_chip_list[VGM_MAX_CHIPS];
 uint16_t vgm_loop_addr;
 uint8_t vgm_loop_page;
+uint16_t vgm_total_seconds;
 
 /* ── High-level command queue globals ──────────────────────────────── */
 hl_entry_t vgm_hl_queue[HL_QUEUE_MAX];
@@ -346,6 +347,27 @@ uint8_t vgm_parse_header(void)
             vgm_loop_addr = 0;
             vgm_loop_page = 0;
         }
+    }
+
+    /* ── Total playback duration (seconds) ────────────────────────────
+     * total_samples (0x18) = samples in entire file (before loop).
+     * loop_samples  (0x20) = samples in one loop iteration.
+     * Effective total = total_samples + loop_samples * MAX_LOOP_REWINDS.
+     * Divide by 44100 to get seconds.
+     */
+    {
+        uint32_t ts = (uint32_t)base[0x18]
+                    | ((uint32_t)base[0x19] << 8)
+                    | ((uint32_t)base[0x1A] << 16)
+                    | ((uint32_t)base[0x1B] << 24);
+        if (vgm_loop_addr) {
+            uint32_t ls = (uint32_t)base[0x20]
+                        | ((uint32_t)base[0x21] << 8)
+                        | ((uint32_t)base[0x22] << 16)
+                        | ((uint32_t)base[0x23] << 24);
+            ts += ls * MAX_LOOP_REWINDS;
+        }
+        vgm_total_seconds = (uint16_t)(ts / 44100UL);
     }
 
     return VGM_OK;

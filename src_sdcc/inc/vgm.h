@@ -192,6 +192,12 @@ extern uint16_t vgm_loop_addr;
 /** VPL-страница точки петли */
 extern uint8_t  vgm_loop_page;
 
+/** Общая длительность воспроизведения (секунды), с учётом loop rewinds */
+extern uint16_t vgm_total_seconds;
+
+/** Количество повторов петли после первого проигрывания */
+#define MAX_LOOP_REWINDS 1
+
 /* ── GD3 метаданные (только English, ASCII) ──────────────────────── */
 #define VGM_GD3_LEN  48   /* макс. длина одного поля (+1 для '\0')   */
 

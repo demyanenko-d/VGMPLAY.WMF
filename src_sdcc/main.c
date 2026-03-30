@@ -121,7 +121,7 @@ static void detect_active_chips(void)
     }
 }
 
-#define MAX_LOOP_REWINDS 2
+/* MAX_LOOP_REWINDS is defined in vgm.h */
 
 /* ── HL queue helpers ────────────────────────────────────────────────
  * The queue itself and its state live in vgm.c (vgm_hl_queue etc.)
@@ -199,6 +199,24 @@ static uint8_t s_last_active_buf = 0;
 static uint8_t s_buf_ready[2] = {0, 0};
 static uint8_t s_last_loop_count = 0;
 static uint16_t s_last_displayed_sec = 0xFFFF;  /* форсить первую отрисовку */
+
+/* ── Progress bar state (предвычисленные параметры) ───────────────── */
+static uint8_t  s_pb_text_pg;     /* physical page of text screen          */
+static uint16_t s_pb_char_ofs;    /* char area offset within text page     */
+static uint16_t s_pb_attr_ofs;    /* attr area offset within text page     */
+static uint8_t  s_pb_width;       /* bar width in columns                  */
+static uint16_t s_pb_sec_step;    /* seconds per column (precomputed)      */
+static uint16_t s_pb_next_sec;    /* threshold sec for next green col      */
+static uint8_t  s_pb_col;         /* current green column count            */
+
+/* Позиции изменяемых символов внутри строки progress bar:
+ * "Playing  MM:SS / MM:SS  Loop N"
+ *  0         9       17     27  29  */
+#define PB_OFS_MIN10   9
+#define PB_OFS_MIN1   10
+#define PB_OFS_SEC10  12
+#define PB_OFS_SEC1   13
+#define PB_OFS_LOOP   29
 
 /* ── FSM-клавиатура (дебаунс без сжигания CPU) ───────────────────────
  * Состояния:
@@ -280,16 +298,20 @@ static void ints_enable(void)
         __endasm;
 }
 
-/* Формат MM:SS */
-static void append_time_mmss(char *dst, uint16_t sec)
+/* Формат MM:SS в буфер (5 символов, без '\0') */
+static void fmt_mmss(char *out, uint16_t sec)
 {
     uint16_t min = sec / 60U;
     uint8_t s = (uint8_t)(sec % 60U);
-
-    buf_append_u16_dec(dst, min);
-    buf_append_char(dst, ':');
-    buf_append_char(dst, (char)('0' + (s / 10U)));
-    buf_append_char(dst, (char)('0' + (s % 10U)));
+    /* Минуты: макс 2 цифры (до 99) */
+    if (min >= 10)
+        *out++ = (char)('0' + (uint8_t)(min / 10U));
+    else
+        *out++ = '0';
+    *out++ = (char)('0' + (uint8_t)(min % 10U));
+    *out++ = ':';
+    *out++ = (char)('0' + (s / 10U));
+    *out++ = (char)('0' + (s % 10U));
 }
 
 /* ── Имя OPL-типа ────────────────────────────────────────────────────── */
@@ -795,25 +817,44 @@ void update_playback_info(void)
 
     sec = isr_play_seconds;
 
-    /* Перерисовывать только при смене секунд или loop —
-       сокращает вызовы WC API с 50/сек до 1-2/сек */
+    /* Обновлять только при смене секунды или loop */
     if (sec == s_last_displayed_sec && vgm_loop_count == s_last_loop_count)
         return;
     s_last_displayed_sec = sec;
     s_last_loop_count = vgm_loop_count;
 
-    buf_clear(work_buf);
-    buf_append_str(work_buf, "Playing  ");
+    /* ── Переключаем Window3 на текстовую страницу напрямую через порт.
+     * Не используем wc_mngcvpl — она вызывает WC_ENTRY и обновляет
+     * WC_SYS_PGC, что может корраптить состояние WC при перехваченном ISR.
+     * sfr_page3 = прямая запись в порт 0x13AF. */
+    {
+        uint8_t saved_pg = sfr_page3;
+        sfr_page3 = s_pb_text_pg;
 
-    buf_append_str(work_buf, "Time ");
-    append_time_mmss(work_buf, sec);
+        /* Обновляем только 4 изменяющиеся цифры времени + 1 цифру loop */
+        volatile uint8_t *base =
+            (volatile uint8_t *)(0xC000 + s_pb_char_ofs);
 
-    /* Всегда показываем номер прохода (1 = первый, 2 = после 1-й перемотки) */
-    buf_append_str(work_buf, "  Loop ");
-    buf_append_char(work_buf, (char)('1' + vgm_loop_count));
+        uint16_t min = sec / 60U;
+        uint8_t s = (uint8_t)(sec % 60U);
 
-    print_line(&s_wnd, pbinfo_start_row, work_buf,
-               WC_COLOR(WC_GREEN, WC_BLACK));
+        base[PB_OFS_MIN10] = '0' + (uint8_t)(min / 10U);
+        base[PB_OFS_MIN1]  = '0' + (uint8_t)(min % 10U);
+        base[PB_OFS_SEC10] = '0' + (s / 10U);
+        base[PB_OFS_SEC1]  = '0' + (s % 10U);
+        base[PB_OFS_LOOP]  = '1' + vgm_loop_count;
+
+        /* ── Progress bar: инкрементально красим столбцы зелёным.
+         * Только сравнение + сложение uint16, ноль делений. */
+        while (s_pb_col < s_pb_width && sec >= s_pb_next_sec) {
+            *(volatile uint8_t *)(0xC000 + s_pb_attr_ofs + s_pb_col) =
+                WC_COLOR(WC_GREEN, WC_BLACK);
+            s_pb_col++;
+            s_pb_next_sec += s_pb_sec_step;
+        }
+
+        sfr_page3 = saved_pg;
+    }
 }
 
 /* ── main() ──────────────────────────────────────────────────────────── */
@@ -905,6 +946,39 @@ void main(void)
     }
 
     pbinfo_start_row = drow_ui();
+
+    /* Кешируем параметры progress bar (строка playback info) */
+    {
+        uint16_t bar_addr = wc_gadrw(&s_wnd, pbinfo_start_row, 2);
+        s_pb_text_pg  = wc_get_pgc();
+        s_pb_char_ofs = bar_addr & 0x3FFF;
+        s_pb_attr_ofs = s_pb_char_ofs | 0x0080;
+        s_pb_width    = get_content_width(&s_wnd);
+        s_pb_col      = 0;
+        /* Предвычислить порог и шаг — одно деление здесь,
+         * ноль делений в цикле */
+        if (vgm_total_seconds && s_pb_width) {
+            s_pb_sec_step = vgm_total_seconds / s_pb_width;
+            if (!s_pb_sec_step) s_pb_sec_step = 1;
+        } else {
+            s_pb_sec_step = 0xFFFF;
+        }
+        s_pb_next_sec = s_pb_sec_step;
+    }
+
+    /* Печатаем полную строку progress bar ОДИН РАЗ через WC API.
+     * "Playing  00:00 / MM:SS  Loop 1" + чёрный фон/белый текст.
+     * В главном цикле обновляются только 5 символов + атрибуты. */
+    {
+        char tb[5];
+        buf_clear(work_buf);
+        buf_append_str(work_buf, "Playing  00:00 / ");
+        fmt_mmss(tb, vgm_total_seconds);
+        for (uint8_t i = 0; i < 5; i++) buf_append_char(work_buf, tb[i]);
+        buf_append_str(work_buf, "  Loop 1");
+        print_line(&s_wnd, pbinfo_start_row, work_buf,
+                   WC_COLOR(WC_BLACK, WC_WHITE));
+    }
 
     if (state == STATE_PLAYBACK)
         start_playback();
