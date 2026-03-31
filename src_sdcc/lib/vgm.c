@@ -69,11 +69,12 @@ uint8_t vgm_loop_count;
 static uint16_t vgm_wait_accum = 0;
 
 /* ── Spectrum analyzer bitmask (fill_buffer → pad bytes → ISR) ──── */
-static uint16_t spec_mask;   /* 16-bit: bit N → bar N at max           */
-static uint16_t spec_ay_period[6]; /* AY period shadow: ch0-2(chip1), ch0-2(chip2) */
-static uint8_t  spec_saa_oct[6];   /* SAA octave shadow: channels 0-5       */
-static uint8_t  spec_opl_bd;       /* OPL 0xBD shadow for rising-edge detect */
-static uint8_t  spec_fm_block[6];  /* YM2203 FM block shadow: ch0-2(chip1/2)*/
+/* Non-static: accessed by ASM spectrum helpers (asm/spectrum.s)     */
+uint16_t spec_mask;            /* 16-bit: bit N → bar N at max           */
+uint16_t spec_ay_period[6];    /* AY period shadow: ch0-2(chip1), ch0-2(chip2) */
+uint8_t  spec_saa_oct[6];      /* SAA octave shadow: channels 0-5       */
+uint8_t  spec_opl_bd;          /* OPL 0xBD shadow for rising-edge detect */
+uint8_t  spec_fm_block[6];     /* YM2203 FM block shadow: ch0-2(chip1/2)*/
 
 #ifdef VGM_FREQ_SCALE
 /* ── Масштабирование частот PSG/FM (только LUT) ─────────────────────── */
@@ -117,100 +118,13 @@ static uint8_t  fb_reg;    /* temp: AY register (0xA0 handler)         */
 
 /* VGM_FILL_CMD_BUDGET определён в variant_cfg.h (через isr.h) */
 
-/* ── Spectrum analyzer helpers (quasi-log frequency → 16 bars) ───── */
+/* ── Spectrum analyzer helpers (ASM: asm/spectrum.s) ─────────────── */
 /* 16 bars = 8 octaves × 2 sub-bands (matching OPL block*2+fnum_msb).
- * Bass gets more visual weight because octaves ARE log-scale:
- * bar 0-1 = lowest octave (≈27-54 Hz), bar 14-15 = highest (≈3-6 kHz).
- * All chips share the same 16-bar frequency axis. */
-
-/* OPL3: extract (block<<1)|fnum_msb directly from B0-B8 value bits [4:1] */
-static void spectrum_opl_b0(uint8_t reg, uint8_t val) {
-    if (reg >= 0xB0 && reg <= 0xB8 && (val & 0x20))
-        spec_mask |= (1u << ((val >> 1) & 0x0F));
-    /* OPL rhythm register 0xBD: rising-edge detect for 5 percussion bits */
-    if (reg == 0xBD) {
-        if (val & 0x20) {  /* rhythm mode ON */
-            uint8_t rising = val & ~spec_opl_bd & 0x1F;
-            if (rising & 0x10) spec_mask |= (1u << 2);   /* BD  → bar 2  */
-            if (rising & 0x08) spec_mask |= (1u << 8);   /* SD  → bar 8  */
-            if (rising & 0x04) spec_mask |= (1u << 5);   /* TOM → bar 5  */
-            if (rising & 0x02) spec_mask |= (1u << 12);  /* CY  → bar 12 */
-            if (rising & 0x01) spec_mask |= (1u << 14);  /* HH  → bar 14 */
-        }
-        spec_opl_bd = val;
-    }
-}
-
-static void spectrum_opl_b1(uint8_t reg, uint8_t val) {
-    if (reg >= 0xB0 && reg <= 0xB6 && (val & 0x20))
-        spec_mask |= (1u << ((val >> 1) & 0x0F));
-}
-
-/* AY/YM: period → bar (inverse log2, high period = low freq = low bar).
- * Thresholds at 1.5× steps within each octave (half-octave split). */
-static uint8_t spec_period_to_bar(uint16_t period) {
-    uint8_t hi = (uint8_t)(period >> 8);
-    if (hi >= 12) return 0;       /* period >= 3072 */
-    if (hi >= 8)  return 1;       /* period >= 2048 */
-    if (hi >= 6)  return 2;       /* period >= 1536 */
-    if (hi >= 4)  return 3;       /* period >= 1024 */
-    if (hi >= 3)  return 4;       /* period >= 768  */
-    if (hi >= 2)  return 5;       /* period >= 512  */
-    if (hi >= 1)  return ((uint8_t)period >= 128) ? 6 : 7; /* 384 / 256 */
-    {
-        uint8_t p = (uint8_t)period;
-        if (p >= 192) return 8;
-        if (p >= 128) return 9;
-        if (p >= 96)  return 10;
-        if (p >= 64)  return 11;
-        if (p >= 48)  return 12;
-        if (p >= 32)  return 13;
-        if (p >= 16)  return 14;
-        return 15;
-    }
-}
-
-/* AY: shadow tone period (regs 0-5), trigger bar on volume (regs 8-10) */
-/* YM2203 FM: shadow block (regs 0xA4-0xA6), trigger on key-on (reg 0x28) */
-static void spectrum_ay(uint8_t reg, uint8_t val, uint8_t chip2) {
-    uint8_t base = chip2 ? 3 : 0;
-    if (reg <= 5) {
-        uint8_t ch = base + (reg >> 1);
-        if (reg & 1)
-            spec_ay_period[ch] = (spec_ay_period[ch] & 0x00FF)
-                               | ((uint16_t)(val & 0x0F) << 8);
-        else
-            spec_ay_period[ch] = (spec_ay_period[ch] & 0x0F00) | val;
-        return;
-    }
-    if (reg >= 8 && reg <= 10 && (val & 0x0F)) {
-        spec_mask |= (1u << spec_period_to_bar(spec_ay_period[base + (reg - 8)]));
-        return;
-    }
-    /* FM block/octave shadow (YM2203 regs 0xA4-0xA6) */
-    if (reg >= 0xA4 && reg <= 0xA6) {
-        spec_fm_block[base + (reg - 0xA4)] = (val >> 3) & 0x07;
-        return;
-    }
-    /* FM key-on (YM2203 reg 0x28): ch in [1:0], operators in [7:4] */
-    if (reg == 0x28 && (val & 0xF0)) {
-        uint8_t ch = val & 0x03;
-        if (ch <= 2)
-            spec_mask |= (1u << (spec_fm_block[base + ch] << 1));
-    }
-}
-
-/* SAA1099: shadow octave (regs 0x10-0x12), trigger bar on amplitude (regs 0-5) */
-static void spectrum_saa(uint8_t reg, uint8_t val) {
-    if (reg >= 0x10 && reg <= 0x12) {
-        uint8_t ch = (reg - 0x10) * 2;
-        spec_saa_oct[ch]     = val & 0x07;
-        spec_saa_oct[ch + 1] = (val >> 4) & 0x07;
-        return;
-    }
-    if (reg <= 0x05 && val)
-        spec_mask |= (1u << (spec_saa_oct[reg] << 1));
-}
+ * All implementations in hand-optimised Z80 ASM for hot-loop speed. */
+extern void spectrum_opl_b0(uint8_t reg, uint8_t val);
+extern void spectrum_opl_b1(uint8_t reg, uint8_t val);
+extern void spectrum_ay(uint8_t reg, uint8_t val, uint8_t chip2);
+extern void spectrum_saa(uint8_t reg, uint8_t val);
 
 
 /* ── Chip scan table (ROM-const) ────────────────────────────────────── */

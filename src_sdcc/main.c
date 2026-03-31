@@ -187,10 +187,10 @@ static void build_playback_queue(void)
 #define WND_X 14
 #define WND_Y 7
 #define WND_W 62
-#define WND_H 23
+#define WND_H 22
 
 #define CLR_WIN WC_COLOR(WC_WHITE, WC_BLACK)
-#define CLR_TITLE WC_COLOR(WC_BRIGHT_BLUE, WC_BLACK)
+#define CLR_TITLE WC_COLOR(WC_BLUE, WC_YELLOW)
 
 static const char s_win_title[] = " VGM Player " APP_VERSION " ";
 
@@ -207,13 +207,13 @@ static const char s_win_title[] = " VGM Player " APP_VERSION " ";
  *   Row 21:     Help keys                                            */
 #define ROW_TITLE         1
 #define ROW_FILE_START    2
-#define ROW_VGM_START     8
+#define ROW_VGM_START     6
 #define ROW_VGM_END       14   /* максимальная строка для VGM/GD3 info   */
-#define ROW_PROGRESS      16
-#define ROW_SPECTRUM      17   /* 4 rows: 17,18,19,20                   */
-#define ROW_HELP          21
+#define ROW_PROGRESS      15
+#define ROW_SPECTRUM      16   /* 4 rows: 16,17,18,19                    */
+#define ROW_HELP          20
 #define DIV1_FROM_BOTTOM  16   /* row 7 = 23-16                          */
-#define DIV2_FROM_BOTTOM  8    /* row 15 = 23-8                          */
+#define DIV2_FROM_BOTTOM  7    /* row 15 = 23-8                          */
 
 static wc_window_t s_wnd;
 static uint8_t s_pages;
@@ -232,7 +232,7 @@ static uint8_t s_pb_d_sec10 = '0';
 static uint8_t s_pb_d_sec1  = '0';
 
 /* ── Progress bar state (предвычисленные параметры) ───────────────── */
-static uint8_t  s_pb_text_pg;     /* physical page of text screen          */
+uint8_t  s_pb_text_pg;            /* physical page of text screen (non-static: ASM) */
 static uint16_t s_pb_char_ofs;    /* char area offset within text page     */
 static uint16_t s_pb_attr_ofs;    /* attr area offset within text page     */
 static uint8_t  s_pb_width;       /* bar width in columns                  */
@@ -248,29 +248,17 @@ static uint8_t  s_pb_col;         /* current green column count            */
 #define PB_OFS_SEC1   13
 #define PB_OFS_LOOP   29
 
-/* ── Spectrum analyzer rendering ──────────────────────────────────────
+/* ── Spectrum analyzer rendering (ASM: asm/spectrum.s) ────────────────
  * 16 bars, 4 rows (ROW_SPECTRUM..ROW_SPECTRUM+3), bottom-up.
- * Each bar: 3 chars wide (2 filled + 1 space).
- * Characters: 0xDB=█(full block, 2 units), 0xDC=▄(half, 1 unit), 0x20=space
- * Levels 0-8: row_n shows levels 2*n+1..2*n+2 (bottom row = levels 1-2).
- * Decay: each call to spectrum_decay() decrements non-zero levels by 1. */
-
-#define SPEC_CHAR_FULL  0xDB   /* █ */
-#define SPEC_CHAR_HALF  0xDC   /* ▄ */
-#define SPEC_BAR_WIDTH  3      /* 2 filled + 1 space separator         */
-#define SPEC_LEFT_PAD   5      /* centering: (58 - 16*3 - 1) / 2 ≈ 5  */
+ * spectrum_render() and hot-loop spectrum helpers are in asm/spectrum.s.
+ * Variables below are non-static so ASM can access them via _symbol. */
 
 /* Предвычисленные адреса для прямого доступа к текстовой странице */
-static uint16_t s_spec_char_ofs[4];  /* char offsets for 4 rows       */
-static uint16_t s_spec_attr_ofs[4];  /* attr offsets for 4 rows       */
+uint16_t s_spec_char_ofs[4];  /* char offsets for 4 rows       */
+uint16_t s_spec_attr_ofs[4];  /* attr offsets for 4 rows       */
 
-/* Цвета полос спектра (по номеру строки сверху вниз) */
-static const uint8_t spec_row_colors[4] = {
-    WC_COLOR(WC_BLACK, WC_BRIGHT_RED),     /* top = red (peak)        */
-    WC_COLOR(WC_BLACK, WC_BRIGHT_YELLOW),  /* upper-mid               */
-    WC_COLOR(WC_BLACK, WC_BRIGHT_GREEN),   /* lower-mid               */
-    WC_COLOR(WC_BLACK, WC_GREEN),          /* bottom = green (base)   */
-};
+/* spectrum_render() is in asm/spectrum.s */
+void spectrum_render(void);
 
 static uint8_t s_spec_frame_ctr;  /* 0-4: counts frames until decay tick */
 static uint8_t s_spec_decay_tick; /* increments every 5 frames            */
@@ -297,44 +285,6 @@ static void spectrum_decay(void)
     }
 }
 
-static void spectrum_render(void)
-{
-    uint8_t saved_pg = sfr_page3;
-    sfr_page3 = s_pb_text_pg;
-
-    /* 4 display rows, top (row 0 = levels 7-8) to bottom (row 3 = levels 1-2) */
-    for (uint8_t r = 0; r < 4; r++) {
-        volatile uint8_t *chars = (volatile uint8_t *)(0xC000 + s_spec_char_ofs[r]);
-        volatile uint8_t *attrs = (volatile uint8_t *)(0xC000 + s_spec_attr_ofs[r]);
-        uint8_t thresh_full = (uint8_t)((3 - r) * 2 + 2); /* 8,6,4,2 */
-        uint8_t thresh_half = thresh_full - 1;              /* 7,5,3,1 */
-
-        for (uint8_t b = 0; b < SPECTRUM_BARS; b++) {
-            uint8_t lev = spectrum_levels[b];
-            uint8_t ch;
-            uint8_t col = SPEC_LEFT_PAD + b * SPEC_BAR_WIDTH;
-
-            if (lev >= thresh_full)
-                ch = SPEC_CHAR_FULL;
-            else if (lev >= thresh_half)
-                ch = SPEC_CHAR_HALF;
-            else
-                ch = ' ';
-
-            chars[col]     = ch;
-            chars[col + 1] = ch;
-            if (ch != ' ') {
-                attrs[col]     = spec_row_colors[r];
-                attrs[col + 1] = spec_row_colors[r];
-            } else {
-                attrs[col]     = CLR_WIN;
-                attrs[col + 1] = CLR_WIN;
-            }
-        }
-    }
-
-    sfr_page3 = saved_pg;
-}
 
 /* ── FSM-клавиатура (дебаунс без сжигания CPU) ───────────────────────
  * Состояния:
@@ -603,8 +553,8 @@ uint8_t drow_ui(void)
 
     /* ── Help line (fixed row) ──────────────────────────────────── */
     buf_clear(work_buf);
-    buf_append_str(work_buf, "[N]ext [P]rev [Q] Exit");
-    print_line(&s_wnd, ROW_HELP, work_buf, WC_COLOR(WC_WHITE, WC_BLUE));
+    buf_append_str(work_buf, " [N]ext [P]rev [Q] Exit");
+    print_line(&s_wnd, ROW_HELP, work_buf, CLR_TITLE);
 
     return ROW_PROGRESS;
 }

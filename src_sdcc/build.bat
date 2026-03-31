@@ -91,6 +91,9 @@ if errorlevel 1 ( echo FAIL txtlib.s && goto :err )
 sdasz80 %ASFLAGS% build\inflate_call.rel asm\inflate_call.s >nul
 if errorlevel 1 ( echo FAIL inflate_call.s && goto :err )
 
+sdasz80 %ASFLAGS% build\spectrum.rel asm\spectrum.s >nul
+if errorlevel 1 ( echo FAIL spectrum.s && goto :err )
+
 echo [6/9] Линковка...
 REM Порядок важен: crt0 первым (entry point), затем модули
 REM Layout: CODE #8000–#B83F, DATA #B8A0–#BFFF
@@ -108,6 +111,7 @@ sdcc -mz80 --no-std-crt0 --out-fmt-ihx --code-loc 0x8000 --data-loc %DATA_LOC% ^
     build\opl3.rel ^
     build\txtlib.rel ^
     build\inflate_call.rel ^
+    build\spectrum.rel ^
     -o build\vgmplay.ihx >nul
 if errorlevel 1 ( echo FAIL link && goto :err )
 
