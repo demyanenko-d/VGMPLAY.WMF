@@ -199,20 +199,18 @@ extern uint16_t vgm_total_seconds;
  *  Устанавливается в vgm_parse_header() с учётом loop policy. */
 extern uint8_t  vgm_loop_enabled;
 
-/** Количество повторов петли после первого проигрывания */
-#define MAX_LOOP_REWINDS 1
+/* ── Loop/duration policy (читаются из INI, устанавливаются main.c) ── */
+extern uint8_t  cfg_loop_rewinds;    /* кол-во повторов петли (default 1) */
+extern uint8_t  cfg_min_duration;    /* ниже этой длительности (сек) петля запрещена (default 10) */
+extern uint16_t cfg_max_duration;    /* выше этой длительности (сек) петля запрещена (default 240) */
 
-/* ── Loop policy (TODO: перенести в INI-параметры) ──────────────── */
-#define LOOP_MIN_BASE_SEC  10   /* базовый трек < 10 с → loop не нужен  */
-#define LOOP_MAX_TOTAL_SEC 240  /* с лупом > 4 мин → loop не нужен      */
-
-/* ── GD3 метаданные (только English, ASCII) ──────────────────────── */
+/* ── GD3 метаданные (только English, ASCII) ─────────────────────── */
 #define VGM_GD3_LEN  48   /* макс. длина одного поля (+1 для '\0')   */
 
-extern char vgm_gd3_track[VGM_GD3_LEN];   /* Track title (EN)          */
-extern char vgm_gd3_game[VGM_GD3_LEN];    /* Game name (EN)            */
-extern char vgm_gd3_system[VGM_GD3_LEN];  /* System name (EN)          */
-extern char vgm_gd3_author[VGM_GD3_LEN];  /* Author (EN)               */
+extern char vgm_gd3_track[VGM_GD3_LEN];   /* Название трека (EN)      */
+extern char vgm_gd3_game[VGM_GD3_LEN];    /* Название игры (EN)       */
+extern char vgm_gd3_system[VGM_GD3_LEN];  /* Название системы (EN)    */
+extern char vgm_gd3_author[VGM_GD3_LEN];  /* Автор (EN)               */
 
 /* ── Функции ─────────────────────────────────────────────────────── */
 
@@ -228,13 +226,13 @@ uint8_t vgm_parse_header(void);
  * Заполнить командный буфер buf_idx (0 = A, 1 = B).
  *
  * Поддерживаемые VGM-команды:
- *   0x5A/0x5B/0x5C/0x5E → CMD_WRITE_B0 (OPL1/OPL2/Y8950/OPL3 bank 0)
- *   0x5F               → CMD_WRITE_B1 (OPL3 bank 1)
- *   0x55               → CMD_WRITE_AY (YM2203 PSG-часть, reg 0-15)
- *   0xA0               → CMD_WRITE_AY / CMD_WRITE_AY2 (AY8910, dual)
- *   0xBD               → CMD_WRITE_SAA / CMD_WRITE_SAA2 (SAA1099, dual)
+ *   0x5A/0x5B/0x5C/0x5E      → CMD_WRITE_B0 (OPL1/OPL2/Y8950/OPL3 bank 0)
+ *   0x5F                     → CMD_WRITE_B1 (OPL3 bank 1)
+ *   0x55                     → CMD_WRITE_AY (YM2203 PSG-часть, reg 0-15)
+ *   0xA0                     → CMD_WRITE_AY / CMD_WRITE_AY2 (AY8910, dual)
+ *   0xBD                     → CMD_WRITE_SAA / CMD_WRITE_SAA2 (SAA1099, dual)
  *   0x61/0x62/0x63/0x70-0x7F → CMD_WAIT
- *   0x66           → end; 0x67 → data block skip
+ *   0x66                     → end; 0x67 → data block skip
  *
  * Гарантирует CMD_END_BUF в конце буфера.
  * @param buf_idx  0 = cmd_buf_a, 1 = cmd_buf_b

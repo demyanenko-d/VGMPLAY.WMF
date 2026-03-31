@@ -35,22 +35,29 @@
 #endif
 
 /* ── Состояние парсера ──────────────────────────────────────────────── */
-volatile uint8_t vgm_song_ended;
-uint8_t vgm_paused;
-uint8_t vgm_cur_page;
-uint16_t vgm_read_ptr;
-uint8_t vgm_end_page;
-uint16_t vgm_end_addr;
-uint16_t vgm_version;
-uint8_t vgm_chip_type;
-uint8_t vgm_chip_count;
-vgm_chip_entry_t vgm_chip_list[VGM_MAX_CHIPS];
-uint16_t vgm_loop_addr;
-uint8_t vgm_loop_page;
-uint16_t vgm_total_seconds;
-uint8_t  vgm_loop_enabled;
+volatile uint8_t vgm_song_ended; // 1 = достигнут конец (0x66), main loop может остановить воспроизведение
+uint8_t vgm_paused;              // 1 = пауза (остановить таймер, не обнулять vgm_sec_budget)
+uint8_t vgm_cur_page;            // текущая VPL-страница для чтения данных (0..N)
+uint16_t vgm_read_ptr;           // смещение в окне #C000 для чтения следующего байта VGM-потока
+uint8_t vgm_end_page;            // страница, на которой заканчивается VGM-поток (для оптимизации проверки конца)
+uint16_t vgm_end_addr;           // смещение в окне #C000, на котором заканчивается VGM-поток (для оптимизации проверки конца)
+uint16_t vgm_version;            // версия VGM в BCD (например, 0x0151 для v1.51)
+uint8_t vgm_chip_type;           // битовая маска типа чипов (VGM_CHIP_xxx), например VGM_CHIP_OPL2 | VGM_CHIP_AY
+uint8_t vgm_chip_count;          // количество обнаруженных чипов (для вывода информации о файле)
 
-/* ── High-level command queue globals ──────────────────────────────── */
+vgm_chip_entry_t vgm_chip_list[VGM_MAX_CHIPS];
+
+uint16_t vgm_loop_addr;          // адрес точки петли в окне #C000 (0 = нет петли)
+uint8_t vgm_loop_page;           // страница, на которой находится точка петли
+uint16_t vgm_total_seconds;      // общее время воспроизведения в секундах
+uint8_t  vgm_loop_enabled;       // 1 = петля включена, 0 = нет
+
+// параметры политики петли (читаются из INI, устанавливаются main.c)
+uint8_t  cfg_loop_rewinds  = 1;
+uint8_t  cfg_min_duration  = 10;
+uint16_t cfg_max_duration  = 240;
+
+// очередь высокоуровневых команд для vgm_fill_buffer (play, loop, init, silence)
 hl_entry_t vgm_hl_queue[HL_QUEUE_MAX];
 uint8_t vgm_hl_len;
 uint8_t vgm_hl_pos;
@@ -60,6 +67,13 @@ uint8_t vgm_loop_count;
 
 /* ── Аккумулятор остатка задержки (VGM samples, 0..15) ─────────────── */
 static uint16_t vgm_wait_accum = 0;
+
+/* ── Spectrum analyzer bitmask (fill_buffer → pad bytes → ISR) ──── */
+static uint16_t spec_mask;   /* 16-bit: bit N → bar N at max           */
+static uint16_t spec_ay_period[6]; /* AY period shadow: ch0-2(chip1), ch0-2(chip2) */
+static uint8_t  spec_saa_oct[6];   /* SAA octave shadow: channels 0-5       */
+static uint8_t  spec_opl_bd;       /* OPL 0xBD shadow for rising-edge detect */
+static uint8_t  spec_fm_block[6];  /* YM2203 FM block shadow: ch0-2(chip1/2)*/
 
 #ifdef VGM_FREQ_SCALE
 /* ── Масштабирование частот PSG/FM (только LUT) ─────────────────────── */
@@ -102,6 +116,101 @@ static uint8_t  fb_reg;    /* temp: AY register (0xA0 handler)         */
 #endif
 
 /* VGM_FILL_CMD_BUDGET определён в variant_cfg.h (через isr.h) */
+
+/* ── Spectrum analyzer helpers (quasi-log frequency → 16 bars) ───── */
+/* 16 bars = 8 octaves × 2 sub-bands (matching OPL block*2+fnum_msb).
+ * Bass gets more visual weight because octaves ARE log-scale:
+ * bar 0-1 = lowest octave (≈27-54 Hz), bar 14-15 = highest (≈3-6 kHz).
+ * All chips share the same 16-bar frequency axis. */
+
+/* OPL3: extract (block<<1)|fnum_msb directly from B0-B8 value bits [4:1] */
+static void spectrum_opl_b0(uint8_t reg, uint8_t val) {
+    if (reg >= 0xB0 && reg <= 0xB8 && (val & 0x20))
+        spec_mask |= (1u << ((val >> 1) & 0x0F));
+    /* OPL rhythm register 0xBD: rising-edge detect for 5 percussion bits */
+    if (reg == 0xBD) {
+        if (val & 0x20) {  /* rhythm mode ON */
+            uint8_t rising = val & ~spec_opl_bd & 0x1F;
+            if (rising & 0x10) spec_mask |= (1u << 2);   /* BD  → bar 2  */
+            if (rising & 0x08) spec_mask |= (1u << 8);   /* SD  → bar 8  */
+            if (rising & 0x04) spec_mask |= (1u << 5);   /* TOM → bar 5  */
+            if (rising & 0x02) spec_mask |= (1u << 12);  /* CY  → bar 12 */
+            if (rising & 0x01) spec_mask |= (1u << 14);  /* HH  → bar 14 */
+        }
+        spec_opl_bd = val;
+    }
+}
+
+static void spectrum_opl_b1(uint8_t reg, uint8_t val) {
+    if (reg >= 0xB0 && reg <= 0xB6 && (val & 0x20))
+        spec_mask |= (1u << ((val >> 1) & 0x0F));
+}
+
+/* AY/YM: period → bar (inverse log2, high period = low freq = low bar).
+ * Thresholds at 1.5× steps within each octave (half-octave split). */
+static uint8_t spec_period_to_bar(uint16_t period) {
+    uint8_t hi = (uint8_t)(period >> 8);
+    if (hi >= 12) return 0;       /* period >= 3072 */
+    if (hi >= 8)  return 1;       /* period >= 2048 */
+    if (hi >= 6)  return 2;       /* period >= 1536 */
+    if (hi >= 4)  return 3;       /* period >= 1024 */
+    if (hi >= 3)  return 4;       /* period >= 768  */
+    if (hi >= 2)  return 5;       /* period >= 512  */
+    if (hi >= 1)  return ((uint8_t)period >= 128) ? 6 : 7; /* 384 / 256 */
+    {
+        uint8_t p = (uint8_t)period;
+        if (p >= 192) return 8;
+        if (p >= 128) return 9;
+        if (p >= 96)  return 10;
+        if (p >= 64)  return 11;
+        if (p >= 48)  return 12;
+        if (p >= 32)  return 13;
+        if (p >= 16)  return 14;
+        return 15;
+    }
+}
+
+/* AY: shadow tone period (regs 0-5), trigger bar on volume (regs 8-10) */
+/* YM2203 FM: shadow block (regs 0xA4-0xA6), trigger on key-on (reg 0x28) */
+static void spectrum_ay(uint8_t reg, uint8_t val, uint8_t chip2) {
+    uint8_t base = chip2 ? 3 : 0;
+    if (reg <= 5) {
+        uint8_t ch = base + (reg >> 1);
+        if (reg & 1)
+            spec_ay_period[ch] = (spec_ay_period[ch] & 0x00FF)
+                               | ((uint16_t)(val & 0x0F) << 8);
+        else
+            spec_ay_period[ch] = (spec_ay_period[ch] & 0x0F00) | val;
+        return;
+    }
+    if (reg >= 8 && reg <= 10 && (val & 0x0F)) {
+        spec_mask |= (1u << spec_period_to_bar(spec_ay_period[base + (reg - 8)]));
+        return;
+    }
+    /* FM block/octave shadow (YM2203 regs 0xA4-0xA6) */
+    if (reg >= 0xA4 && reg <= 0xA6) {
+        spec_fm_block[base + (reg - 0xA4)] = (val >> 3) & 0x07;
+        return;
+    }
+    /* FM key-on (YM2203 reg 0x28): ch in [1:0], operators in [7:4] */
+    if (reg == 0x28 && (val & 0xF0)) {
+        uint8_t ch = val & 0x03;
+        if (ch <= 2)
+            spec_mask |= (1u << (spec_fm_block[base + ch] << 1));
+    }
+}
+
+/* SAA1099: shadow octave (regs 0x10-0x12), trigger bar on amplitude (regs 0-5) */
+static void spectrum_saa(uint8_t reg, uint8_t val) {
+    if (reg >= 0x10 && reg <= 0x12) {
+        uint8_t ch = (reg - 0x10) * 2;
+        spec_saa_oct[ch]     = val & 0x07;
+        spec_saa_oct[ch + 1] = (val >> 4) & 0x07;
+        return;
+    }
+    if (reg <= 0x05 && val)
+        spec_mask |= (1u << (spec_saa_oct[reg] << 1));
+}
 
 
 /* ── Chip scan table (ROM-const) ────────────────────────────────────── */
@@ -357,8 +466,8 @@ uint8_t vgm_parse_header(void)
      * Loop отключается если:
      *  1) loop_addr == 0 (нет лупа в файле)
      *  2) full-track loop (loop_start == data_start)
-     *  3) базовый трек < LOOP_MIN_BASE_SEC
-     *  4) с лупом получается > LOOP_MAX_TOTAL_SEC
+     *  3) базовый трек < cfg_min_duration
+     *  4) с лупом получается > cfg_max_duration
      */
     {
         uint32_t ts = (uint32_t)base[0x18]
@@ -372,16 +481,16 @@ uint8_t vgm_parse_header(void)
         if (vgm_loop_addr &&
             !(vgm_loop_page == vgm_cur_page &&
               vgm_loop_addr == vgm_read_ptr) &&
-            base_sec >= LOOP_MIN_BASE_SEC) {
+            base_sec >= cfg_min_duration) {
             /* Частичный loop, трек достаточно длинный — пробуем */
             uint32_t ls = (uint32_t)base[0x20]
                         | ((uint32_t)base[0x21] << 8)
                         | ((uint32_t)base[0x22] << 16)
                         | ((uint32_t)base[0x23] << 24);
-            uint32_t total_with_loop = ts + ls * MAX_LOOP_REWINDS;
+            uint32_t total_with_loop = ts + ls * cfg_loop_rewinds;
             uint16_t total_sec = (uint16_t)(total_with_loop / 44100UL);
 
-            if (total_sec <= LOOP_MAX_TOTAL_SEC) {
+            if (total_sec <= cfg_max_duration) {
                 vgm_loop_enabled = 1;
                 base_sec = total_sec;
             }
@@ -584,10 +693,16 @@ static void emit_wait(uint16_t tk)
                 fb_wp += 4;
                 fb_wp[0] = CMD_SKIP_TICKS;
                 fb_wp[1] = ISR_TICKS_PER_FRAME - 1;
+                fb_wp[2] = (uint8_t)spec_mask;
+                fb_wp[3] = (uint8_t)(spec_mask >> 8);
+                spec_mask = 0;
                 fb_wp += 4;
             } else if (fb_w >= 1) {
                 fb_wp[0] = CMD_SKIP_TICKS;
                 fb_wp[1] = (uint8_t)(fb_w - 1);
+                fb_wp[2] = (uint8_t)spec_mask;
+                fb_wp[3] = (uint8_t)(spec_mask >> 8);
+                spec_mask = 0;
                 fb_wp += 4;
             }
             /* CMD_INC_SEC */
@@ -613,6 +728,9 @@ static void emit_wait(uint16_t tk)
         /* Последние ≤ISR_TICKS_PER_FRAME тиков через SKIP (экономия CPU) */
         fb_wp[0] = CMD_SKIP_TICKS;
         fb_wp[1] = (uint8_t)(tk - 1);
+        fb_wp[2] = (uint8_t)spec_mask;
+        fb_wp[3] = (uint8_t)(spec_mask >> 8);
+        spec_mask = 0;
         fb_wp += 4;
         vgm_sec_budget -= tk;
         tk = 0;
@@ -746,6 +864,7 @@ next_hl:
             fb_wp[0] = CMD_WRITE_B0;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
+            spectrum_opl_b0(fb_b1, fb_b2);
             goto do_budget;
         }
 
@@ -760,6 +879,9 @@ next_hl:
                 {
                     fb_wp[0] = CMD_SKIP_TICKS;
                     fb_wp[1] = (uint8_t)(fb_tk - 1);
+                    fb_wp[2] = (uint8_t)spec_mask;
+                    fb_wp[3] = (uint8_t)(spec_mask >> 8);
+                    spec_mask = 0;
                     fb_wp += 4;
                     vgm_sec_budget -= fb_tk;
                 } else {
@@ -781,6 +903,9 @@ next_hl:
                 {
                     fb_wp[0] = CMD_SKIP_TICKS;
                     fb_wp[1] = (uint8_t)(fb_tk - 1);
+                    fb_wp[2] = (uint8_t)spec_mask;
+                    fb_wp[3] = (uint8_t)(spec_mask >> 8);
+                    spec_mask = 0;
                     fb_wp += 4;
                     vgm_sec_budget -= fb_tk;
                 } else {
@@ -801,6 +926,9 @@ next_hl:
                 if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
                     fb_wp[0] = CMD_SKIP_TICKS;
                     fb_wp[1] = (uint8_t)(fb_tk - 1);
+                    fb_wp[2] = (uint8_t)spec_mask;
+                    fb_wp[3] = (uint8_t)(spec_mask >> 8);
+                    spec_mask = 0;
                     fb_wp += 4;
                     vgm_sec_budget -= fb_tk;
                 } else {
@@ -826,6 +954,9 @@ next_hl:
                 if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
                     fb_wp[0] = CMD_SKIP_TICKS;
                     fb_wp[1] = (uint8_t)(fb_tk - 1);
+                    fb_wp[2] = (uint8_t)spec_mask;
+                    fb_wp[3] = (uint8_t)(spec_mask >> 8);
+                    spec_mask = 0;
                     fb_wp += 4;
                     vgm_sec_budget -= fb_tk;
                 } else {
@@ -843,6 +974,7 @@ next_hl:
             fb_wp[0] = CMD_WRITE_B0;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
+            spectrum_opl_b0(fb_b1, fb_b2);
             goto do_budget;
         }
 
@@ -853,6 +985,7 @@ next_hl:
             fb_wp[0] = CMD_WRITE_B0;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
+            spectrum_opl_b0(fb_b1, fb_b2);
             goto do_budget;
         }
 
@@ -863,6 +996,7 @@ next_hl:
             fb_wp[0] = CMD_WRITE_B0;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
+            spectrum_opl_b0(fb_b1, fb_b2);
             goto do_budget;
         }
 
@@ -873,6 +1007,7 @@ next_hl:
             fb_wp[0] = CMD_WRITE_B1;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
+            spectrum_opl_b1(fb_b1, fb_b2);
             goto do_budget;
         }
 
@@ -880,6 +1015,7 @@ next_hl:
         if (fb_op == 0x55)
         {
             asm_read_2bytes();
+            spectrum_ay(fb_b1, fb_b2, 0);
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             /* ── PSG tone period (reg 0x00-0x05): 12-bit, парами lo/hi ── */
@@ -924,6 +1060,7 @@ next_hl:
         if (fb_op == 0xA5)
         {
             asm_read_2bytes();
+            spectrum_ay(fb_b1, fb_b2, 1);
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             if (fb_b1 <= 0x05) {
@@ -961,6 +1098,7 @@ next_hl:
         if (fb_op == 0xA0)
         {
             asm_read_2bytes();
+            spectrum_ay(fb_b1 & 0x7F, fb_b2, (fb_b1 & 0x80) ? 1 : 0);
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             fb_reg = fb_b1 & 0x7F;
@@ -1012,6 +1150,7 @@ next_hl:
             fb_wp[1] = fb_b1;
             fb_wp[2] = fb_b2;
             fb_wp += 4;
+            spectrum_saa(fb_b1, fb_b2);
             goto do_budget;
         }
 
@@ -1092,6 +1231,9 @@ next_hl:
             if (vgm_sec_budget > 1) {
                 fb_wp[0] = CMD_SKIP_TICKS;
                 fb_wp[1] = 0;
+                fb_wp[2] = (uint8_t)spec_mask;
+                fb_wp[3] = (uint8_t)(spec_mask >> 8);
+                spec_mask = 0;
                 fb_wp += 4;
                 vgm_sec_budget--;
             } else {
@@ -1116,6 +1258,9 @@ finish:
      * (иначе пропуск INT-позиции и падение темпа в десятки раз).       */
     fb_wp[0] = CMD_SKIP_TICKS;
     fb_wp[1] = 0;
+    fb_wp[2] = (uint8_t)spec_mask;
+    fb_wp[3] = (uint8_t)(spec_mask >> 8);
+    spec_mask = 0;
     fb_wp += 4;
 
     fb_wp[0] = CMD_END_BUF;

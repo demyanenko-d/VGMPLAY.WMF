@@ -121,7 +121,7 @@ static void detect_active_chips(void)
     }
 }
 
-/* MAX_LOOP_REWINDS is defined in vgm.h */
+/* cfg_loop_rewinds, cfg_min_duration, cfg_max_duration are in vgm.c */
 
 /* ── HL queue helpers ────────────────────────────────────────────────
  * The queue itself and its state live in vgm.c (vgm_hl_queue etc.)
@@ -156,7 +156,7 @@ static void build_playback_queue(void)
     /* Loop repeats — только если vgm_parse_header разрешил loop.
      * Policy: без full-track loop, без коротких (<10с), без длинных (>4мин). */
     if (vgm_loop_enabled) {
-        for (uint8_t i = 0; i < MAX_LOOP_REWINDS; i++)
+        for (uint8_t i = 0; i < cfg_loop_rewinds; i++)
             hl_push(HLCMD_LOOP, 0);
     }
 
@@ -183,17 +183,41 @@ static void build_playback_queue(void)
 }
 
 /* ── Размеры и цвета окна ───────────────────────────────────────────── */
-/* TextMode=2 (wc.ini) → 90×36. Центровка: (90-60)/2=15, (36-20)/2=8   */
+/* TextMode=2 (wc.ini) → 90×36. Центровка: (90-60)/2=15, (36-22)/2=7  */
 #define WND_X 14
-#define WND_Y 6
-#define WND_W 64
-#define WND_H 24
+#define WND_Y 7
+#define WND_W 62
+#define WND_H 23
 
 #define CLR_WIN WC_COLOR(WC_WHITE, WC_BLACK)
+#define CLR_TITLE WC_COLOR(WC_BRIGHT_BLUE, WC_BLACK)
+
+static const char s_win_title[] = " VGM Player " APP_VERSION " ";
+
+/* ── Фиксированные строки окна (1-based content rows) ───────────────
+ * Height=23 → interior rows 1..21, border rows 0 and 22.
+ *   Row 1:      Title (blue)
+ *   Rows 2-4:   File info section
+ *   Rows 5-6:   (empty)
+ *   Row 7:      ← divider 1 (from_bottom = 23-7 = 16)
+ *   Rows 8-14:  VGM info section (ver, chips, loop, freq, GD3)
+ *   Row 15:     ← divider 2 (from_bottom = 23-15 = 8)
+ *   Row 16:     Progress bar
+ *   Rows 17-20: Spectrum analyzer (4 rows)
+ *   Row 21:     Help keys                                            */
+#define ROW_TITLE         1
+#define ROW_FILE_START    2
+#define ROW_VGM_START     8
+#define ROW_VGM_END       14   /* максимальная строка для VGM/GD3 info   */
+#define ROW_PROGRESS      16
+#define ROW_SPECTRUM      17   /* 4 rows: 17,18,19,20                   */
+#define ROW_HELP          21
+#define DIV1_FROM_BOTTOM  16   /* row 7 = 23-16                          */
+#define DIV2_FROM_BOTTOM  8    /* row 15 = 23-8                          */
 
 static wc_window_t s_wnd;
 static uint8_t s_pages;
-static uint8_t pbinfo_start_row;
+/* pbinfo_start_row replaced by ROW_PROGRESS constant */
 
 static uint8_t s_playback_inited = 0;
 static uint8_t s_last_active_buf = 0;
@@ -223,6 +247,94 @@ static uint8_t  s_pb_col;         /* current green column count            */
 #define PB_OFS_SEC10  12
 #define PB_OFS_SEC1   13
 #define PB_OFS_LOOP   29
+
+/* ── Spectrum analyzer rendering ──────────────────────────────────────
+ * 16 bars, 4 rows (ROW_SPECTRUM..ROW_SPECTRUM+3), bottom-up.
+ * Each bar: 3 chars wide (2 filled + 1 space).
+ * Characters: 0xDB=█(full block, 2 units), 0xDC=▄(half, 1 unit), 0x20=space
+ * Levels 0-8: row_n shows levels 2*n+1..2*n+2 (bottom row = levels 1-2).
+ * Decay: each call to spectrum_decay() decrements non-zero levels by 1. */
+
+#define SPEC_CHAR_FULL  0xDB   /* █ */
+#define SPEC_CHAR_HALF  0xDC   /* ▄ */
+#define SPEC_BAR_WIDTH  3      /* 2 filled + 1 space separator         */
+#define SPEC_LEFT_PAD   5      /* centering: (58 - 16*3 - 1) / 2 ≈ 5  */
+
+/* Предвычисленные адреса для прямого доступа к текстовой странице */
+static uint16_t s_spec_char_ofs[4];  /* char offsets for 4 rows       */
+static uint16_t s_spec_attr_ofs[4];  /* attr offsets for 4 rows       */
+
+/* Цвета полос спектра (по номеру строки сверху вниз) */
+static const uint8_t spec_row_colors[4] = {
+    WC_COLOR(WC_BLACK, WC_BRIGHT_RED),     /* top = red (peak)        */
+    WC_COLOR(WC_BLACK, WC_BRIGHT_YELLOW),  /* upper-mid               */
+    WC_COLOR(WC_BLACK, WC_BRIGHT_GREEN),   /* lower-mid               */
+    WC_COLOR(WC_BLACK, WC_GREEN),          /* bottom = green (base)   */
+};
+
+static uint8_t s_spec_frame_ctr;  /* 0-4: counts frames until decay tick */
+static uint8_t s_spec_decay_tick; /* increments every 5 frames            */
+
+/* Non-linear decay (1 decay "tick" = 5 frames ≈ 100ms at 50Hz):
+ *   level 8-7 : decay every tick    (5 frames  ≈ 100ms)
+ *   level 6-4 : decay every 2 ticks (10 frames ≈ 200ms)
+ *   level 3-1 : decay every 4 ticks (20 frames ≈ 400ms)           */
+static void spectrum_decay(void)
+{
+    if (++s_spec_frame_ctr < 5) return;
+    s_spec_frame_ctr = 0;
+    uint8_t tick = ++s_spec_decay_tick;
+    for (uint8_t i = 0; i < SPECTRUM_BARS; i++) {
+        uint8_t lev = spectrum_levels[i];
+        if (!lev) continue;
+        if (lev >= 7) {
+            spectrum_levels[i] = lev - 1;
+        } else if (lev >= 4) {
+            if (!(tick & 1)) spectrum_levels[i] = lev - 1;
+        } else {
+            if (!(tick & 3)) spectrum_levels[i] = lev - 1;
+        }
+    }
+}
+
+static void spectrum_render(void)
+{
+    uint8_t saved_pg = sfr_page3;
+    sfr_page3 = s_pb_text_pg;
+
+    /* 4 display rows, top (row 0 = levels 7-8) to bottom (row 3 = levels 1-2) */
+    for (uint8_t r = 0; r < 4; r++) {
+        volatile uint8_t *chars = (volatile uint8_t *)(0xC000 + s_spec_char_ofs[r]);
+        volatile uint8_t *attrs = (volatile uint8_t *)(0xC000 + s_spec_attr_ofs[r]);
+        uint8_t thresh_full = (uint8_t)((3 - r) * 2 + 2); /* 8,6,4,2 */
+        uint8_t thresh_half = thresh_full - 1;              /* 7,5,3,1 */
+
+        for (uint8_t b = 0; b < SPECTRUM_BARS; b++) {
+            uint8_t lev = spectrum_levels[b];
+            uint8_t ch;
+            uint8_t col = SPEC_LEFT_PAD + b * SPEC_BAR_WIDTH;
+
+            if (lev >= thresh_full)
+                ch = SPEC_CHAR_FULL;
+            else if (lev >= thresh_half)
+                ch = SPEC_CHAR_HALF;
+            else
+                ch = ' ';
+
+            chars[col]     = ch;
+            chars[col + 1] = ch;
+            if (ch != ' ') {
+                attrs[col]     = spec_row_colors[r];
+                attrs[col + 1] = spec_row_colors[r];
+            } else {
+                attrs[col]     = CLR_WIN;
+                attrs[col + 1] = CLR_WIN;
+            }
+        }
+    }
+
+    sfr_page3 = saved_pg;
+}
 
 /* ── FSM-клавиатура (дебаунс без сжигания CPU) ───────────────────────
  * Состояния:
@@ -347,12 +459,7 @@ enum state_t
 /* ── Предварительный вывод информации (до загрузки/распаковки) ──────── */
 static void draw_pre_load_info(void)
 {
-    uint8_t row = 1;
-
-    buf_clear(work_buf);
-    buf_append_str(work_buf, "    VGM Player " APP_VERSION " " STR(ISR_FREQ) "Hz/b" STR(VGM_FILL_CMD_BUDGET));
-    print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
-    row = 3;
+    uint8_t row = ROW_FILE_START;
 
     buf_clear(work_buf);
     buf_append_str(work_buf, "File name   : ");
@@ -372,20 +479,12 @@ static void draw_pre_load_info(void)
 
 uint8_t drow_ui(void)
 {
-    uint8_t row = 1;
+    uint8_t row;
+    uint8_t gd3_count = 0;
 
-    // Заголовок ---------------------------------------------------------------------------------------
-    buf_clear(work_buf);
-    buf_append_str(work_buf, "    VGM Player " APP_VERSION " " STR(ISR_FREQ) "Hz/b" STR(VGM_FILL_CMD_BUDGET));
-    print_line(&s_wnd, row, work_buf, WC_COLOR(WC_BLUE, WC_YELLOW));
-    row += 2;
+    /* ── Section 1: File info (rows 1-3) ────────────────────────── */
+    row = ROW_FILE_START;
 
-    // Инструкция --------------------------------------------------------------------------------------
-    buf_clear(work_buf);
-    buf_append_str(work_buf, "[N]ext [P]rev [Q] Exit");
-    print_line(&s_wnd, 22, work_buf, WC_COLOR(WC_WHITE, WC_BLUE));
-
-    // Данные файла ------------------------------------------------------------------------------------
     buf_clear(work_buf);
     buf_append_str(work_buf, "File name   : ");
     buf_append_str(work_buf, wc_file_name);
@@ -408,7 +507,9 @@ uint8_t drow_ui(void)
     }
     buf_append_u16_dec(work_buf, s_pages);
     print_line(&s_wnd, row, work_buf, CLR_WIN);
-    row += 2;
+
+    /* ── Section 2: VGM info (rows 5..ROW_VGM_END) ─────────────── */
+    row = ROW_VGM_START;
 
     buf_clear(work_buf);
     buf_append_str(work_buf, "VGM version : ");
@@ -417,12 +518,12 @@ uint8_t drow_ui(void)
     buf_append_u8_hex(work_buf, vgm_version & 0xFF);
     print_line(&s_wnd, row++, work_buf, CLR_WIN);
 
-    for (uint8_t i = 0; i < vgm_chip_count; i++)
+    for (uint8_t i = 0; i < vgm_chip_count && row <= ROW_VGM_END; i++)
     {
         const vgm_chip_entry_t *chip = &vgm_chip_list[i];
 
         buf_clear(work_buf);
-        buf_append_str(work_buf, "Chip : ");
+        buf_append_str(work_buf, "Chip        : ");
         {
             const char *cname = vgm_chip_name(chip->id);
             if (cname) {
@@ -442,20 +543,22 @@ uint8_t drow_ui(void)
         print_line(&s_wnd, row++, work_buf, CLR_WIN);
     }
 
-    // loop info
-    buf_clear(work_buf);
-    buf_append_str(work_buf, "Loop : ");
-    if (vgm_loop_addr)
-        buf_append_str(work_buf, "Yes");
-    else
-        buf_append_str(work_buf, "No");
-    print_line(&s_wnd, row++, work_buf, CLR_WIN);
+    /* Loop info */
+    if (row <= ROW_VGM_END) {
+        buf_clear(work_buf);
+        buf_append_str(work_buf, "Loop        : ");
+        if (vgm_loop_addr)
+            buf_append_str(work_buf, "Yes");
+        else
+            buf_append_str(work_buf, "No");
+        print_line(&s_wnd, row++, work_buf, CLR_WIN);
+    }
 
 #ifdef VGM_FREQ_SCALE
     /* Информация о режиме частот */
-    {
+    if (row <= ROW_VGM_END) {
         buf_clear(work_buf);
-        buf_append_str(work_buf, "Freq : ");
+        buf_append_str(work_buf, "Freq        : ");
         if (vgm_freq_mode == FREQ_MODE_TABLE) {
             buf_append_str(work_buf, "table");
         } else {
@@ -468,45 +571,45 @@ uint8_t drow_ui(void)
     }
 #endif
 
-    row++;
-
-    /* ── GD3 метаданные (English) ──────────────────────────────────── */
-    if (vgm_gd3_track[0]) {
+    /* ── GD3 метаданные (English, max 4) ──────────────────────────── */
+    if (vgm_gd3_track[0] && row <= ROW_VGM_END && gd3_count < 4) {
         buf_clear(work_buf);
         buf_append_str(work_buf, "Title  : ");
         buf_append_str(work_buf, vgm_gd3_track);
         print_line(&s_wnd, row++, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
+        gd3_count++;
     }
-    if (vgm_gd3_game[0]) {
+    if (vgm_gd3_game[0] && row <= ROW_VGM_END && gd3_count < 4) {
         buf_clear(work_buf);
         buf_append_str(work_buf, "Game   : ");
         buf_append_str(work_buf, vgm_gd3_game);
         print_line(&s_wnd, row++, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
+        gd3_count++;
     }
-    if (vgm_gd3_author[0]) {
+    if (vgm_gd3_author[0] && row <= ROW_VGM_END && gd3_count < 4) {
         buf_clear(work_buf);
         buf_append_str(work_buf, "Author : ");
         buf_append_str(work_buf, vgm_gd3_author);
         print_line(&s_wnd, row++, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
+        gd3_count++;
     }
-    if (vgm_gd3_system[0]) {
+    if (vgm_gd3_system[0] && row <= ROW_VGM_END && gd3_count < 4) {
         buf_clear(work_buf);
         buf_append_str(work_buf, "System : ");
         buf_append_str(work_buf, vgm_gd3_system);
         print_line(&s_wnd, row++, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
+        gd3_count++;
     }
 
-    row++;
-    return row;
+    /* ── Help line (fixed row) ──────────────────────────────────── */
+    buf_clear(work_buf);
+    buf_append_str(work_buf, "[N]ext [P]rev [Q] Exit");
+    print_line(&s_wnd, ROW_HELP, work_buf, WC_COLOR(WC_WHITE, WC_BLUE));
+
+    return ROW_PROGRESS;
 }
 
-void render_static_info(void)
-{
-    buf_clear(work_buf);
-    buf_append_str(work_buf, "VGM version: ");
-    buf_append_u32_dec(work_buf, vgm_version);
-    print_line(&s_wnd, 5, work_buf, CLR_WIN);
-}
+/* render_static_info() removed — replaced by drow_ui() */
 
 /* Проверить расширение файла: .vgz / .VGZ */
 static uint8_t is_vgz_filename(void)
@@ -901,21 +1004,47 @@ void main(void)
     state = STATE_INIT;
 
     wc_turbopl(WC_TURBO_CPU, 0x02);  /* 14 МГц */
+
+    /* ── Чтение INI-параметров ───────────────────────────────────────
+     * Формат в wc.ini:  VGMPLAY.WMF -min_dur=10 -max_dur=4 -loops=1
+     *   param 0: min_duration секунд  (default 10)
+     *   param 1: max_duration в минутах (default 4 → 240 сек)
+     *   param 2: loop_count           (default 1)
+     * wc_prm_pl() возвращает 0xFF если параметр не задан.            */
+    {
+        uint8_t v;
+        v = wc_prm_pl(0);
+        if (v != 0xFF) cfg_min_duration = v;
+
+        v = wc_prm_pl(1);
+        if (v != 0xFF) cfg_max_duration = (uint16_t)v * 60u;
+
+        v = wc_prm_pl(2);
+        if (v != 0xFF) cfg_loop_rewinds = v;
+    }
+
     wc_strset((char *)&s_wnd, sizeof(s_wnd), 0);
 
-    // SOW — однолинейная рамка, без буфера фона
-    s_wnd.type = WC_WIN_SINGLE;
-    s_wnd.cur_mask = 0x07;
+    // SOW — рамка с тенью (TYPE3, заголовок рисуем вручную)
+    s_wnd.type = WC_WIN_TYPE3 | WC_WIN_SHADOW;
+    s_wnd.cur_mask = 0x05;
     s_wnd.x = WND_X;
     s_wnd.y = WND_Y;
     s_wnd.width = WND_W;
     s_wnd.height = WND_H;
     s_wnd.color = CLR_WIN;
     s_wnd.buf_addr = 0;
+    s_wnd.divider1 = DIV1_FROM_BOTTOM;
+    s_wnd.divider2 = DIV2_FROM_BOTTOM;
 
     // Восстановить дисплей WC и нарисовать окно
     wc_gedpl();
     wc_prwow(&s_wnd);
+
+    /* Заголовок окна синим текстом */
+    buf_clear(work_buf);
+    buf_append_str(work_buf, s_win_title);
+    print_line(&s_wnd, ROW_TITLE, work_buf, CLR_TITLE);
 
     /* Предварительный вывод: имя, размер, страницы (до загрузки) */
     s_is_vgz = 0;
@@ -929,11 +1058,11 @@ void main(void)
     if (is_vgz_filename()) {
         buf_clear(work_buf);
         buf_append_str(work_buf, "             Unpacking...");
-        print_line(&s_wnd, 7, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
+        print_line(&s_wnd, ROW_VGM_START, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
 
-        /* Setup progress bar: get text screen address for row 7 col 2 */
+        /* Setup progress bar: get text screen address for VGM section col 2 */
         {
-            uint16_t bar_addr = wc_gadrw(&s_wnd, 7, 2);
+            uint16_t bar_addr = wc_gadrw(&s_wnd, ROW_VGM_START, 2);
             ifl_pb_text_pg  = wc_get_pgc();   /* phys page of text screen */
             ifl_pb_attr_ofs = (bar_addr & 0x3FFF) | 0x0080; /* SET 7,L = attr area */
             ifl_pb_bw       = get_content_width(&s_wnd);
@@ -979,17 +1108,28 @@ void main(void)
         }
     }
 
-    pbinfo_start_row = drow_ui();
+    drow_ui();
 
     /* Кешируем параметры progress bar (строка playback info) */
     {
-        uint16_t bar_addr = wc_gadrw(&s_wnd, pbinfo_start_row, 2);
+        uint16_t bar_addr = wc_gadrw(&s_wnd, ROW_PROGRESS, 2);
         s_pb_text_pg  = wc_get_pgc();
         s_pb_char_ofs = bar_addr & 0x3FFF;
         s_pb_attr_ofs = s_pb_char_ofs | 0x0080;
         s_pb_width    = get_content_width(&s_wnd);
         s_pb_col      = 0;
         s_pb_err      = 0;
+    }
+
+    /* Кешируем адреса строк спектроанализатора */
+    {
+        for (uint8_t r = 0; r < 4; r++) {
+            uint16_t a = wc_gadrw(&s_wnd, ROW_SPECTRUM + r, 2);
+            s_spec_char_ofs[r] = a & 0x3FFF;
+            s_spec_attr_ofs[r] = s_spec_char_ofs[r] | 0x0080;
+        }
+        s_spec_frame_ctr = 0;
+        s_spec_decay_tick = 0;
     }
 
     /* Печатаем полную строку progress bar ОДИН РАЗ через WC API.
@@ -1002,7 +1142,7 @@ void main(void)
         fmt_mmss(tb, vgm_total_seconds);
         for (uint8_t i = 0; i < 5; i++) buf_append_char(work_buf, tb[i]);
         buf_append_str(work_buf, "  Loop 1");
-        print_line(&s_wnd, pbinfo_start_row, work_buf, WC_COLOR(WC_BRIGHT_WHITE, WC_BLACK));
+        print_line(&s_wnd, ROW_PROGRESS, work_buf, WC_COLOR(WC_BRIGHT_WHITE, WC_BLACK));
     }
 
     if (state == STATE_PLAYBACK)
@@ -1053,6 +1193,10 @@ void main(void)
 
         if (isr_play_seconds != s_last_displayed_sec || vgm_loop_count  != s_last_loop_count)
             update_playback_info();
+
+        /* ── 3. Спектроанализатор ──────────────────────────── */
+        spectrum_decay();
+        spectrum_render();
     }
 
     stop_playback();

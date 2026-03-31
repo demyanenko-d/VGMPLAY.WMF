@@ -29,19 +29,21 @@
  * ФОРМАТ КОМАНДЫ (4 байта, выровнено)
  * ═══════════════════════════════════════════════════════════════════
  *
- *   Код          │ Байт 1 │ Байт 2 │ Байт 3 │ Действие
- *   ─────────────┼────────┼────────┼────────┼─────────────────────
- *   CMD_WRITE_AY │ reg    │ val    │ 0      │ OUT AY8910 chip 1
- *   CMD_INC_SEC  │ 0      │ 0      │ 0      │ Инкр. isr_play_seconds
- *   CMD_WRITE_AY2│ reg    │ val    │ 0      │ OUT AY8910 chip 2 (TS)
- *   CMD_CALL_WC  │ 0      │ 0      │ 0      │ Вызов WC ISR handler
- *   CMD_WRITE_B0 │ reg    │ val    │ 0      │ OUT OPL3 Bank 0
- *   CMD_SKIP_TICKS│ N     │ 0      │ 0      │ Пропустить N позиций pos_table
- *   CMD_WRITE_SAA│ reg    │ val    │ 0      │ OUT SAA1099 chip 1
- *   CMD_WRITE_B1 │ reg    │ val    │ 0      │ OUT OPL3 Bank 1
- *   CMD_WRITE_SA2│ reg    │ val    │ 0      │ OUT SAA1099 chip 2
- *   CMD_WAIT     │ lo     │ hi     │ 0      │ Ждать (hi<<8)|lo тиков
- *   CMD_END_BUF  │ 0      │ 0      │ 0      │ Переключить буфер
+ *   Код           │ Байт 1 │ Байт 2 │ Байт 3 │ Действие
+ *   ──────────────┼────────┼────────┼────────┼─────────────────────
+ *   CMD_WRITE_AY  │ reg    │ val    │ 0      │ OUT AY8910 chip 1
+ *   CMD_INC_SEC   │ 0      │ 0      │ 0      │ Инкр. isr_play_seconds
+ *   CMD_WRITE_AY2 │ reg    │ val    │ 0      │ OUT AY8910 chip 2 (TS)
+ *   CMD_CALL_WC   │ 0      │ 0      │ 0      │ Вызов WC ISR handler
+ *   CMD_WRITE_B0  │ reg    │ val    │ 0      │ OUT OPL3 Bank 0
+ *   CMD_SKIP_TICKS│ N      │ smsk_lo│ smsk_hi│ Пропустить N позиций pos_table
+ *   CMD_WRITE_SAA │ reg    │ val    │ 0      │ OUT SAA1099 chip 1
+ *   CMD_WRITE_B1  │ reg    │ val    │ 0      │ OUT OPL3 Bank 1
+ *   CMD_WRITE_SA2 │ reg    │ val    │ 0      │ OUT SAA1099 chip 2
+ *   CMD_WAIT      │ lo     │ hi     │ 0      │ Ждать (hi<<8)|lo тиков
+ *   CMD_END_BUF   │ 0      │ 0      │ 0      │ Переключить буфер
+ *
+ * CMD_SKIP_TICKS carries 16-bit spectrum bitmask: bit N → bar N triggered
  *
  * ═══════════════════════════════════════════════════════════════════
  * ПРИМЕР ИСПОЛЬЗОВАНИЯ
@@ -80,7 +82,7 @@
 #define CMD_WRITE_AY2 0x20  /* AY8910 chip 2 (TurboSound): [reg,val,0]*/
 #define CMD_CALL_WC   0x30  /* Вызов WC ISR handler: [0,0,0]        */
 #define CMD_WRITE_B0  0x40  /* OPL3 Bank 0 write: [reg, val, 0]      */
-#define CMD_SKIP_TICKS 0x50 /* Пропустить N записей pos_table: [N,0,0]  */
+#define CMD_SKIP_TICKS 0x50 /* Пропустить N pos_table: [N,sml,smh]  */
 #define CMD_WRITE_SAA 0x60  /* SAA1099 chip 1: [reg, val, 0]         */
 #define CMD_WRITE_B1  0x80  /* OPL3 Bank 1 write: [reg, val, 0]      */
 #define CMD_WRITE_SAA2 0xA0 /* SAA1099 chip 2: [reg, val, 0]         */
@@ -136,6 +138,18 @@ extern volatile uint8_t  isr_done;
 /** Командные буферы A и B. Заполняются main loop, читаются ISR. */
 extern uint8_t cmd_buf_a[CMD_BUF_SIZE];
 extern uint8_t cmd_buf_b[CMD_BUF_SIZE];
+
+/* ── Spectrum analyzer (16 bars, 0-8 levels) ─────────────────────── */
+#define SPECTRUM_BARS      16
+#define SPECTRUM_MAX_LEVEL 8
+
+/** уровни спектра для каждой из 16 полос, 0..SPECTRUM_MAX_LEVEL.
+ *  Заполняются ISR (через CMD_SKIP_TICKS), читаются main loop для рендеринга.
+ *  Каждый бит в CMD_SKIP_TICKS соответствует одной полосе, устанавливается при активации. 
+ *  Например, если бит 0x0001 установлен, то полоса 0 (самая левая) будет на максимальном уровне. 
+ * Если бит 0x0002 установлен, то полоса 1 будет на максимальном уровне, и так далее. 
+ */
+extern volatile uint8_t spectrum_levels[SPECTRUM_BARS];
 
 /** Контрольный счётчик текущей задержки CMD_WAIT.
  *  ISR декрементирует при каждом тике, переходит к следующей команде после достижения 0.

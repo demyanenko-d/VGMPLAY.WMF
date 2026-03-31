@@ -40,6 +40,7 @@
         .globl  _isr_init
         .globl  _isr_deinit
         .globl  _call_wc_handler
+        .globl  _spectrum_levels
 
 ; Импорт таблицы позиций из pos_table.s
         .globl  pos_table
@@ -345,7 +346,7 @@ _isr_do_wait:
         ld      a, (de)             ; hi
         inc     de
         ld      h, a
-        inc     de                  ; pad
+        inc     de                  ; skip pad byte
         ld      (_isr_wait_ctr), hl
         ex      de, hl
         ld      (_isr_read_ptr), hl
@@ -442,7 +443,7 @@ _isr_inc_sec:
         ld      (_isr_play_seconds), hl
         jp      _isr_cmd_loop
 
-;--- CMD_SKIP_TICKS: skip N записей pos_table [N,0,0] ----------------------
+;--- CMD_SKIP_TICKS: skip N + spectrum bitmask [N,smask_lo,smask_hi] --------
 ; CMD_SKIP_TICKS(N):
 ;   N=0 — не перепрограммирует, просто exit (1 тик пауза)
 ;   N>=1 — пропустить N записей, перепрограммировать INT (N+1 тиков пауза)
@@ -450,8 +451,44 @@ _isr_inc_sec:
 _isr_skip_ticks:
         ld      a, (de)             ; N = skip count (0..55)
         inc     de
+        ;--- Spectrum: unpack 16-bit bitmask → set bars to max ---
+        push    af                  ; save N
+        ld      a, (de)             ; mask_lo
         inc     de
-        inc     de                  ; пропустить 3 байта параметров
+        ld      l, a                ; L = mask_lo
+        ld      a, (de)             ; mask_hi
+        inc     de
+        ld      h, a                ; H = mask_hi
+        or      l                   ; quick zero check
+        jr      z, _skip_spec_done
+        push    de                  ; save read_ptr
+        ld      b, h                ; B = mask_hi
+        ld      c, l                ; C = mask_lo
+        ld      hl, #_spectrum_levels
+        ld      d, #8               ; SPECTRUM_MAX_LEVEL
+        ld      a, c                ; mask_lo (bars 0-7)
+        ld      e, #8
+_skip_spec_lo:
+        rra
+        jr      nc, _skip_spec_lo_n
+        ld      (hl), d
+_skip_spec_lo_n:
+        inc     hl
+        dec     e
+        jr      nz, _skip_spec_lo
+        ld      a, b                ; mask_hi (bars 8-15)
+        ld      e, #8
+_skip_spec_hi:
+        rra
+        jr      nc, _skip_spec_hi_n
+        ld      (hl), d
+_skip_spec_hi_n:
+        inc     hl
+        dec     e
+        jr      nz, _skip_spec_hi
+        pop     de                  ; restore read_ptr
+_skip_spec_done:
+        pop     af                  ; restore N
         ; Сохранить read_ptr
         ex      de, hl
         ld      (_isr_read_ptr), hl
@@ -545,6 +582,12 @@ _isr_wait_ctr::     .dw 0
 _isr_done::         .db 0          ; 1 = ISR замер на CMD_ISR_DONE, готов к завершению
 _pos_ptr:           .dw 0          ; инициализируется в isr_init()
 _isr_saved_vec:     .dw 0          ; сохранённый вектор WC (#5BFF)
+
+;==============================================================================
+; Spectrum analyzer levels (16 bars, updated by 16-bit bitmask in CMD_SKIP_TICKS)
+;==============================================================================
+_spectrum_levels::
+        .ds 16                      ; 16 bytes, one per bar (0-8)
 
 ;==============================================================================
 ; Командные буферы (512 байт каждый)
