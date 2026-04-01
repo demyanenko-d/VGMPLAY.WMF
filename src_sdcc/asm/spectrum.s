@@ -1,10 +1,8 @@
 ;==============================================================================
-; spectrum.s — Spectrum analyzer: render + decay + hot-loop helpers (Z80 ASM)
+; spectrum.s — Spectrum analyzer: render + hot-loop helpers (Z80 ASM)
 ;
 ; Hand-optimised replacements for C functions in main.c / vgm.c:
 ;   spectrum_render()      — 4-row bar graph, direct VRAM write
-;   spectrum_decay()       — non-linear level decay, ISR-tick timed
-;   spectrum_decay_reset() — reset decay timer on song start
 ;   spectrum_opl_b0(r,v)   — OPL B0-B8 key-on + 0xBD percussion
 ;   spectrum_opl_b1(r,v)   — OPL Bank1 B0-B6 key-on
 ;   spectrum_ay(r,v,chip2) — AY period shadow + vol trigger + YM2203 FM
@@ -21,6 +19,8 @@
 
 ; ── Exports ──────────────────────────────────────────────────────────
         .globl  _spectrum_render
+        .globl  _spectrum_decay
+        .globl  _spectrum_decay_reset
         .globl  _spectrum_opl_b0
         .globl  _spectrum_opl_b1
         .globl  _spectrum_ay
@@ -50,11 +50,10 @@ CHAR_HALF    = 0x01      ; custom glyph: half-height striped bar
 CLR_WIN      = 0x70      ; WC_COLOR(WC_WHITE, WC_BLACK)
 WC_PAGE_FONT0 = 0x01     ; font page (TSConf page number)
 FONT_BASE     = 0xC000   ; page3 window base address
-
-; DECAY_INTERVAL: isr_tick_ctr ticks between each level-decay step.
-; At ISR_FREQ=683Hz: 43 ticks ≈ 63 ms. Tune to adjust fall speed.
-; Safe range: 1..127 (isr_tick_ctr wraps at 256; uint8 subtraction handles wrap).
-DECAY_INTERVAL = 43
+ISR_TICKS_PER_FRAME = 14  ; ticks per display frame (from variant_cfg.h)
+DECAY_FAST  = 2           ; frames between decay for levels >= 6
+DECAY_MED   = 5           ; frames between decay for levels 3-5
+DECAY_SLOW  = 7          ; frames between decay for levels 1-2
 
 ;======================================================================
 ; Scratch variables in _DATA (kept minimal)
@@ -64,8 +63,10 @@ DECAY_INTERVAL = 43
 say_base:       .db 0                   ; temp: chip base index (0 or 3)
 sr_row_ctr:     .db 0                   ; temp: row iteration counter
 sr_rp_ptr:      .dw 0                   ; temp: current row-params pointer
-sd_last_tick:   .db 0                   ; isr_tick_ctr at last decay step
-sd_step_ctr:    .db 0                   ; decay step counter (for non-linear mult)
+sd_last_tick:   .db 0                   ; isr_tick_ctr snapshot for frame gate
+sd_fast_ctr:    .db DECAY_FAST          ; countdown: decay levels >= 6
+sd_med_ctr:     .db DECAY_MED           ; countdown: decay levels 3-5
+sd_slow_ctr:    .db DECAY_SLOW          ; countdown: decay levels 1-2
 sfont_save:     .ds 16                  ; backup of original font glyphs 0x01-0x02
 
         .area   _CODE
@@ -230,81 +231,103 @@ sr_next:
         ret
 
 ;======================================================================
-; spectrum_decay_reset() — reset decay timer to isr_tick_ctr at song start
+; spectrum_decay_reset() — initialize decay timers at song start
 ;======================================================================
 _spectrum_decay_reset::
         ld      a, (_isr_tick_ctr)
         ld      (sd_last_tick), a
-        xor     a
-        ld      (sd_step_ctr), a
+        ld      a, #DECAY_FAST
+        ld      (sd_fast_ctr), a
+        ld      a, #DECAY_MED
+        ld      (sd_med_ctr), a
+        ld      a, #DECAY_SLOW
+        ld      (sd_slow_ctr), a
         ret
 
 ;======================================================================
-; spectrum_decay()
+; spectrum_decay() — frame-gated non-linear level decay
 ;
-; Non-linear level decay, timed by isr_tick_ctr (hardware-independent).
-; Called every main loop iteration; returns immediately if not enough
-; time has elapsed since the last decay step.
+; Called every main-loop iteration; returns immediately if less than
+; ISR_TICKS_PER_FRAME ticks have elapsed since the last frame.
 ;
-; Decay schedule per step (DECAY_INTERVAL ticks between steps):
-;   level 8-7 : decrement every step          (~187 ms at 683 Hz)
-;   level 6-4 : decrement every 2nd step      (~374 ms)
-;   level 3-1 : decrement every 4th step      (~748 ms)
+; Three countdown timers control decay speed per level range:
+;   Levels >= 6 : -1 every  3 frames  (~60 ms)
+;   Levels  3-5 : -1 every  6 frames  (~180 ms)
+;   Levels  1-2 : -1 every 10 frames  (~200 ms)
 ;
-; Register use:
-;   A  — scratch / current level
-;   B  — bar loop counter (DJNZ)
-;   C  — precomputed sd_step_ctr (tick & 3 and bit 0 via BIT)
-;   HL — pointer into spectrum_levels[]
+; Register layout:
+;   C = decay-flags bitmask (bit2=fast, bit1=med, bit0=slow)
+;   B = bar loop counter
+;   HL = pointer into spectrum_levels[]
 ;======================================================================
 _spectrum_decay::
-        ; ── Timer gate ──────────────────────────────────────────────
+        ; ── Frame gate ──────────────────────────────────────────────
         ld      a, (_isr_tick_ctr)
         ld      hl, #sd_last_tick
-        sub     (hl)                    ; A = (now - last_tick) mod 256
-        cp      #DECAY_INTERVAL
-        ret     c                       ; not enough time yet
+        sub     (hl)                    ; elapsed = now - last
+        cp      #ISR_TICKS_PER_FRAME
+        ret     c                       ; < 1 frame, skip
 
-        ; ── Update snapshot ─────────────────────────────────────────
-        ld      a, (_isr_tick_ctr)
-        ld      (sd_last_tick), a
+        ; Advance by one frame
+        ld      a, (hl)
+        add     a, #ISR_TICKS_PER_FRAME
+        ld      (hl), a
 
-        ; ── Increment step counter, keep low 2 bits in C ────────────
-        ld      hl, #sd_step_ctr
-        inc     (hl)
-        ld      c, (hl)                 ; C = step_ctr (bit0=odd/even, bits0-1=mod4)
+        ; ── Build decay-flags in C ──────────────────────────────────
+        ld      c, #0
 
-        ; ── Bar loop ────────────────────────────────────────────────
+        ld      hl, #sd_fast_ctr        ; 5-frame timer (levels >= 6)
+        dec     (hl)
+        jr      nz, sd_nf
+        ld      (hl), #DECAY_FAST
+        set     2, c
+sd_nf:
+        ld      hl, #sd_med_ctr         ; med-frame timer (levels 3-5)
+        dec     (hl)
+        jr      nz, sd_nm
+        ld      (hl), #DECAY_MED
+        set     1, c
+sd_nm:
+        ld      hl, #sd_slow_ctr        ; slow-frame timer (levels 1-2)
+        dec     (hl)
+        jr      nz, sd_ns
+        ld      (hl), #DECAY_SLOW
+        set     0, c
+sd_ns:
+        ld      a, c
+        or      a
+        ret     z                       ; no tier expired → nothing to decay
+
+        ; ── Single loop over 16 bars ────────────────────────────────
         ld      hl, #_spectrum_levels
         ld      b, #SPEC_BARS
 
 sd_bar_loop:
         ld      a, (hl)
         or      a
-        jr      z, sd_next              ; level == 0, skip
+        jr      z, sd_next              ; level 0 → skip
 
-        cp      #7
-        jr      c, sd_mid               ; level < 7
+        cp      #6
+        jr      nc, sd_high             ; level >= 6 → fast tier
 
-        ; level 7-8: always decrement
+        cp      #3
+        jr      nc, sd_mid              ; level >= 3 → medium tier
+
+        ; level 1-2: slow tier
+        bit     0, c
+        jr      z, sd_next
         dec     (hl)
         jr      sd_next
 
 sd_mid:
-        cp      #4
-        jr      c, sd_lo                ; level < 4
-
-        ; level 4-6: decrement on even steps (tick & 1 == 0)
-        bit     0, c
-        jr      nz, sd_next
+        bit     1, c
+        jr      z, sd_next
         dec     (hl)
         jr      sd_next
 
-sd_lo:
-        ; level 1-3: decrement when step_ctr & 3 == 0
-        ld      a, c
-        and     #3
-        jr      nz, sd_next
+sd_high:
+        bit     2, c
+        jr      z, sd_next
         dec     (hl)
 
 sd_next:
@@ -405,42 +428,38 @@ _spectrum_opl_b1::
         and     a, #0x0F
         jr      _set_spec_bit          ; tail-call
 
-; Power-of-2 bit mask table — O(1) lookup replaces djnz shift loop.
-; Fixes original bug: bit 0 was never set (djnz loop was skipped, leaving A=0).
-ssb_bit_table:
-        .db     0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80
+; 16-bit mask table — direct 16-bit OR into spec_mask, no byte split.
+; 32 bytes ROM, but eliminates push/pop bc + bit3 branch in hot path.
+ssb_mask_table:
+        .dw     0x0001, 0x0002, 0x0004, 0x0008
+        .dw     0x0010, 0x0020, 0x0040, 0x0080
+        .dw     0x0100, 0x0200, 0x0400, 0x0800
+        .dw     0x1000, 0x2000, 0x4000, 0x8000
 
 ;======================================================================
 ; _set_spec_bit — set bit A (0..15) in spec_mask
 ; Input: A = bit number (0..15)
-; Trashes: A, HL
-; Cost: ~70 T-states flat (vs up to ~180 T for bit 7 in old djnz loop).
+; Trashes: A, D, E, HL
+; Preserves: B, C (no push/pop needed)
+; Cost: ~122 T-states flat.
 ;======================================================================
 _set_spec_bit:
-        push    bc
-        ld      b, a                    ; B = full bit number (0..15)
-        and     #7                      ; A = bit mod 8 → table index
-        ld      hl, #ssb_bit_table
-        add     a, l
-        ld      l, a
-        jr      nc, ssb_nc
-        inc     h
-ssb_nc:
-        ld      a, (hl)                 ; A = 1 << (bit & 7)
+        add     a, a                    ; A = bit * 2 (index into word table)
+        ld      e, a
+        ld      d, #0
+        ld      hl, #ssb_mask_table
+        add     hl, de                  ; HL → mask entry
+        ld      e, (hl)                 ; E = mask lo
+        inc     hl
+        ld      d, (hl)                 ; D = mask hi
         ld      hl, (_spec_mask)
-        bit     3, b                    ; B bit 3: set → bits 8..15 → hi byte
-        jr      z, ssb_lo
-ssb_hi:
-        or      h
+        ld      a, l
+        or      e
+        ld      l, a
+        ld      a, h
+        or      d
         ld      h, a
         ld      (_spec_mask), hl
-        pop     bc
-        ret
-ssb_lo:
-        or      l
-        ld      l, a
-        ld      (_spec_mask), hl
-        pop     bc
         ret
 
 ;======================================================================

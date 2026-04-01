@@ -109,6 +109,7 @@ static uint16_t fb_tk;     /* temp: tick count for emit_wait            */
 static uint32_t fb_t32;    /* temp: 32-bit wait / data-block size       */
 static uint16_t fb_w;      /* temp: emit_wait split value               */
 static uint8_t  fb_n;      /* temp: skip byte count                    */
+static uint8_t *fb_end;    /* precomputed fb_buf + (CMD_BUF_SIZE - 48)  */
 static hl_entry_t *fb_e;   /* temp: HL queue entry pointer              */
 #ifdef VGM_FREQ_SCALE
 static uint8_t  fb_ch;     /* temp: PSG/FM channel index               */
@@ -569,6 +570,94 @@ static void asm_read_2bytes(void) __naked
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * asm_emit_skip_spec — emit CMD_SKIP_TICKS + spec_mask to cmd buffer
+ *
+ * Writes: [CMD_SKIP_TICKS, val, spec_mask_lo, spec_mask_hi].
+ * Clears spec_mask, advances fb_wp by 4.
+ * Replaces a 6-line C pattern that appears 9× in fill_buffer/emit_wait.
+ *
+ * Input: A = byte1 (tick count minus 1, or literal).
+ * Clobbers: A, C, HL.
+ * Cost: ~119 T  (+ call 17 = 136 T total).
+ * ───────────────────────────────────────────────────────────────────── */
+static void asm_emit_skip_spec(uint8_t val) __naked {
+    __asm
+    ld   c, a               ; 4  C = val (byte1)
+    ld   hl, (_fb_wp)       ;16
+    ld   (hl), #0x50        ;10  CMD_SKIP_TICKS = 0x50
+    inc  hl                 ; 6
+    ld   (hl), c            ; 7  val
+    inc  hl                 ; 6
+    ld   a, (_spec_mask)    ;13
+    ld   (hl), a            ; 7  spec_mask lo
+    inc  hl                 ; 6
+    ld   a, (_spec_mask+1)  ;13
+    ld   (hl), a            ; 7  spec_mask hi
+    inc  hl                 ; 6
+    ld   (_fb_wp), hl       ;16  advance write pointer
+    ;; spec_mask = 0
+    ld   hl, #0x0000        ;10
+    ld   (_spec_mask), hl   ;16
+    ret                     ;10  total: 153 T
+    __endasm;
+    (void)val;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * asm_emit_opl_b0 — emit CMD_WRITE_B0 + tail-call spectrum_opl_b0
+ *
+ * Reads fb_b1, fb_b2 (set by prior asm_read_2bytes).
+ * Writes [CMD_WRITE_B0, reg, val, x] to fb_wp, advances fb_wp += 4.
+ * Tail-calls spectrum_opl_b0(A=reg, L=val) — its RET returns to caller.
+ *
+ * Cost: ~128 T body + 17 call + 10 jp = 155 T total.
+ * Was ~223 T (SDCC codegen): saves ~68 T per OPL Bank0 write.
+ * ───────────────────────────────────────────────────────────────────── */
+static void asm_emit_opl_b0(void) __naked {
+    __asm
+    ld   hl, (_fb_wp)      ;16
+    ld   (hl), #0x40       ;10  CMD_WRITE_B0
+    inc  hl                ; 6
+    ld   a, (_fb_b1)       ;13
+    ld   d, a              ; 4  save reg
+    ld   (hl), a           ; 7  [1] = reg
+    inc  hl                ; 6
+    ld   a, (_fb_b2)       ;13
+    ld   (hl), a           ; 7  [2] = val
+    inc  hl                ; 6
+    inc  hl                ; 6  skip [3] padding
+    ld   (_fb_wp), hl      ;16  fb_wp += 4
+    ld   l, a              ; 4  L = val (fb_b2 still in A)
+    ld   a, d              ; 4  A = reg (fb_b1)
+    jp   _spectrum_opl_b0  ;10  tail-call
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * asm_emit_opl_b1 — emit CMD_WRITE_B1 + tail-call spectrum_opl_b1
+ * Same pattern as asm_emit_opl_b0 but for OPL3 Bank 1.
+ * ───────────────────────────────────────────────────────────────────── */
+static void asm_emit_opl_b1(void) __naked {
+    __asm
+    ld   hl, (_fb_wp)      ;16
+    ld   (hl), #0x80       ;10  CMD_WRITE_B1
+    inc  hl                ; 6
+    ld   a, (_fb_b1)       ;13
+    ld   d, a              ; 4
+    ld   (hl), a           ; 7
+    inc  hl                ; 6
+    ld   a, (_fb_b2)       ;13
+    ld   (hl), a           ; 7
+    inc  hl                ; 6
+    inc  hl                ; 6
+    ld   (_fb_wp), hl      ;16
+    ld   l, a              ; 4
+    ld   a, d              ; 4
+    jp   _spectrum_opl_b1  ;10  tail-call
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * emit_wait — вставить паузу tk тиков (ISR)
  *
  * Использует два механизма паузы:
@@ -605,19 +694,9 @@ static void emit_wait(uint16_t tk)
                 fb_wp[1] = (uint8_t)(fb_w - 1);
                 fb_wp[2] = (uint8_t)((fb_w - 1) >> 8);
                 fb_wp += 4;
-                fb_wp[0] = CMD_SKIP_TICKS;
-                fb_wp[1] = ISR_TICKS_PER_FRAME - 1;
-                fb_wp[2] = (uint8_t)spec_mask;
-                fb_wp[3] = (uint8_t)(spec_mask >> 8);
-                spec_mask = 0;
-                fb_wp += 4;
+                asm_emit_skip_spec(ISR_TICKS_PER_FRAME - 1);
             } else if (fb_w >= 1) {
-                fb_wp[0] = CMD_SKIP_TICKS;
-                fb_wp[1] = (uint8_t)(fb_w - 1);
-                fb_wp[2] = (uint8_t)spec_mask;
-                fb_wp[3] = (uint8_t)(spec_mask >> 8);
-                spec_mask = 0;
-                fb_wp += 4;
+                asm_emit_skip_spec((uint8_t)(fb_w - 1));
             }
             /* CMD_INC_SEC */
             fb_wp[0] = CMD_INC_SEC;
@@ -640,12 +719,7 @@ static void emit_wait(uint16_t tk)
             tk = ISR_TICKS_PER_FRAME;
         }
         /* Последние ≤ISR_TICKS_PER_FRAME тиков через SKIP (экономия CPU) */
-        fb_wp[0] = CMD_SKIP_TICKS;
-        fb_wp[1] = (uint8_t)(tk - 1);
-        fb_wp[2] = (uint8_t)spec_mask;
-        fb_wp[3] = (uint8_t)(spec_mask >> 8);
-        spec_mask = 0;
-        fb_wp += 4;
+        asm_emit_skip_spec((uint8_t)(tk - 1));
         vgm_sec_budget -= tk;
         tk = 0;
     }
@@ -673,6 +747,7 @@ void vgm_fill_buffer(uint8_t buf_idx)
 {
     fb_buf = buf_idx ? cmd_buf_b : cmd_buf_a;
     fb_wp  = fb_buf;
+    fb_end = fb_buf + (CMD_BUF_SIZE - 48);
 
     /* Пауза — заполнить тишиной */
     if (vgm_paused) {
@@ -766,7 +841,7 @@ next_hl:
      * Горячий цикл — разбор VGM-опкодов → ISR-команды
      * EOF-проверка удалена (гарантирован 0x66-сентинел в данных).
      * ═══════════════════════════════════════════════════════════════ */
-    while (fb_wp < fb_buf + (CMD_BUF_SIZE - 48)) // зазор 48 байт для emit_wait (макс. 32 байта) + CMD_END_BUF (4 байта) + safety
+    while (fb_wp < fb_end) // зазор 48 байт для emit_wait (макс. 32 байта) + CMD_END_BUF (4 байта) + safety
     {
         /* ── Читаем опкод ──────────────────────────────────────── */
         fb_op = asm_read_byte();
@@ -775,83 +850,22 @@ next_hl:
         if (fb_op == 0x5A)
         {
             asm_read_2bytes();
-            fb_wp[0] = CMD_WRITE_B0;
-            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
-            fb_wp += 4;
-            spectrum_opl_b0(fb_b1, fb_b2);
+            asm_emit_opl_b0();
             goto do_budget;
         }
 
         /* ═══════ Frame wait 1/60 (0x62) ═══════ */
         if (fb_op == 0x62)
-        {
-            fb_t = fb_wacc + 735u;
-            asm_shift_mask();
-            if (fb_tk) // оптимизация для коротких пауз 1-12 мс (типично для 60 FPS)
-            {
-                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) // CMD_SKIP_TICKS для коротких пауз (экономия CPU), иначе обычная пауза с emit_wait
-                {
-                    fb_wp[0] = CMD_SKIP_TICKS;
-                    fb_wp[1] = (uint8_t)(fb_tk - 1);
-                    fb_wp[2] = (uint8_t)spec_mask;
-                    fb_wp[3] = (uint8_t)(spec_mask >> 8);
-                    spec_mask = 0;
-                    fb_wp += 4;
-                    vgm_sec_budget -= fb_tk;
-                } else {
-                    emit_wait(fb_tk);
-                }
-                fb_budget = VGM_FILL_CMD_BUDGET;
-            }
-            continue;
-        }
+        { fb_t = fb_wacc + 735u; goto do_wait_shift; }
 
         /* ═══════ Frame wait 1/50 (0x63) ═══════ */
         if (fb_op == 0x63)
-        {
-            fb_t = fb_wacc + 882u;
-            asm_shift_mask();
-            if (fb_tk) // оптимизация для коротких пауз 1-12 мс (типично для 50 FPS)
-            {
-                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) // CMD_SKIP_TICKS для коротких пауз (экономия CPU), иначе обычная пауза с emit_wait
-                {
-                    fb_wp[0] = CMD_SKIP_TICKS;
-                    fb_wp[1] = (uint8_t)(fb_tk - 1);
-                    fb_wp[2] = (uint8_t)spec_mask;
-                    fb_wp[3] = (uint8_t)(spec_mask >> 8);
-                    spec_mask = 0;
-                    fb_wp += 4;
-                    vgm_sec_budget -= fb_tk;
-                } else {
-                    emit_wait(fb_tk);
-                }
-                fb_budget = VGM_FILL_CMD_BUDGET;
-            }
-            continue;
-        }
+        { fb_t = fb_wacc + 882u; goto do_wait_shift; }
 
         /* ═══════ Short wait 1-16 samples (0x70-0x7F) ═══════ */
 #ifndef VGM_NO_SHORT_WAITS
         if ((fb_op & 0xF0) == 0x70)
-        {
-            fb_t = fb_wacc + (uint16_t)((fb_op & 0x0Fu) + 1u);
-            asm_shift_mask();
-            if (fb_tk) {
-                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
-                    fb_wp[0] = CMD_SKIP_TICKS;
-                    fb_wp[1] = (uint8_t)(fb_tk - 1);
-                    fb_wp[2] = (uint8_t)spec_mask;
-                    fb_wp[3] = (uint8_t)(spec_mask >> 8);
-                    spec_mask = 0;
-                    fb_wp += 4;
-                    vgm_sec_budget -= fb_tk;
-                } else {
-                    emit_wait(fb_tk);
-                }
-                fb_budget = VGM_FILL_CMD_BUDGET;
-            }
-            continue;
-        }
+        { fb_t = fb_wacc + (uint16_t)((fb_op & 0x0Fu) + 1u); goto do_wait_shift; }
 #else
         /* VGM_NO_SHORT_WAITS: пропуск коротких пауз 0x70-0x7F */
         if ((fb_op & 0xF0) == 0x70) continue;
@@ -864,31 +878,14 @@ next_hl:
             fb_t32 = (uint32_t)fb_wacc + ((uint16_t)fb_b1 | ((uint16_t)fb_b2 << 8));
             fb_tk  = (uint16_t)(fb_t32 >> VGM_SAMPLE_SHIFT);
             fb_wacc = (uint16_t)(fb_t32 & (uint32_t)VGM_SAMPLE_MASK);
-            if (fb_tk) {
-                if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
-                    fb_wp[0] = CMD_SKIP_TICKS;
-                    fb_wp[1] = (uint8_t)(fb_tk - 1);
-                    fb_wp[2] = (uint8_t)spec_mask;
-                    fb_wp[3] = (uint8_t)(spec_mask >> 8);
-                    spec_mask = 0;
-                    fb_wp += 4;
-                    vgm_sec_budget -= fb_tk;
-                } else {
-                    emit_wait(fb_tk);
-                }
-                fb_budget = VGM_FILL_CMD_BUDGET;
-            }
-            continue;
+            goto do_wait;
         }
 
         /* ═══════ OPL3 Bank 0 (0x5E) ═══════ */
         if (fb_op == 0x5E)
         {
             asm_read_2bytes();
-            fb_wp[0] = CMD_WRITE_B0;
-            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
-            fb_wp += 4;
-            spectrum_opl_b0(fb_b1, fb_b2);
+            asm_emit_opl_b0();
             goto do_budget;
         }
 
@@ -896,10 +893,7 @@ next_hl:
         if (fb_op == 0x5B)
         {
             asm_read_2bytes();
-            fb_wp[0] = CMD_WRITE_B0;
-            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
-            fb_wp += 4;
-            spectrum_opl_b0(fb_b1, fb_b2);
+            asm_emit_opl_b0();
             goto do_budget;
         }
 
@@ -907,10 +901,7 @@ next_hl:
         if (fb_op == 0x5C)
         {
             asm_read_2bytes();
-            fb_wp[0] = CMD_WRITE_B0;
-            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
-            fb_wp += 4;
-            spectrum_opl_b0(fb_b1, fb_b2);
+            asm_emit_opl_b0();
             goto do_budget;
         }
 
@@ -918,10 +909,7 @@ next_hl:
         if (fb_op == 0x5F)
         {
             asm_read_2bytes();
-            fb_wp[0] = CMD_WRITE_B1;
-            fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
-            fb_wp += 4;
-            spectrum_opl_b1(fb_b1, fb_b2);
+            asm_emit_opl_b1();
             goto do_budget;
         }
 
@@ -1139,16 +1127,26 @@ next_hl:
         }
         continue;
 
+    /* ═══════ Shared wait post-processing (0x62/0x63/0x70-0x7F → shift+wait, 0x61 → wait only) ═══════ */
+    do_wait_shift:
+        asm_shift_mask();
+    do_wait:
+        if (fb_tk) {
+            if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
+                asm_emit_skip_spec((uint8_t)(fb_tk - 1));
+                vgm_sec_budget -= fb_tk;
+            } else {
+                emit_wait(fb_tk);
+            }
+            fb_budget = VGM_FILL_CMD_BUDGET;
+        }
+        continue;
+
     do_budget:
         if (--fb_budget == 0)
         {
             if (vgm_sec_budget > 1) {
-                fb_wp[0] = CMD_SKIP_TICKS;
-                fb_wp[1] = 0;
-                fb_wp[2] = (uint8_t)spec_mask;
-                fb_wp[3] = (uint8_t)(spec_mask >> 8);
-                spec_mask = 0;
-                fb_wp += 4;
+                asm_emit_skip_spec(0);
                 vgm_sec_budget--;
             } else {
                 emit_wait(1);
@@ -1170,12 +1168,7 @@ finish:
     /* Принудительная пауза перед CMD_END_BUF — гарантирует, что ISR
      * не обработает хвост этого буфера + голову следующего за один тик
      * (иначе пропуск INT-позиции и падение темпа в десятки раз).       */
-    fb_wp[0] = CMD_SKIP_TICKS;
-    fb_wp[1] = 0;
-    fb_wp[2] = (uint8_t)spec_mask;
-    fb_wp[3] = (uint8_t)(spec_mask >> 8);
-    spec_mask = 0;
-    fb_wp += 4;
+    asm_emit_skip_spec(0);
 
     fb_wp[0] = CMD_END_BUF;
 }

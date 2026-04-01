@@ -257,7 +257,7 @@ static uint8_t  s_pb_col;         /* current green column count            */
 uint16_t s_spec_char_ofs[4];  /* char offsets for 4 rows       */
 uint16_t s_spec_attr_ofs[4];  /* attr offsets for 4 rows       */
 
-/* spectrum_render/decay/reset/font() are in asm/spectrum.s */
+/* spectrum_render/font/decay() are in asm/spectrum.s */
 void spectrum_render(void);
 void spectrum_decay(void);
 void spectrum_decay_reset(void);
@@ -1057,8 +1057,8 @@ void main(void)
             s_spec_char_ofs[r] = a & 0x3FFF;
             s_spec_attr_ofs[r] = s_spec_char_ofs[r] | 0x0080;
         }
-        spectrum_decay_reset();
         spectrum_font_init();
+        spectrum_decay_reset();
     }
 
     /* Печатаем полную строку progress bar ОДИН РАЗ через WC API.
