@@ -22,10 +22,10 @@
 /* ── Маппинг VGM 44100→ISR тиков ─────────────────────────────────── */
 /* SHIFT = log2(44100/ISR_FREQ): 6@683, 5@1367, 4@2734                */
 #define VGM_SAMPLE_SHIFT      6
-#define VGM_SAMPLE_MASK       0x3Fu
+#define VGM_SAMPLE_MASK       0x3F
 
 /* ── Лимит команд между принудительными yield ──────────────────────── */
-#define VGM_FILL_CMD_BUDGET   32
+#define VGM_FILL_CMD_BUDGET   16
 
 /* ── Параметры pos_table (для build.bat → gen_pos_table.js) ──────── */
 #define VARIANT_POS_ENTRIES   14
@@ -33,6 +33,13 @@
 
 /* ── Адрес начала сегмента данных (для линковщика) ────────────────── */
 #define VARIANT_DATA_LOC      0xB600
+
+/* ── Спектроанализатор: скорости затухания (в TV-кадрах) ────────── */
+/* Меньше = быстрее затухание.  1 = каждый кадр (~20 мс).             */
+/* Синхронизировать с EQU в spectrum.s!                                */
+#define DECAY_FRAMES_FAST     2   /* уровни >= 6                      */
+#define DECAY_FRAMES_MED      3   /* уровни 3-5                       */
+#define DECAY_FRAMES_SLOW     5   /* уровни 1-2                       */
 
 /* ── Отключение обработки коротких пауз 0x70-0x7F ────────────────── */
 /* Раскомментировать для «no short waits» варианта:                    */

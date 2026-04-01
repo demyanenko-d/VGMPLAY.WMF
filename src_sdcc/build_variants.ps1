@@ -24,9 +24,9 @@ $cfgFile  = "$root\inc\variant_cfg.h"
 # ISR_FREQ = 3 500 000 / Step;  Entries = 71 680 / Step;  TPF = Entries
 # Shift = log2(44100 / Freq) rounded down
 $freqTiers = @{
-  '2734' = @{ Tag='';   Freq=2734; Step=1280; Entries=56; Shift=4; Mask='0x0Fu'; TPF=56;  Budgets=@(8,16)     }
-  '1367' = @{ Tag='hf'; Freq=1367; Step=2560; Entries=28; Shift=5; Mask='0x1Fu'; TPF=28;  Budgets=@(8,16,32)  }
-  '683'  = @{ Tag='qf'; Freq=683;  Step=5120; Entries=14; Shift=6; Mask='0x3Fu'; TPF=14;  Budgets=@(16,32,64) }
+  '2734' = @{ Tag='';   Freq=2734; Step=1280; Entries=56; Shift=4; Mask='0x0F'; TPF=56;  Budgets=@(8,16)     }
+  '1367' = @{ Tag='hf'; Freq=1367; Step=2560; Entries=28; Shift=5; Mask='0x1F'; TPF=28;  Budgets=@(8,16,32)  }
+  '683'  = @{ Tag='qf'; Freq=683;  Step=5120; Entries=14; Shift=6; Mask='0x3F'; TPF=14;  Budgets=@(16,32,64) }
 }
 
 # ── Generate variants: 2+3+3 = 8 base × 2 NS = 16 total ─────────────

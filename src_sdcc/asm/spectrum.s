@@ -50,10 +50,12 @@ CHAR_HALF    = 0x01      ; custom glyph: half-height striped bar
 CLR_WIN      = 0x70      ; WC_COLOR(WC_WHITE, WC_BLACK)
 WC_PAGE_FONT0 = 0x01     ; font page (TSConf page number)
 FONT_BASE     = 0xC000   ; page3 window base address
-ISR_TICKS_PER_FRAME = 14  ; ticks per display frame (from variant_cfg.h)
-DECAY_FAST  = 2           ; frames between decay for levels >= 6
-DECAY_MED   = 3           ; frames between decay for levels 3-5
-DECAY_SLOW  = 5          ; frames between decay for levels 1-2
+; ── Timing: must match variant_cfg.h ────────────────────────────────
+ISR_TICKS_PER_FRAME = 14  ; = ISR_TICKS_PER_FRAME in variant_cfg.h
+; ── Decay: must match DECAY_FRAMES_* in variant_cfg.h ────────────────
+DECAY_FAST  = 1           ; = DECAY_FRAMES_FAST
+DECAY_MED   = 2           ; = DECAY_FRAMES_MED
+DECAY_SLOW  = 4           ; = DECAY_FRAMES_SLOW
 
 ;======================================================================
 ; Scratch variables in _DATA (kept minimal)

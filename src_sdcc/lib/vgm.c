@@ -99,7 +99,8 @@ static uint8_t *fb_wp;     /* write pointer into cmd_buf                */
 static uint8_t *fb_rp;     /* VGM read pointer (#C000-#FFFF)           */
 static uint8_t  fb_cpg;    /* local copy of vgm_cur_page               */
 static uint8_t  fb_budget; /* commands until forced yield               */
-static uint16_t fb_wacc;   /* wait accumulator (0..31)                  */
+static uint8_t  fb_yield_ticks; /* ticks consumed by budget yields      */
+static uint16_t fb_wacc;   /* wait accumulator (0..VGM_SAMPLE_MASK)     */
 static uint8_t  fb_op;     /* current VGM opcode                       */
 static uint8_t  fb_b1;     /* operand byte 1                           */
 static uint8_t  fb_b2;     /* operand byte 2                           */
@@ -461,19 +462,37 @@ static void asm_wait_62(void) __naked {
 _asm_wait_common:
     ld   hl, (_fb_wacc)      ;16T
     add  hl, de              ;11T  max 63+882=945=0x03B1, CF=0
-    ;; fb_wacc = L & 0x3F
+    ;; fb_wacc = L & VGM_SAMPLE_MASK
     ld   a, l                ; 4T
-    and  a, #0x3F            ; 7T
+    and  a, #VGM_SAMPLE_MASK ; 7T
     ld   (_fb_wacc), a       ;13T
-    ;; fb_tk = HL >> 6  via  H<<2 | L>>6
+    ;; fb_tk = HL >> VGM_SAMPLE_SHIFT  via  H<<(8-SHIFT) | L>>(SHIFT)
     ld   a, h                ; 4T
-    add  a, a                ; 4T
-    add  a, a                ; 4T
-    ld   b, a                ; 4T  B = H<<2
+    add  a, a                ; 4T  <<1
+    add  a, a                ; 4T  <<2
+#if VGM_SAMPLE_SHIFT < 6
+    add  a, a                ; 4T  <<3
+#endif
+#if VGM_SAMPLE_SHIFT < 5
+    add  a, a                ; 4T  <<4
+#endif
+    ld   b, a                ; 4T  B = H<<(8-SHIFT)
     ld   a, l                ; 4T
     rlca                     ; 4T
     rlca                     ; 4T
-    and  a, #0x03            ; 7T  A = L>>6
+#if VGM_SAMPLE_SHIFT < 6
+    rlca                     ; 4T
+#endif
+#if VGM_SAMPLE_SHIFT < 5
+    rlca                     ; 4T
+#endif
+#if VGM_SAMPLE_SHIFT == 6
+    and  a, #0x03            ; 7T  L>>6
+#elif VGM_SAMPLE_SHIFT == 5
+    and  a, #0x07            ; 7T  L>>5
+#elif VGM_SAMPLE_SHIFT == 4
+    and  a, #0x0F            ; 7T  L>>4
+#endif
     or   a, b                ; 4T  A = fb_tk (max 14, fits u8)
     ld   (_fb_tk), a         ;13T
     xor  a, a                ; 4T
@@ -500,15 +519,27 @@ static void asm_short_wait(void) __naked {
     ld   d, #0                ; 7T  DE = addend
     ld   hl, (_fb_wacc)       ;16T
     add  hl, de               ;11T  max 79, CF=0, H=0
-    ;; fb_wacc = L & 0x3F
+    ;; fb_wacc = L & VGM_SAMPLE_MASK
     ld   a, l                 ; 4T
-    and  a, #0x3F             ; 7T
+    and  a, #VGM_SAMPLE_MASK  ; 7T
     ld   (_fb_wacc), a        ;13T
-    ;; fb_tk = L >> 6  (H guaranteed 0, result 0 or 1)
+    ;; fb_tk = L >> VGM_SAMPLE_SHIFT  (H guaranteed 0)
     ld   a, l                 ; 4T
     rlca                      ; 4T
     rlca                      ; 4T
+#if VGM_SAMPLE_SHIFT < 6
+    rlca                      ; 4T
+#endif
+#if VGM_SAMPLE_SHIFT < 5
+    rlca                      ; 4T
+#endif
+#if VGM_SAMPLE_SHIFT == 6
     and  a, #0x03             ; 7T
+#elif VGM_SAMPLE_SHIFT == 5
+    and  a, #0x07             ; 7T
+#elif VGM_SAMPLE_SHIFT == 4
+    and  a, #0x0F             ; 7T
+#endif
     ld   (_fb_tk), a          ;13T
     xor  a, a                 ; 4T
     ld   (_fb_tk+1), a        ;13T
@@ -534,38 +565,74 @@ static void asm_arb_wait(void) __naked {
     ld   h, a                 ; 4T
     ld   a, (_fb_b1)          ;13T
     ld   l, a                 ; 4T
-    ;; sum = fb_wacc + sample_count  (17-бит: CF:H:L)
+    ;; sum = fb_wacc + sample_count  (17-bit: CF:H:L)
     ld   de, (_fb_wacc)       ;20T
     add  hl, de               ;11T  CF = bit16
-    ;; Сохранить перенос в B  (ld не трогает флаги!)
+    ;; Save carry to B  (ld does not touch flags!)
     ld   b, #0                ; 7T
-    jr   nc, 80$              ;12/7T  обычно переноса нет
-    ld   b, #4                ; 7T   CF << 2 = 4
+    jr   nc, 80$              ;12/7T  usually no carry
+#if VGM_SAMPLE_SHIFT == 6
+    ld   b, #4                ; 7T   CF << (8-6) = CF<<2 = 4
+#elif VGM_SAMPLE_SHIFT == 5
+    ld   b, #8                ; 7T   CF << (8-5) = CF<<3 = 8
+#elif VGM_SAMPLE_SHIFT == 4
+    ld   b, #16               ; 7T   CF << (8-4) = CF<<4 = 16
+#endif
 80$:
-    ;; fb_wacc = L & 0x3F
+    ;; fb_wacc = L & VGM_SAMPLE_MASK
     ld   a, l                 ; 4T
-    and  a, #0x3F             ; 7T
+    and  a, #VGM_SAMPLE_MASK  ; 7T
     ld   (_fb_wacc), a        ;13T
     xor  a, a                 ; 4T
     ld   (_fb_wacc+1), a      ;13T
-    ;; fb_tk = (CF:H:L) >> 6  = (CF<<2|H>>6) : (H<<2|L>>6)
-    ;; low byte
+    ;; fb_tk = (CF:H:L) >> VGM_SAMPLE_SHIFT
+    ;; low byte: (H<<(8-SHIFT)) | (L>>SHIFT)
     ld   a, l                 ; 4T
     rlca                      ; 4T
     rlca                      ; 4T
-    and  a, #0x03             ; 7T  A = L>>6
+#if VGM_SAMPLE_SHIFT < 6
+    rlca                      ; 4T
+#endif
+#if VGM_SAMPLE_SHIFT < 5
+    rlca                      ; 4T
+#endif
+#if VGM_SAMPLE_SHIFT == 6
+    and  a, #0x03             ; 7T  L>>6
+#elif VGM_SAMPLE_SHIFT == 5
+    and  a, #0x07             ; 7T  L>>5
+#elif VGM_SAMPLE_SHIFT == 4
+    and  a, #0x0F             ; 7T  L>>4
+#endif
     ld   c, a                 ; 4T
     ld   a, h                 ; 4T
     rlca                      ; 4T
     rlca                      ; 4T
+#if VGM_SAMPLE_SHIFT < 6
+    rlca                      ; 4T
+#endif
+#if VGM_SAMPLE_SHIFT < 5
+    rlca                      ; 4T
+#endif
     ld   d, a                 ; 4T  D = rotated H
-    and  a, #0xFC             ; 7T  A = H<<2
-    or   a, c                 ; 4T  lo = (H<<2)|(L>>6)
+#if VGM_SAMPLE_SHIFT == 6
+    and  a, #0xFC             ; 7T  H<<2
+#elif VGM_SAMPLE_SHIFT == 5
+    and  a, #0xF8             ; 7T  H<<3
+#elif VGM_SAMPLE_SHIFT == 4
+    and  a, #0xF0             ; 7T  H<<4
+#endif
+    or   a, c                 ; 4T  lo = (H<<(8-SHIFT))|(L>>SHIFT)
     ld   l, a                 ; 4T
-    ;; high byte
+    ;; high byte: (CF<<(8-SHIFT)) | (H>>SHIFT)
     ld   a, d                 ; 4T  rotated H
-    and  a, #0x03             ; 7T  A = H>>6
-    or   a, b                 ; 4T  A = (CF<<2)|(H>>6)
+#if VGM_SAMPLE_SHIFT == 6
+    and  a, #0x03             ; 7T  H>>6
+#elif VGM_SAMPLE_SHIFT == 5
+    and  a, #0x07             ; 7T  H>>5
+#elif VGM_SAMPLE_SHIFT == 4
+    and  a, #0x0F             ; 7T  H>>4
+#endif
+    or   a, b                 ; 4T  + CF<<(8-SHIFT)
     ld   h, a                 ; 4T
     ld   (_fb_tk), hl         ;16T
     ret                       ;10T
@@ -581,13 +648,13 @@ static uint8_t asm_read_byte(void) __naked
 {
     __asm
     ld   hl, (_fb_rp)       ;16  load read pointer
-    ld   c, (hl)            ; 7  byte → C
+    ld   c, (hl)            ; 7  byte -> C
     inc  hl                 ; 6
     ld   a, h               ; 4
     or   a, l               ; 4  Z if HL wrapped to 0x0000
     jr   Z, 150$            ; 7  page-cross (rare)
     ld   (_fb_rp), hl       ;16  store updated pointer
-    ld   a, c               ; 4  result → A
+    ld   a, c               ; 4  result -> A
     ret                     ;10  fast-path 74 T
 150$:
     ld   hl, #_fb_cpg       ;10
@@ -598,13 +665,13 @@ static uint8_t asm_read_byte(void) __naked
     pop  bc                 ;10
     ld   hl, #0xC000        ;10
     ld   (_fb_rp), hl       ;16
-    ld   a, c               ; 4  result → A
+    ld   a, c               ; 4  result -> A
     ret                     ;10
     __endasm;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * asm_read_2bytes — read two consecutive bytes → fb_b1, fb_b2
+ * asm_read_2bytes — read two consecutive bytes -> fb_b1, fb_b2
  * Writes directly to statics.  Handles page-cross per byte.
  * Fast-path: 124 T  (+ call 17 = 141 T total)
  * ───────────────────────────────────────────────────────────────────── */
@@ -913,6 +980,7 @@ next_hl:
     }
 
     fb_budget = VGM_FILL_CMD_BUDGET;
+    fb_yield_ticks = 0;
 
     /* ═══════════════════════════════════════════════════════════════
      * Горячий цикл — разбор VGM-опкодов → ISR-команды
@@ -1190,6 +1258,14 @@ next_hl:
 
     /* ═══════ Wait post-processing (all wait paths set fb_tk and fb_wacc directly) ═══════ */
     do_wait:
+        /* Компенсация: бюджетные yield-ы уже потратили реальные ISR-тики.
+         * Вычитаем их из VGM-задержки, чтобы общий темп не замедлялся. */
+        if (fb_tk > fb_yield_ticks)
+            fb_tk -= fb_yield_ticks;
+        else
+            fb_tk = 0;
+        fb_yield_ticks = 0;
+
         if (fb_tk) {
             if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
                 asm_emit_skip_spec((uint8_t)(fb_tk - 1));
@@ -1207,6 +1283,7 @@ next_hl:
             if (vgm_sec_budget > 1) {
                 asm_emit_skip_spec(0);
                 vgm_sec_budget--;
+                fb_yield_ticks++;  /* запомнить: этот тик — накладной расход */
             } else {
                 emit_wait(1);
             }
