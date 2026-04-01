@@ -257,33 +257,12 @@ static uint8_t  s_pb_col;         /* current green column count            */
 uint16_t s_spec_char_ofs[4];  /* char offsets for 4 rows       */
 uint16_t s_spec_attr_ofs[4];  /* attr offsets for 4 rows       */
 
-/* spectrum_render() is in asm/spectrum.s */
+/* spectrum_render/decay/reset/font() are in asm/spectrum.s */
 void spectrum_render(void);
-
-static uint8_t s_spec_frame_ctr;  /* 0-4: counts frames until decay tick */
-static uint8_t s_spec_decay_tick; /* increments every 5 frames            */
-
-/* Non-linear decay (1 decay "tick" = 5 frames ≈ 100ms at 50Hz):
- *   level 8-7 : decay every tick    (5 frames  ≈ 100ms)
- *   level 6-4 : decay every 2 ticks (10 frames ≈ 200ms)
- *   level 3-1 : decay every 4 ticks (20 frames ≈ 400ms)           */
-static void spectrum_decay(void)
-{
-    if (++s_spec_frame_ctr < 5) return;
-    s_spec_frame_ctr = 0;
-    uint8_t tick = ++s_spec_decay_tick;
-    for (uint8_t i = 0; i < SPECTRUM_BARS; i++) {
-        uint8_t lev = spectrum_levels[i];
-        if (!lev) continue;
-        if (lev >= 7) {
-            spectrum_levels[i] = lev - 1;
-        } else if (lev >= 4) {
-            if (!(tick & 1)) spectrum_levels[i] = lev - 1;
-        } else {
-            if (!(tick & 3)) spectrum_levels[i] = lev - 1;
-        }
-    }
-}
+void spectrum_decay(void);
+void spectrum_decay_reset(void);
+void spectrum_font_init(void);
+void spectrum_font_restore(void);
 
 
 /* ── FSM-клавиатура (дебаунс без сжигания CPU) ───────────────────────
@@ -1078,8 +1057,8 @@ void main(void)
             s_spec_char_ofs[r] = a & 0x3FFF;
             s_spec_attr_ofs[r] = s_spec_char_ofs[r] | 0x0080;
         }
-        s_spec_frame_ctr = 0;
-        s_spec_decay_tick = 0;
+        spectrum_decay_reset();
+        spectrum_font_init();
     }
 
     /* Печатаем полную строку progress bar ОДИН РАЗ через WC API.
@@ -1150,5 +1129,6 @@ void main(void)
     }
 
     stop_playback();
+    spectrum_font_restore();
     wc_rresb(&s_wnd);
 }
