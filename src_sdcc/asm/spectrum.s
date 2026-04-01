@@ -52,8 +52,8 @@ WC_PAGE_FONT0 = 0x01     ; font page (TSConf page number)
 FONT_BASE     = 0xC000   ; page3 window base address
 ISR_TICKS_PER_FRAME = 14  ; ticks per display frame (from variant_cfg.h)
 DECAY_FAST  = 2           ; frames between decay for levels >= 6
-DECAY_MED   = 5           ; frames between decay for levels 3-5
-DECAY_SLOW  = 7          ; frames between decay for levels 1-2
+DECAY_MED   = 3           ; frames between decay for levels 3-5
+DECAY_SLOW  = 5          ; frames between decay for levels 1-2
 
 ;======================================================================
 ; Scratch variables in _DATA (kept minimal)

@@ -104,9 +104,8 @@ static uint8_t  fb_op;     /* current VGM opcode                       */
 static uint8_t  fb_b1;     /* operand byte 1                           */
 static uint8_t  fb_b2;     /* operand byte 2                           */
 static uint8_t  fb_is_vgm; /* 1 = VGM mega-buffer, 0 = cmdblk          */
-static uint16_t fb_t;      /* temp: wait accumulator + samples          */
 static uint16_t fb_tk;     /* temp: tick count for emit_wait            */
-static uint32_t fb_t32;    /* temp: 32-bit wait / data-block size       */
+static uint32_t fb_t32;    /* temp: 32-bit data-block size (0x67)       */
 static uint16_t fb_w;      /* temp: emit_wait split value               */
 static uint8_t  fb_n;      /* temp: skip byte count                    */
 static uint8_t *fb_end;    /* precomputed fb_buf + (CMD_BUF_SIZE - 48)  */
@@ -438,60 +437,138 @@ const char *vgm_chip_name(uint8_t id)
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * asm_shift_mask — быстрый 16-бит сдвиг вправо на VGM_SAMPLE_SHIFT
+ * asm_wait_63 / asm_wait_62 — добавляет 882/735 к fb_wacc, делает
+ * >> VGM_SAMPLE_SHIFT, пишет fb_tk и fb_wacc.
  *
- * Читает fb_t,  пишет fb_tk  = fb_t >> VGM_SAMPLE_SHIFT
- *                     fb_wacc = fb_t &  VGM_SAMPLE_MASK
- * Чистый ASM: ~122..146 T  vs  SDCC цикл ~370..514 T (3-4× быстрее).
- * Безопасно для fb_t ≤ 4095 (H ≤ 0x0F → H<<(8-N) вмещается в байт).
- * Clobbers: A, B, H, L.
+ * Заменяет цепочку: C-сложение → fb_t → asm_shift_mask.
+ * ~165 T (62) / ~175 T (63)  vs  ~246 T (C + shift_mask).
+ *
+ * VGM_SAMPLE_SHIFT = 6.  Максимальный результат: (63+882)>>6 = 14.
+ * Clobbers: A, B, D, E, H, L.
  * ───────────────────────────────────────────────────────────────────── */
-static void asm_shift_mask(void) __naked {
+static void asm_wait_62(void) __naked;
+static void asm_wait_63(void) __naked;
+
+static void asm_wait_63(void) __naked {
     __asm
-    ld  hl, (_fb_t)
-    ;; fb_wacc = fb_t & mask
-    ld  a, l
-#if VGM_SAMPLE_SHIFT == 6
-    and a, #0x3F
-#elif VGM_SAMPLE_SHIFT == 5
-    and a, #0x1F
-#elif VGM_SAMPLE_SHIFT == 4
-    and a, #0x0F
-#endif
-    ld  (_fb_wacc), a
-    ;; fb_tk = fb_t >> N  via  H<<(8-N) | L>>N
-    ld  a, h
-    add a, a
-    add a, a
-#if VGM_SAMPLE_SHIFT < 6
-    add a, a
-#endif
-#if VGM_SAMPLE_SHIFT < 5
-    add a, a
-#endif
-    ld  b, a
-    ld  a, l
-    rlca
-    rlca
-#if VGM_SAMPLE_SHIFT < 6
-    rlca
-#endif
-#if VGM_SAMPLE_SHIFT < 5
-    rlca
-#endif
-#if VGM_SAMPLE_SHIFT == 6
-    and a, #0x03
-#elif VGM_SAMPLE_SHIFT == 5
-    and a, #0x07
-#elif VGM_SAMPLE_SHIFT == 4
-    and a, #0x0F
-#endif
-    or  a, b
-    ld  (_fb_tk), a
-    xor a, a
-    ld  (_fb_tk+1), a
-    ld  (_fb_wacc+1), a
-    ret
+    ld   de, #882            ;10T
+    jp   _asm_wait_common    ;10T
+    __endasm;
+}
+static void asm_wait_62(void) __naked {
+    __asm
+    ld   de, #735            ;10T
+_asm_wait_common:
+    ld   hl, (_fb_wacc)      ;16T
+    add  hl, de              ;11T  max 63+882=945=0x03B1, CF=0
+    ;; fb_wacc = L & 0x3F
+    ld   a, l                ; 4T
+    and  a, #0x3F            ; 7T
+    ld   (_fb_wacc), a       ;13T
+    ;; fb_tk = HL >> 6  via  H<<2 | L>>6
+    ld   a, h                ; 4T
+    add  a, a                ; 4T
+    add  a, a                ; 4T
+    ld   b, a                ; 4T  B = H<<2
+    ld   a, l                ; 4T
+    rlca                     ; 4T
+    rlca                     ; 4T
+    and  a, #0x03            ; 7T  A = L>>6
+    or   a, b                ; 4T  A = fb_tk (max 14, fits u8)
+    ld   (_fb_tk), a         ;13T
+    xor  a, a                ; 4T
+    ld   (_fb_tk+1), a       ;13T
+    ld   (_fb_wacc+1), a     ;13T
+    ret                      ;10T
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * asm_short_wait — для 0x70-0x7F:  fb_wacc += (fb_op & 0x0F) + 1,
+ *                  >> VGM_SAMPLE_SHIFT, пишет fb_tk и fb_wacc.
+ *
+ * Максимум fb_wacc(63) + 16 = 79 → H=0, fb_tk = 0 или 1.
+ * ~175 T total  vs  ~304 T (C + shift_mask).
+ * Clobbers: A, D, E, H, L.
+ * ───────────────────────────────────────────────────────────────────── */
+static void asm_short_wait(void) __naked {
+    __asm
+    ld   a, (_fb_op)          ;13T
+    and  a, #0x0F             ; 7T
+    inc  a                    ; 4T  A = (op & 0x0F) + 1  (1..16)
+    ld   e, a                 ; 4T
+    ld   d, #0                ; 7T  DE = addend
+    ld   hl, (_fb_wacc)       ;16T
+    add  hl, de               ;11T  max 79, CF=0, H=0
+    ;; fb_wacc = L & 0x3F
+    ld   a, l                 ; 4T
+    and  a, #0x3F             ; 7T
+    ld   (_fb_wacc), a        ;13T
+    ;; fb_tk = L >> 6  (H guaranteed 0, result 0 or 1)
+    ld   a, l                 ; 4T
+    rlca                      ; 4T
+    rlca                      ; 4T
+    and  a, #0x03             ; 7T
+    ld   (_fb_tk), a          ;13T
+    xor  a, a                 ; 4T
+    ld   (_fb_tk+1), a        ;13T
+    ld   (_fb_wacc+1), a      ;13T
+    ret                       ;10T
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * asm_arb_wait — для 0x61:  fb_wacc += fb_b2:fb_b1 (16-бит),
+ *                >> VGM_SAMPLE_SHIFT (= 6) с учётом переноса (17-бит).
+ * Записывает fb_tk (max 1024), fb_wacc.
+ *
+ * ~236 T total  vs  SDCC 32-бит IX-frame + DJNZ ~725 T.  (3× быстрее)
+ *
+ * Вызывать ПОСЛЕ asm_read_2bytes() (fb_b1, fb_b2 уже прочитаны).
+ * Clobbers: A, B, C, D, E, H, L.
+ * ───────────────────────────────────────────────────────────────────── */
+static void asm_arb_wait(void) __naked {
+    __asm
+    ;; sample_count = fb_b2:fb_b1
+    ld   a, (_fb_b2)          ;13T
+    ld   h, a                 ; 4T
+    ld   a, (_fb_b1)          ;13T
+    ld   l, a                 ; 4T
+    ;; sum = fb_wacc + sample_count  (17-бит: CF:H:L)
+    ld   de, (_fb_wacc)       ;20T
+    add  hl, de               ;11T  CF = bit16
+    ;; Сохранить перенос в B  (ld не трогает флаги!)
+    ld   b, #0                ; 7T
+    jr   nc, 80$              ;12/7T  обычно переноса нет
+    ld   b, #4                ; 7T   CF << 2 = 4
+80$:
+    ;; fb_wacc = L & 0x3F
+    ld   a, l                 ; 4T
+    and  a, #0x3F             ; 7T
+    ld   (_fb_wacc), a        ;13T
+    xor  a, a                 ; 4T
+    ld   (_fb_wacc+1), a      ;13T
+    ;; fb_tk = (CF:H:L) >> 6  = (CF<<2|H>>6) : (H<<2|L>>6)
+    ;; low byte
+    ld   a, l                 ; 4T
+    rlca                      ; 4T
+    rlca                      ; 4T
+    and  a, #0x03             ; 7T  A = L>>6
+    ld   c, a                 ; 4T
+    ld   a, h                 ; 4T
+    rlca                      ; 4T
+    rlca                      ; 4T
+    ld   d, a                 ; 4T  D = rotated H
+    and  a, #0xFC             ; 7T  A = H<<2
+    or   a, c                 ; 4T  lo = (H<<2)|(L>>6)
+    ld   l, a                 ; 4T
+    ;; high byte
+    ld   a, d                 ; 4T  rotated H
+    and  a, #0x03             ; 7T  A = H>>6
+    or   a, b                 ; 4T  A = (CF<<2)|(H>>6)
+    ld   h, a                 ; 4T
+    ld   (_fb_tk), hl         ;16T
+    ret                       ;10T
     __endasm;
 }
 
@@ -854,18 +931,36 @@ next_hl:
             goto do_budget;
         }
 
+        /* ═══════ OPL3 Bank 1 (0x5F) ═══════ */
+        if (fb_op == 0x5F)
+        {
+            asm_read_2bytes();
+            asm_emit_opl_b1();
+            goto do_budget;
+        }
+
+        /* ═══════ OPL Bank 0: 0x5B(YM3526) / 0x5C(Y8950) / 0x5E(OPL3bk0) ═══════
+         * Range 0x5B..0x5E — одна проверка, все → bank0.
+         * 0x5D (YMZ280B) не поддерживается — если встретится, запись в bank0 безвредна. */
+        if ((uint8_t)(fb_op - 0x5B) <= (0x5E - 0x5B))
+        {
+            asm_read_2bytes();
+            asm_emit_opl_b0();
+            goto do_budget;
+        }
+
         /* ═══════ Frame wait 1/60 (0x62) ═══════ */
         if (fb_op == 0x62)
-        { fb_t = fb_wacc + 735u; goto do_wait_shift; }
+        { asm_wait_62(); goto do_wait; }
 
         /* ═══════ Frame wait 1/50 (0x63) ═══════ */
         if (fb_op == 0x63)
-        { fb_t = fb_wacc + 882u; goto do_wait_shift; }
+        { asm_wait_63(); goto do_wait; }
 
         /* ═══════ Short wait 1-16 samples (0x70-0x7F) ═══════ */
 #ifndef VGM_NO_SHORT_WAITS
         if ((fb_op & 0xF0) == 0x70)
-        { fb_t = fb_wacc + (uint16_t)((fb_op & 0x0Fu) + 1u); goto do_wait_shift; }
+        { asm_short_wait(); goto do_wait; }
 #else
         /* VGM_NO_SHORT_WAITS: пропуск коротких пауз 0x70-0x7F */
         if ((fb_op & 0xF0) == 0x70) continue;
@@ -875,42 +970,8 @@ next_hl:
         if (fb_op == 0x61)
         {
             asm_read_2bytes();
-            fb_t32 = (uint32_t)fb_wacc + ((uint16_t)fb_b1 | ((uint16_t)fb_b2 << 8));
-            fb_tk  = (uint16_t)(fb_t32 >> VGM_SAMPLE_SHIFT);
-            fb_wacc = (uint16_t)(fb_t32 & (uint32_t)VGM_SAMPLE_MASK);
+            asm_arb_wait();
             goto do_wait;
-        }
-
-        /* ═══════ OPL3 Bank 0 (0x5E) ═══════ */
-        if (fb_op == 0x5E)
-        {
-            asm_read_2bytes();
-            asm_emit_opl_b0();
-            goto do_budget;
-        }
-
-        /* ═══════ OPL1 (0x5B) ═══════ */
-        if (fb_op == 0x5B)
-        {
-            asm_read_2bytes();
-            asm_emit_opl_b0();
-            goto do_budget;
-        }
-
-        /* ═══════ Y8950 / MSX-AUDIO (0x5C) ═══════ */
-        if (fb_op == 0x5C)
-        {
-            asm_read_2bytes();
-            asm_emit_opl_b0();
-            goto do_budget;
-        }
-
-        /* ═══════ OPL3 Bank 1 (0x5F) ═══════ */
-        if (fb_op == 0x5F)
-        {
-            asm_read_2bytes();
-            asm_emit_opl_b1();
-            goto do_budget;
         }
 
         /* ═══════ YM2203 SSG+FM (0x55) ═══════ */
@@ -1127,9 +1188,7 @@ next_hl:
         }
         continue;
 
-    /* ═══════ Shared wait post-processing (0x62/0x63/0x70-0x7F → shift+wait, 0x61 → wait only) ═══════ */
-    do_wait_shift:
-        asm_shift_mask();
+    /* ═══════ Wait post-processing (all wait paths set fb_tk and fb_wacc directly) ═══════ */
     do_wait:
         if (fb_tk) {
             if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {

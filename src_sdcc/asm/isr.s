@@ -1,11 +1,5 @@
 ;==============================================================================
 ; @file   isr.s
-; @brief  ISR FRAME 2734 Hz + инициализация IM2 (на SDCC Z80)
-;
-; Частота: 3,500,000 / 1280 = 2734.375 Hz (~44100/16).
-; 56 INT x 1280 T = 71680 T = 1 TV-кадр (идеальное замыкание).
-;
-; Таблица позиций (pos_table.s): 56 x 5 байт = 280 байт.
 ; Формат записи: [VSINTH, VSINTL, HSINT, next_lo, next_hi]
 ; Читается тремя OUTI: BC=#24AF -> VSINTH, #23AF -> VSINTL, #22AF -> HSINT,
 ; затем читается next_ptr.
@@ -255,12 +249,17 @@ _isr_exec_cmd:
 _isr_cmd_loop:
         ld      a, (de)
         inc     de
-        ; Dispatch: 8 command types at 0x20 boundaries
-        ; Hot path first: OPL writes (most common for OPL files)
+        ; Dispatch: command types — hot path first
+        ; OPL Bank 0 writes (most common register writes)
         cp      #CMD_WRITE_B0
         jp      z, _isr_write_b0
+        ; ★ CMD_SKIP_TICKS — every ISR tick ends with this (promoted from #12)
+        cp      #CMD_SKIP_TICKS
+        jp      z, _isr_skip_ticks
+        ; OPL Bank 1 writes (OPL3 second bank)
         cp      #CMD_WRITE_B1
         jp      z, _isr_write_b1
+        ; Wait (long pauses, less common than SKIP_TICKS)
         cp      #CMD_WAIT
         jp      z, _isr_do_wait
         ; AY/SAA/end commands (less frequent per-interrupt)
@@ -272,7 +271,7 @@ _isr_cmd_loop:
         jp      z, _isr_write_saa
         cp      #CMD_WRITE_SAA2
         jp      z, _isr_write_saa2
-        ; Rare commands (before END_BUF fallthrough)
+        ; Rare commands
         cp      #CMD_END_BUF
         jp      z, _isr_do_end_buf
         cp      #CMD_ISR_DONE
@@ -281,8 +280,6 @@ _isr_cmd_loop:
         jp      z, _isr_inc_sec
         cp      #CMD_CALL_WC
         jp      z, _isr_call_wc
-        cp      #CMD_SKIP_TICKS
-        jp      z, _isr_skip_ticks
         ; Unknown command: skip 3 bytes, continue
         inc     de
         inc     de
