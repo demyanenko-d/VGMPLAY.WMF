@@ -5,7 +5,8 @@
 ;   spectrum_render()      — 4-row bar graph, direct VRAM write
 ;   spectrum_opl_b0(r,v)   — OPL B0-B8 key-on + 0xBD percussion
 ;   spectrum_opl_b1(r,v)   — OPL Bank1 B0-B6 key-on
-;   spectrum_ay(r,v,chip2) — AY period shadow + vol trigger + YM2203 FM
+;   spectrum_ay(r,v)       — AY period shadow + vol trigger + YM2203 FM (chip1)
+;   spectrum_ay2(r,v)      — same for chip2 (base offset = 3)
 ;   spectrum_saa(r,v)      — SAA octave shadow + amp trigger
 ;
 ; sdcccall(1) conventions:
@@ -24,6 +25,7 @@
         .globl  _spectrum_opl_b0
         .globl  _spectrum_opl_b1
         .globl  _spectrum_ay
+        .globl  _spectrum_ay2
         .globl  _spectrum_saa
         .globl  _spec_period_to_bar
         .globl  _spectrum_font_init
@@ -465,24 +467,23 @@ _set_spec_bit:
         ret
 
 ;======================================================================
-; spectrum_ay(reg, val, chip2)  — A=reg, L=val, stack+2=chip2
+; spectrum_ay(reg, val)  — A=reg, L=val  (chip1, base=0)
+; spectrum_ay2(reg, val) — A=reg, L=val  (chip2, base=3)
 ;
 ; AY: shadow tone period (regs 0-5), trigger bar on volume (regs 8-10)
 ; YM2203 FM: shadow block (0xA4-0xA6), key-on (0x28)
 ;======================================================================
+_spectrum_ay2::
+        ld      d, a                    ; D = reg
+        ld      e, l                    ; E = val
+        ld      a, #3
+        jr      say_base_set
+
 _spectrum_ay::
         ld      d, a                    ; D = reg
         ld      e, l                    ; E = val
-
-        ; Compute base = chip2 ? 3 : 0
-        ld      hl, #2
-        add     hl, sp
-        ld      a, (hl)                 ; A = chip2
-        or      a, a
-        ld      a, #0
-        jr      z, say_base0
-        ld      a, #3
-say_base0:
+        xor     a, a                    ; base = 0
+say_base_set:
         ld      (say_base), a           ; save base
 
         ; ── Check reg <= 5 (tone period shadow) ──

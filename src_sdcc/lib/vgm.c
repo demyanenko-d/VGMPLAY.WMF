@@ -124,7 +124,8 @@ static uint8_t  fb_reg;    /* temp: AY register (0xA0 handler)         */
  * All implementations in hand-optimised Z80 ASM for hot-loop speed. */
 extern void spectrum_opl_b0(uint8_t reg, uint8_t val);
 extern void spectrum_opl_b1(uint8_t reg, uint8_t val);
-extern void spectrum_ay(uint8_t reg, uint8_t val, uint8_t chip2);
+extern void spectrum_ay(uint8_t reg, uint8_t val);
+extern void spectrum_ay2(uint8_t reg, uint8_t val);
 extern void spectrum_saa(uint8_t reg, uint8_t val);
 
 
@@ -1046,7 +1047,7 @@ next_hl:
         if (fb_op == 0x55)
         {
             asm_read_2bytes();
-            spectrum_ay(fb_b1, fb_b2, 0);
+            spectrum_ay(fb_b1, fb_b2);
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             /* ── PSG tone period (reg 0x00-0x05): 12-bit, парами lo/hi ── */
@@ -1091,7 +1092,7 @@ next_hl:
         if (fb_op == 0xA5)
         {
             asm_read_2bytes();
-            spectrum_ay(fb_b1, fb_b2, 1);
+            spectrum_ay2(fb_b1, fb_b2);
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             if (fb_b1 <= 0x05) {
@@ -1129,7 +1130,10 @@ next_hl:
         if (fb_op == 0xA0)
         {
             asm_read_2bytes();
-            spectrum_ay(fb_b1 & 0x7F, fb_b2, (fb_b1 & 0x80) ? 1 : 0);
+            if (fb_b1 & 0x80)
+                spectrum_ay2(fb_b1 & 0x7F, fb_b2);
+            else
+                spectrum_ay(fb_b1 & 0x7F, fb_b2);
 #ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             fb_reg = fb_b1 & 0x7F;
