@@ -102,9 +102,13 @@ extern uint8_t vgm_freq_mode;
 /** Базовый адрес LUT таблицы в Window 0 (#0000-#3FFF).
  *  Используется в TABLE mode: freq_lut_base[period] → scaled period.
  *  NULL (0) если режим не TABLE.
- *  PSG: индекс 0..4095 (12-bit), FM: индекс 0..2047 (11-bit).
+ *  PSG: индекс 0..4095 (12-bit).
  *  Таблица в plugin page N, подключённой через wc_mng0_pl(N). */
 extern uint16_t *freq_lut_base;
+
+/** Clock (кГц) подобранной LUT таблицы (для отображения в UI).
+ *  0 если режим NATIVE. */
+extern uint16_t vgm_freq_lut_khz;
 
 /* ══════════════════════════════════════════════════════════════════════
  * ID чипов = смещение clock-поля в VGM-заголовке.

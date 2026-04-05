@@ -82,9 +82,6 @@ if errorlevel 1 ( echo FAIL pos_table.s && goto :err )
 call lib\wc_api\build_lib.bat >nul
 if errorlevel 1 ( echo FAIL wc_api.lib && goto :err )
 
-sdasz80 %ASFLAGS% build\opl3.rel    asm\opl3.s      >nul
-if errorlevel 1 ( echo FAIL opl3.s && goto :err )
-
 sdasz80 %ASFLAGS% build\txtlib.rel  asm\txtlib.s    >nul
 if errorlevel 1 ( echo FAIL txtlib.s && goto :err )
 
@@ -108,7 +105,6 @@ sdcc -mz80 --no-std-crt0 --out-fmt-ihx --code-loc 0x8000 --data-loc %DATA_LOC% ^
     build\isr.rel  ^
     build\pos_table.rel ^
     build\wc_api.lib ^
-    build\opl3.rel ^
     build\txtlib.rel ^
     build\inflate_call.rel ^
     build\spectrum.rel ^

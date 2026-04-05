@@ -7,24 +7,33 @@
 /* AY/YM2149: bypass |psg_khz - 1750| <= 35 */
 #define FREQ_LUT_HW_KHZ        1750u
 #define FREQ_LUT_BYPASS_TOL     35u  /* 2% */
-/* YM2203: bypass |psg_khz - 3500| <= 70 */
+/* YM2203: bypass |ym_khz - 3500| <= 70 */
 #define FREQ_LUT_HW_YM_KHZ     3500u
 #define FREQ_LUT_BYPASS_TOL_YM  70u  /* 2% */
 
 #define FREQ_LUT_AY_COUNT     6u
 #define FREQ_LUT_YM_COUNT     5u
-#define FREQ_LUT_ENTRIES      4096u   /* 12-bit PSG */
-#define FREQ_LUT_FM_MAX       2048u  /* 11-bit FM F-Number */
-#define FREQ_LUT_BYTES        8192u     /* per table */
+#define FREQ_LUT_PSG_ENTRIES  4096u   /* 12-bit PSG */
+#define FREQ_LUT_PSG_BYTES    8192u     /* per PSG table */
 
 typedef struct {
-    uint16_t clk_khz;   /* canonical PSG clock in kHz  */
+    uint16_t clk_khz;   /* canonical clock in kHz (PSG or YM master) */
     uint16_t tol_khz;   /* ±tolerance in kHz (5%)      */
     uint8_t  page;      /* plugin page (PAGE_BASE-based) */
-    uint16_t offset;    /* byte offset within page     */
+    uint16_t offset;    /* PSG table byte offset within page */
 } freq_lut_entry_t;
 
-/* AY/YM2149 table map (tolerance = 5% of canonical PSG clock) */
+/* FM F-Number scaling (YM2203): runtime дробные коэффициенты.
+ * FM ratio = srcYM2203 / HW_CLK_YM2203, decomposed as 1 ± mul/div.
+ * scaled_fnum = fnum ± (fnum × mul + div/2) / div */
+typedef struct {
+    uint8_t mul;   /* numerator of adjustment fraction   */
+    uint8_t div;   /* denominator                        */
+    uint8_t sub;   /* 1 = subtract (ratio<1), 0 = add   */
+} fm_frac_t;
+
+/* AY/YM2149 PSG table map (tolerance = 5% of canonical PSG clock)
+ * Layout: 2 ratios per page, PSG_A@0x0000, PSG_B@0x2000 */
 static const freq_lut_entry_t freq_lut_map_ay[FREQ_LUT_AY_COUNT] = {
     { 1790u,  90u, 1, 0x0000 },  /* NTSC_1790 */
     { 1500u,  75u, 1, 0x2000 },  /* 3MHz_1500 */
@@ -34,7 +43,7 @@ static const freq_lut_entry_t freq_lut_map_ay[FREQ_LUT_AY_COUNT] = {
     {  750u,  38u, 3, 0x2000 }   /* 1500_750 */
 };
 
-/* YM2203 table map (full master clock, same tables as AY) */
+/* YM2203 table map (full master clock, PSG table = same as AY entry) */
 static const freq_lut_entry_t freq_lut_map_ym[FREQ_LUT_YM_COUNT] = {
     { 3580u, 179u, 1, 0x0000 },  /* NTSC_1790 (YM2203@3580kHz) */
     { 3000u, 150u, 1, 0x2000 },  /* 3MHz_1500 (YM2203@3000kHz) */
@@ -43,32 +52,27 @@ static const freq_lut_entry_t freq_lut_map_ym[FREQ_LUT_YM_COUNT] = {
     { 1500u,  75u, 3, 0x2000 }   /* 1500_750 (YM2203@1500kHz) */
 };
 
+/* FM fraction table — indexed same as freq_lut_map_ym[].
+ * Runtime: scaled = fnum ± (fnum × mul + div/2) / div */
+static const fm_frac_t freq_lut_fm_frac[FREQ_LUT_YM_COUNT] = {
+    { 1, 44, 0 },  /* NTSC_1790: 1.022727 = 1+1/44 */
+    { 1,  7, 1 },  /* 3MHz_1500: 0.857143 = 1-1/7 */
+    { 1,  7, 0 },  /* 4MHz_2000: 1.142857 = 1+1/7 */
+    { 2,  7, 1 },  /* 1250: 0.714286 = 1-2/7 */
+    { 4,  7, 1 }   /* 1500_750: 0.428571 = 1-4/7 */
+};
+
 /*
  * Usage in vgm.c (parse_header):
  *
- *   uint16_t psg_khz = chip_clock / 1000;  // already have clock_khz
+ *   1. Bypass check: |clock_khz - HW| <= BYPASS_TOL → native
+ *   2. Find matching table → set page, PSG base = offset
+ *   3. For YM2203: also set fm_adj_{mul,div,sub} from fm_frac[j]
  *
- *   // 1. Bypass check
- *   uint16_t diff = (psg_khz > FREQ_LUT_HW_KHZ)
- *                  ? psg_khz - FREQ_LUT_HW_KHZ
- *                  : FREQ_LUT_HW_KHZ - psg_khz;
- *   if (diff <= FREQ_LUT_BYPASS_TOL) → no scaling needed
- *
- *   // 2. Find matching table (linear scan, 5 entries)
- *   for (i = 0; i < FREQ_LUT_COUNT; i++) {
- *       diff = abs16(psg_khz - freq_lut_map[i].clk_khz);
- *       if (diff <= freq_lut_map[i].tol_khz) {
- *           wc_mng0_pl(freq_lut_map[i].page);
- *           lut_base = (uint16_t *)freq_lut_map[i].offset;
- *           break;
- *       }
- *   }
- *
- *   // 3. No match → runtime generate into page 1
- *
- *   // Access: scaled_period = lut_base[original_period]
- *   //   PSG: full 12-bit index (0..4095)
- *   //   FM:  11-bit F-Number index (0..2047)
+ *   PSG: scaled_period = freq_lut_base[period_12bit]
+ *   FM:  adj = (fnum × mul + div/2) / div
+ *        scaled = sub ? fnum-adj : fnum+adj
+ *        if (scaled > 2047) block++, scaled >>= 1
  */
 
 #endif /* FREQ_LUT_MAP_H */

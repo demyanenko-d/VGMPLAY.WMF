@@ -1,28 +1,26 @@
 /**
- * gen_freq_tables.js — Генерация LUT таблиц масштабирования частот PSG/FM
+ * gen_freq_tables.js — Генерация LUT таблиц масштабирования частот PSG
  *
  * Использование:
  *   node scripts/gen_freq_tables.js [--binary <output.bin>] [--asm <output.s>] [--info]
  *
- * Таблица: 4096 entries × uint16_t LE = 8192 байт (8 КБ) на коэффициент.
+ * Каждая таблица: 4096 entries × uint16_t LE = 8192 байт (8 КБ).
  *
  * Покрывает:
- *   - PSG (AY/YM2149): 12-bit tone period (regs 0x00–0x05), 0..4095
- *   - PSG noise: 5-bit (reg 0x06), 0..31 — первые 32 записи
+ *   - AY/YM2149: 12-bit tone period (regs 0x00–0x05), 0..4095
+ *   - Noise: 5-bit (reg 0x06), 0..31 — первые 32 записи
  *
- * Формула: table[i] = round(i × f_target / f_source)
- *   Для PSG: f_source = VGM PSG clock, f_target = 1750000 Hz
- *   Период УМЕНЬШАЕТСЯ при target < source → частота сохраняется.
+ * Формула масштабирования PSG:
+ *   F = CLK / (16 × period)   → scaled = period × (target / source)
  *
- * FM F-Number масштабирование требует ОБРАТНОГО ratio (source/target)
- * и реализуется отдельно (TODO: shadow-регистры FM каналов).
+ * FM F-Number масштабирование (YM2203) требует ОБРАТНОГО ratio (source/target)
+ * и выполняется runtime через дробные коэффициенты (fm_frac_t в C-хедере).
  *
- * При использовании build-time подхода (6 таблиц в WMF):
- *   --binary freq_tables.bin  → 6 × 8 КБ = 48 КБ raw data
- *   Расположение: по 2 таблицы на 16 КБ страницу (3 доп. страницы)
+ * Layout: 2 ratios per 16 КБ page:
+ *   0x0000–0x1FFF : PSG таблица A (8 КБ)
+ *   0x2000–0x3FFF : PSG таблица B (8 КБ)
  *
- * При runtime генерации на Z80 (~300 мс):
- *   Этот скрипт используется для верификации / тестирования.
+ * Итого: 3 pages × 16 КБ = 48 КБ (3 доп. страницы)
  */
 
 'use strict';
@@ -42,11 +40,15 @@ const MATCH_TOLERANCE_PCT = 5.0;   /* % — порог совпадения та
 const BYPASS_PCT          = 2.0;   /* % — порог bypass (≈1:1)       */
 
 /* ── Предопределённые варианты VGM-клоков ─────────────────────────────
- * Для YM2203: PSG = fclk/2, FM = fclk
+ * Для YM2203: PSG (SSG) = fclk/2, FM = fclk
  * Для AY8910: PSG = fclk
  *
- * ratio = f_source_psg / HW_CLK_AY = f_source_ym2203 / HW_CLK_YM2203
- * (одинаков для PSG и FM части одного и того же чипа)
+ * PSG ratio = HW_CLK_AY / srcPsgHz  (target/source → period scaling)
+ * FM  ratio = srcYM2203 / HW_CLK_YM2203  (source/target → fnum scaling, INVERSE!)
+ *
+ * PSG ratio и FM ratio НЕ равны друг другу — нужны ОТДЕЛЬНЫЕ таблицы!
+ *   PSG: scaled_period = period × (HW_CLK_AY / srcPsgHz)
+ *   FM:  scaled_fnum   = fnum   × (srcYM2203 / HW_CLK_YM2203)
  *
  * Близкие частоты (≤ MATCH_TOLERANCE_PCT) объединяются:
  *   1996800 Hz ≈ 2000000 Hz (0.16%) → используют одну таблицу '4MHz_2000'
@@ -57,18 +59,21 @@ const RATIOS = [
         name: 'NTSC_1790',
         srcPsgHz:  1789773,  /* AY8910 @ 1789773 или YM2203 @ 3579545 (SSG=1789773) */
         srcYM2203: 3579545,
+        fm_mul: 1, fm_div: 44, fm_sub: 0,  /* 45/44 = 1+1/44 */
         desc: 'NTSC-derived (NES, many JP computers)',
     },
     {
         name: '3MHz_1500',
         srcPsgHz:  1500000,  /* AY8910 @ 1.5M или YM2203 @ 3M */
         srcYM2203: 3000000,
+        fm_mul: 1, fm_div: 7, fm_sub: 1,   /* 6/7 = 1-1/7 */
         desc: 'PC-88, MSX (3 MHz YM2203)',
     },
     {
         name: '4MHz_2000',
         srcPsgHz:  2000000,  /* AY8910 @ 2M или YM2203 @ 4M (≈1996800/3993600) */
         srcYM2203: 4000000,
+        fm_mul: 1, fm_div: 7, fm_sub: 0,   /* 8/7 = 1+1/7 */
         desc: 'Arcade boards (4 MHz YM2203, covers 3.9936 MHz)',
     },
     {
@@ -81,12 +86,14 @@ const RATIOS = [
         name: '1250',
         srcPsgHz:  1250000,
         srcYM2203: 2500000,
+        fm_mul: 2, fm_div: 7, fm_sub: 1,   /* 5/7 = 1-2/7 */
         desc: 'Some boards (1.25 MHz AY / 2.5 MHz YM2203)',
     },
     {
         name: '1500_750',
         srcPsgHz:   750000,  /* YM2203 @ 1.5M → SSG = 750 kHz */
         srcYM2203: 1500000,
+        fm_mul: 4, fm_div: 7, fm_sub: 1,   /* 3/7 = 1-4/7 */
         desc: 'Arcade/custom boards (1.5 MHz YM2203, SSG=750 kHz)',
     },
 ];
@@ -133,13 +140,16 @@ function matchTable(psgClkHz) {
 }
 
 const TABLE_ENTRIES = 4096;  /* 12-bit PSG range */
-const TABLE_BYTES  = TABLE_ENTRIES * 2;  /* uint16_t LE */
+const TABLE_BYTES  = TABLE_ENTRIES * 2;  /* uint16_t LE = 8 КБ */
 const PAGE_SIZE    = 16384;  /* 16 КБ */
 
-/* ── Генерация одной таблицы ─────────────────────────────────────────── */
+/* ── Генерация PSG таблицы ───────────────────────────────────────────
+ * ratio = target / source (period scales up/down to preserve frequency)
+ * PSG: F = CLK / (16 × period)  →  scaled_period = period × (target/source)
+ */
 function generateTable(srcPsgHz, targetHz) {
     const buf = Buffer.alloc(TABLE_BYTES);
-    const ratio = targetHz / srcPsgHz;  /* PSG: period shrinks when target < source */
+    const ratio = targetHz / srcPsgHz;
 
     for (let i = 0; i < TABLE_ENTRIES; i++) {
         let scaled = Math.round(i * ratio);
@@ -153,39 +163,37 @@ function generateTable(srcPsgHz, targetHz) {
 /* ── Вывод информации о таблицах ─────────────────────────────────────── */
 function printInfo() {
     console.log('=== Frequency Scale LUT Tables ===');
-    console.log(`Target PSG: ${HW_CLK_AY} Hz, Target FM: ${HW_CLK_YM2203} Hz`);
-    console.log(`Table: ${TABLE_ENTRIES} entries × 2 bytes = ${TABLE_BYTES} bytes per ratio`);
-    console.log(`Total: ${RATIOS.length} tables × ${TABLE_BYTES} = ${RATIOS.length * TABLE_BYTES} bytes`);
-    console.log(`Pages: ${Math.ceil(RATIOS.length * TABLE_BYTES / PAGE_SIZE)} × 16 КБ`);
-    console.log(`  (2 tables per page)`);
+    console.log(`Target PSG: ${HW_CLK_AY} Hz`);
+    console.log(`PSG table: ${TABLE_ENTRIES} entries × 2 bytes = ${TABLE_BYTES} bytes`);
+    console.log(`Layout: 2 ratios per 16 КБ page`);
+    console.log(`Total: ${Math.ceil(RATIOS.length / 2)} pages × 16 КБ = ${Math.ceil(RATIOS.length / 2) * PAGE_SIZE} bytes`);
     console.log('');
 
     for (let r = 0; r < RATIOS.length; r++) {
         const rt = RATIOS[r];
-        const ratio = HW_CLK_AY / rt.srcPsgHz;  /* same as generateTable: target/source */
-        const page  = Math.floor(r / 2) + PAGE_BASE; /* plugin page (PAGE_BASE = after code pages) */
-        const slot  = r % 2;                          /* 0 or 1 within page */
-        const base  = slot * TABLE_BYTES;           /* byte offset within page */
+        const psgRatio = HW_CLK_AY / rt.srcPsgHz;
+        const page  = Math.floor(r / 2) + PAGE_BASE;
+        const slot  = r % 2;
+        const offset = slot * TABLE_BYTES;
 
-        console.log(`[${r}] ${rt.name}: ${rt.srcPsgHz} Hz → ratio = ${ratio.toFixed(6)}`);
+        console.log(`[${r}] ${rt.name}: PSG ${rt.srcPsgHz} Hz → ratio = ${psgRatio.toFixed(6)}`);
         console.log(`    ${rt.desc}`);
-        console.log(`    Page ${page}, offset 0x${base.toString(16).toUpperCase()} (slot ${slot})`);
+        console.log(`    Page ${page}, slot ${slot} (offset 0x${offset.toString(16).toUpperCase()})`);
         if (rt.srcYM2203) {
-            console.log(`    FM: YM2203 @ ${rt.srcYM2203} Hz → same ratio`);
+            const fmRatio = rt.srcYM2203 / HW_CLK_YM2203;
+            console.log(`    FM: YM2203 @ ${rt.srcYM2203} Hz → fm_ratio = ${fmRatio.toFixed(6)} (runtime frac: ${rt.fm_sub ? '1-' : '1+'}${rt.fm_mul}/${rt.fm_div})`);
         }
 
         /* Проверка нескольких ключевых значений */
         const checks = [
             { name: 'PSG tone 440 Hz equiv', val: Math.round(rt.srcPsgHz / (16 * 440)) },
-            { name: 'FM F-Num mid',          val: 1024 },
             { name: 'PSG max 12-bit',        val: 4095 },
             { name: 'Noise max 5-bit',       val: 31 },
         ];
         for (const c of checks) {
             if (c.val >= TABLE_ENTRIES) continue;
-            const scaled = Math.round(c.val * ratio);
-            console.log(`    ${c.name}: ${c.val} → ${scaled}` +
-                        (c.val <= 2047 ? ` (FM OK: ${scaled <= 2047 ? 'fits' : 'overflow→block++' })` : ''));
+            const scaled = Math.round(c.val * psgRatio);
+            console.log(`    PSG ${c.name}: ${c.val} → ${scaled}`);
         }
         console.log('');
     }
@@ -229,19 +237,19 @@ function printInfo() {
         const khz = Math.round(RATIOS[r].srcPsgHz / 1000);
         const tol = Math.round(khz * MATCH_TOLERANCE_PCT / 100);
         const page = Math.floor(r / 2) + PAGE_BASE;
-        const off  = (r % 2) * TABLE_BYTES;
-        console.log(`  [${r}] ${RATIOS[r].name.padEnd(12)} ${khz} kHz ± ${tol} kHz  →  page ${page}, off 0x${off.toString(16).toUpperCase().padStart(4, '0')}`);
+        const slot = r % 2;
+        console.log(`  [${r}] ${RATIOS[r].name.padEnd(12)} ${khz} kHz ± ${tol} kHz  →  page ${page}, slot ${slot}`);
     }
 }
 
 /* ── Генерация бинарного файла ───────────────────────────────────────── *
- * Layout: N таблиц по 8 КБ, упакованных по 2 на 16 КБ страницу.
+ * Layout: 2 ratios per 16 КБ page.
  *
- *   Page 1: tables[0] (0x0000-0x1FFF) + tables[1] (0x2000-0x3FFF)
- *   Page 2: tables[2] (0x0000-0x1FFF) + tables[3] (0x2000-0x3FFF)
- *   Page 3: tables[4] (0x0000-0x1FFF) + padding
+ *   Page N+0: PSG[0] (0x0000-0x1FFF) + PSG[1] (0x2000-0x3FFF)
+ *   Page N+1: PSG[2] (0x0000-0x1FFF) + PSG[3] (0x2000-0x3FFF)
+ *   ...
  *
- * Итого: ceil(N/2) × 16 КБ
+ * Итого: ceil(RATIOS.length / 2) × 16 КБ
  */
 function generateBinary(outPath) {
     const numPages = Math.ceil(RATIOS.length / 2);
@@ -249,10 +257,11 @@ function generateBinary(outPath) {
     const out = Buffer.alloc(totalSize, 0x00);
 
     for (let r = 0; r < RATIOS.length; r++) {
-        const table = generateTable(RATIOS[r].srcPsgHz, HW_CLK_AY);
-        const pageIndex = Math.floor(r / 2);
+        const page = Math.floor(r / 2);
         const slot = r % 2;
-        const offset = pageIndex * PAGE_SIZE + slot * TABLE_BYTES;
+        const offset = page * PAGE_SIZE + slot * TABLE_BYTES;
+
+        const table = generateTable(RATIOS[r].srcPsgHz, HW_CLK_AY);
         table.copy(out, offset);
     }
 
@@ -264,8 +273,8 @@ function generateBinary(outPath) {
     console.log('// After determining VGM PSG clock, select table:');
     for (let r = 0; r < RATIOS.length; r++) {
         const page = Math.floor(r / 2) + PAGE_BASE;
-        const base = (r % 2) * TABLE_BYTES;
-        console.log(`//   ${RATIOS[r].srcPsgHz} Hz → wc_mng0_pl(${page}), lut_base = 0x${base.toString(16).padStart(4, '0')}`);
+        const offset = (r % 2) * TABLE_BYTES;
+        console.log(`//   ${RATIOS[r].srcPsgHz} Hz → wc_mng0_pl(${page}), offset = 0x${offset.toString(16)}`);
     }
 }
 
@@ -301,10 +310,13 @@ function generateAsm(outPath) {
  * Содержит таблицу {clk_khz, tol_khz, page, offset} для линейного
  * поиска ближайшей LUT при парсинге VGM заголовка.
  *
+ * Layout: 2 ratios per page — PSG_A@0x0000 (8 КБ) + PSG_B@0x2000 (8 КБ).
+ * FM масштабирование — runtime через fm_frac_t (дробные коэффициенты).
+ *
  * Алгоритм на Z80 (в vgm.c):
  *   1. bypass: |psg_khz - 1750| ≤ 35 → нет масштабирования
  *   2. Линейный поиск: |psg_khz - entry.clk_khz| ≤ entry.tol_khz → match
- *   3. Нет match → runtime generation (fallback num/den)
+ *   3. Нет match → native (без масштабирования)
  *
  * Все сравнения — 16 бит (uint16_t kHz), дёшево на Z80.
  */
@@ -321,38 +333,49 @@ function generateCHeader(outPath) {
     h += `/* AY/YM2149: bypass |psg_khz - ${Math.round(HW_CLK_AY/1000)}| <= ${Math.round(HW_CLK_AY/1000 * BYPASS_PCT / 100)} */\n`;
     h += `#define FREQ_LUT_HW_KHZ        ${Math.round(HW_CLK_AY/1000)}u\n`;
     h += `#define FREQ_LUT_BYPASS_TOL     ${Math.round(HW_CLK_AY/1000 * BYPASS_PCT / 100)}u  /* ${BYPASS_PCT}% */\n`;
-    h += `/* YM2203: bypass |psg_khz - ${Math.round(HW_CLK_YM2203/1000)}| <= ${Math.round(HW_CLK_YM2203/1000 * BYPASS_PCT / 100)} */\n`;
+    h += `/* YM2203: bypass |ym_khz - ${Math.round(HW_CLK_YM2203/1000)}| <= ${Math.round(HW_CLK_YM2203/1000 * BYPASS_PCT / 100)} */\n`;
     h += `#define FREQ_LUT_HW_YM_KHZ     ${Math.round(HW_CLK_YM2203/1000)}u\n`;
     h += `#define FREQ_LUT_BYPASS_TOL_YM  ${Math.round(HW_CLK_YM2203/1000 * BYPASS_PCT / 100)}u  /* ${BYPASS_PCT}% */\n\n`;
 
     h += `#define FREQ_LUT_AY_COUNT     ${RATIOS.length}u\n`;
     h += `#define FREQ_LUT_YM_COUNT     ${ymEntries.length}u\n`;
-    h += `#define FREQ_LUT_ENTRIES      ${TABLE_ENTRIES}u   /* 12-bit PSG */\n`;
-    h += `#define FREQ_LUT_FM_MAX       2048u  /* 11-bit FM F-Number */\n`;
-    h += `#define FREQ_LUT_BYTES        ${TABLE_BYTES}u     /* per table */\n\n`;
+    h += `#define FREQ_LUT_PSG_ENTRIES  ${TABLE_ENTRIES}u   /* 12-bit PSG */\n`;
+    h += `#define FREQ_LUT_PSG_BYTES    ${TABLE_BYTES}u     /* per PSG table */\n\n`;
 
     h += 'typedef struct {\n';
-    h += '    uint16_t clk_khz;   /* canonical PSG clock in kHz  */\n';
-    h += '    uint16_t tol_khz;   /* ±tolerance in kHz (5%)      */\n';
+    h += '    uint16_t clk_khz;   /* canonical clock in kHz (PSG or YM master) */\n';
+    h += '    uint16_t tol_khz;   /* \u00b1tolerance in kHz (5%)      */\n';
     h += '    uint8_t  page;      /* plugin page (PAGE_BASE-based) */\n';
-    h += '    uint16_t offset;    /* byte offset within page     */\n';
+    h += '    uint16_t offset;    /* PSG table byte offset within page */\n';
     h += '} freq_lut_entry_t;\n\n';
 
-    h += `/* AY/YM2149 table map (tolerance = ${MATCH_TOLERANCE_PCT}% of canonical PSG clock) */\n`;
+    /* FM fraction type for runtime FM F-Number scaling */
+    h += '/* FM F-Number scaling (YM2203): runtime \u0434\u0440\u043e\u0431\u043d\u044b\u0435 \u043a\u043e\u044d\u0444\u0444\u0438\u0446\u0438\u0435\u043d\u0442\u044b.\n';
+    h += ' * FM ratio = srcYM2203 / HW_CLK_YM2203, decomposed as 1 \u00b1 mul/div.\n';
+    h += ' * scaled_fnum = fnum \u00b1 (fnum \u00d7 mul + div/2) / div */\n';
+    h += 'typedef struct {\n';
+    h += '    uint8_t mul;   /* numerator of adjustment fraction   */\n';
+    h += '    uint8_t div;   /* denominator                        */\n';
+    h += '    uint8_t sub;   /* 1 = subtract (ratio<1), 0 = add   */\n';
+    h += '} fm_frac_t;\n\n';
+
+    /* AY map — PSG only */
+    h += `/* AY/YM2149 PSG table map (tolerance = ${MATCH_TOLERANCE_PCT}% of canonical PSG clock)\n`;
+    h += ` * Layout: 2 ratios per page, PSG_A@0x0000, PSG_B@0x${TABLE_BYTES.toString(16).toUpperCase()} */\n`;
     h += 'static const freq_lut_entry_t freq_lut_map_ay[FREQ_LUT_AY_COUNT] = {\n';
 
     for (let r = 0; r < RATIOS.length; r++) {
         const khz = Math.round(RATIOS[r].srcPsgHz / 1000);
         const tol = Math.round(khz * MATCH_TOLERANCE_PCT / 100);
         const page = Math.floor(r / 2) + PAGE_BASE;
-        const off  = (r % 2) * TABLE_BYTES;
+        const offset = (r % 2) * TABLE_BYTES;
         const comma = (r < RATIOS.length - 1) ? ',' : ' ';
-        h += `    { ${khz.toString().padStart(4)}u, ${tol.toString().padStart(3)}u, ${page}, 0x${off.toString(16).toUpperCase().padStart(4, '0')} }${comma}  /* ${RATIOS[r].name} */\n`;
+        h += `    { ${khz.toString().padStart(4)}u, ${tol.toString().padStart(3)}u, ${page}, 0x${offset.toString(16).toUpperCase().padStart(4, '0')} }${comma}  /* ${RATIOS[r].name} */\n`;
     }
     h += '};\n\n';
 
-    /* YM2203 map: full master clock → same table pages (ratio identical) */
-    h += `/* YM2203 table map (full master clock, same tables as AY) */\n`;
+    /* YM2203 map — uses same PSG table as AY, plus FM frac for runtime */
+    h += '/* YM2203 table map (full master clock, PSG table = same as AY entry) */\n';
     h += 'static const freq_lut_entry_t freq_lut_map_ym[FREQ_LUT_YM_COUNT] = {\n';
 
     let ymIdx = 0;
@@ -361,39 +384,41 @@ function generateCHeader(outPath) {
         const khz = Math.round(RATIOS[r].srcYM2203 / 1000);
         const tol = Math.round(khz * MATCH_TOLERANCE_PCT / 100);
         const page = Math.floor(r / 2) + PAGE_BASE;
-        const off  = (r % 2) * TABLE_BYTES;
+        const offset = (r % 2) * TABLE_BYTES;
         ymIdx++;
         const comma = (ymIdx < ymEntries.length) ? ',' : ' ';
-        h += `    { ${khz.toString().padStart(4)}u, ${tol.toString().padStart(3)}u, ${page}, 0x${off.toString(16).toUpperCase().padStart(4, '0')} }${comma}  /* ${RATIOS[r].name} (YM2203@${khz}kHz) */\n`;
+        h += `    { ${khz.toString().padStart(4)}u, ${tol.toString().padStart(3)}u, ${page}, 0x${offset.toString(16).toUpperCase().padStart(4, '0')} }${comma}  /* ${RATIOS[r].name} (YM2203@${khz}kHz) */\n`;
+    }
+    h += '};\n\n';
+
+    /* FM fraction table — indexed same as freq_lut_map_ym[] */
+    h += '/* FM fraction table \u2014 indexed same as freq_lut_map_ym[].\n';
+    h += ' * Runtime: scaled = fnum \u00b1 (fnum \u00d7 mul + div/2) / div */\n';
+    h += 'static const fm_frac_t freq_lut_fm_frac[FREQ_LUT_YM_COUNT] = {\n';
+
+    ymIdx = 0;
+    for (let r = 0; r < RATIOS.length; r++) {
+        if (!RATIOS[r].srcYM2203) continue;
+        const rt = RATIOS[r];
+        const fmRatio = rt.srcYM2203 / HW_CLK_YM2203;
+        ymIdx++;
+        const comma = (ymIdx < ymEntries.length) ? ',' : ' ';
+        const sign = rt.fm_sub ? '-' : '+';
+        h += `    { ${rt.fm_mul}, ${rt.fm_div.toString().padStart(2)}, ${rt.fm_sub} }${comma}  /* ${rt.name}: ${fmRatio.toFixed(6)} = 1${sign}${rt.fm_mul}/${rt.fm_div} */\n`;
     }
     h += '};\n\n';
 
     h += '/*\n';
     h += ' * Usage in vgm.c (parse_header):\n';
     h += ' *\n';
-    h += ' *   uint16_t psg_khz = chip_clock / 1000;  // already have clock_khz\n';
+    h += ' *   1. Bypass check: |clock_khz - HW| <= BYPASS_TOL \u2192 native\n';
+    h += ' *   2. Find matching table \u2192 set page, PSG base = offset\n';
+    h += ' *   3. For YM2203: also set fm_adj_{mul,div,sub} from fm_frac[j]\n';
     h += ' *\n';
-    h += ' *   // 1. Bypass check\n';
-    h += ' *   uint16_t diff = (psg_khz > FREQ_LUT_HW_KHZ)\n';
-    h += ' *                  ? psg_khz - FREQ_LUT_HW_KHZ\n';
-    h += ' *                  : FREQ_LUT_HW_KHZ - psg_khz;\n';
-    h += ' *   if (diff <= FREQ_LUT_BYPASS_TOL) → no scaling needed\n';
-    h += ' *\n';
-    h += ' *   // 2. Find matching table (linear scan, 5 entries)\n';
-    h += ' *   for (i = 0; i < FREQ_LUT_COUNT; i++) {\n';
-    h += ' *       diff = abs16(psg_khz - freq_lut_map[i].clk_khz);\n';
-    h += ' *       if (diff <= freq_lut_map[i].tol_khz) {\n';
-    h += ' *           wc_mng0_pl(freq_lut_map[i].page);\n';
-    h += ' *           lut_base = (uint16_t *)freq_lut_map[i].offset;\n';
-    h += ' *           break;\n';
-    h += ' *       }\n';
-    h += ' *   }\n';
-    h += ' *\n';
-    h += ' *   // 3. No match → runtime generate into page 1\n';
-    h += ' *\n';
-    h += ' *   // Access: scaled_period = lut_base[original_period]\n';
-    h += ' *   //   PSG: full 12-bit index (0..4095)\n';
-    h += ' *   //   FM:  11-bit F-Number index (0..2047)\n';
+    h += ' *   PSG: scaled_period = freq_lut_base[period_12bit]\n';
+    h += ' *   FM:  adj = (fnum \u00d7 mul + div/2) / div\n';
+    h += ' *        scaled = sub ? fnum-adj : fnum+adj\n';
+    h += ' *        if (scaled > 2047) block++, scaled >>= 1\n';
     h += ' */\n\n';
 
     h += '#endif /* FREQ_LUT_MAP_H */\n';

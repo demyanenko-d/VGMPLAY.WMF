@@ -77,12 +77,27 @@ uint8_t  spec_fm_block[6];     /* YM2203 FM block shadow: ch0-2(chip1/2)*/
 /* ── Масштабирование частот PSG/FM (только LUT) ─────────────────────── */
 uint8_t vgm_freq_mode;
 uint16_t *freq_lut_base;
+uint16_t vgm_freq_lut_khz;      /* clock (кГц) подобранной LUT таблицы  */
 static uint8_t freq_lut_page;   /* plugin page для Window 0 (LUT)       */
+
+/* FM fraction: runtime коэффициенты для FM F-Number scaling.
+ * scaled = fnum ± (fnum × fm_adj_mul + fm_adj_div/2) / fm_adj_div.
+ * fm_adj_div == 0 означает «нет FM scaling». */
+static uint8_t fm_adj_mul;
+static uint8_t fm_adj_div;
+static uint8_t fm_adj_sub;       /* 1 = subtract (ratio<1) */
 
 /* Shadow-регистры PSG: полный 12-бит tone period на канал.
  * Обновляются при записи lo/hi, используются для LUT lookup. */
 static uint16_t psg_shadow[3];   /* каналы 0,1,2 — chip 1 */
 static uint16_t psg_shadow2[3];  /* каналы 0,1,2 — chip 2 (0xA5) */
+
+/* Shadow-регистры FM: 11-бит F-Number + 3-бит block на канал.
+ * Обновляются при записи 0xA0-0xA2 (lo) / 0xA4-0xA6 (hi+block). */
+static uint16_t fm_fnum[3];     /* F-Number каналы 0,1,2 — chip 1 */
+static uint16_t fm_fnum2[3];    /* F-Number каналы 0,1,2 — chip 2 */
+static uint8_t  fm_block[3];    /* block каналы 0,1,2 — chip 1    */
+static uint8_t  fm_block2[3];   /* block каналы 0,1,2 — chip 2    */
 
 /* ── Бюджеты для вставки служебных ISR-команд ──────────────────────── */
 static uint16_t vgm_sec_budget = ISR_FREQ;  /* тиков до CMD_INC_SEC  */
@@ -282,15 +297,24 @@ uint8_t vgm_parse_header(void)
             vgm_chip_type = VGM_CHIP_OPL;
     }
 
-    /* ── Подбор LUT для пересчёта частот PSG ─────────────────────────
+    /* ── Подбор LUT для пересчёта частот PSG/FM ────────────────────────
      * YM2203: psg_khz = полный master clock → ищем в freq_lut_map_ym[]
      * AY8910: psg_khz = clock как есть      → ищем в freq_lut_map_ay[]
-     * Ratio одинаковый: HW_AY/AY_src = HW_YM/YM_src, таблицы общие. */
+     *
+     * PSG таблица в 16KB странице (2 per page, PSG_A@0x0000, PSG_B@0x2000).
+     * PSG ratio = target/source (period scaling).
+     * FM  ratio = source/target (F-Number scaling, ОБРАТНЫЙ!) — runtime frac. */
     vgm_freq_mode = FREQ_MODE_NATIVE;
     freq_lut_base = (uint16_t *)0;
     freq_lut_page = 0;
+    vgm_freq_lut_khz = 0;
+    fm_adj_mul = 0; fm_adj_div = 0; fm_adj_sub = 0;
     psg_shadow[0] = 0; psg_shadow[1] = 0; psg_shadow[2] = 0;
     psg_shadow2[0] = 0; psg_shadow2[1] = 0; psg_shadow2[2] = 0;
+    fm_fnum[0] = 0; fm_fnum[1] = 0; fm_fnum[2] = 0;
+    fm_fnum2[0] = 0; fm_fnum2[1] = 0; fm_fnum2[2] = 0;
+    fm_block[0] = 0; fm_block[1] = 0; fm_block[2] = 0;
+    fm_block2[0] = 0; fm_block2[1] = 0; fm_block2[2] = 0;
 
     for (i = 0; i < vgm_chip_count; i++) {
         uint16_t psg_khz;
@@ -298,6 +322,7 @@ uint8_t vgm_parse_header(void)
         uint16_t bypass_tol;
         const freq_lut_entry_t *lut_map;
         uint8_t lut_count;
+        uint8_t is_ym;
 
         if (vgm_chip_list[i].id == VGM_OFF_YM2203) {
             psg_khz    = vgm_chip_list[i].clock_khz;  /* полный master clock */
@@ -305,12 +330,14 @@ uint8_t vgm_parse_header(void)
             bypass_tol = FREQ_LUT_BYPASS_TOL_YM;       /* 70   */
             lut_map    = freq_lut_map_ym;
             lut_count  = FREQ_LUT_YM_COUNT;
+            is_ym      = 1;
         } else if (vgm_chip_list[i].id == VGM_OFF_AY8910) {
             psg_khz    = vgm_chip_list[i].clock_khz;
             hw_khz     = FREQ_LUT_HW_KHZ;              /* 1750 */
             bypass_tol = FREQ_LUT_BYPASS_TOL;           /* 35   */
             lut_map    = freq_lut_map_ay;
             lut_count  = FREQ_LUT_AY_COUNT;
+            is_ym      = 0;
         } else {
             continue;
         }
@@ -338,6 +365,13 @@ uint8_t vgm_parse_header(void)
                         freq_lut_page = lut_map[j].page;
                         wc_mng0_pl(freq_lut_page);
                         freq_lut_base = (uint16_t *)lut_map[j].offset;
+                        /* FM fraction: runtime коэффициенты для FM F-Number */
+                        if (is_ym) {
+                            fm_adj_mul = freq_lut_fm_frac[j].mul;
+                            fm_adj_div = freq_lut_fm_frac[j].div;
+                            fm_adj_sub = freq_lut_fm_frac[j].sub;
+                        }
+                        vgm_freq_lut_khz = lut_map[j].clk_khz;
                         vgm_freq_mode = FREQ_MODE_TABLE;
                         break;
                     }
@@ -1068,7 +1102,53 @@ next_hl:
             else if (fb_b1 == 0x06) {
                 fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
-            /* FM regs (>0x0D): без масштабирования (TODO: F-Number shadow) */
+            /* ── FM F-Number (regs 0xA0-0xA2 lo, 0xA4-0xA6 hi+block) ── */
+            else if (fm_adj_div && fb_b1 >= 0xA0 && fb_b1 <= 0xA6) {
+                uint8_t fmr = fb_b1 - 0xA0;  /* 0..6 */
+                if (fmr <= 2) {
+                    /* 0xA0-0xA2: F-Number low 8 bits */
+                    fb_ch = fmr;  /* ch 0,1,2 */
+                    fm_fnum[fb_ch] = (fm_fnum[fb_ch] & 0x0700) | fb_b2;
+                } else if (fmr >= 4) {
+                    /* 0xA4-0xA6: block[5:3] + fnum_hi[2:0] */
+                    fb_ch = fmr - 4;  /* ch 0,1,2 */
+                    fm_block[fb_ch] = (fb_b2 >> 3) & 0x07;
+                    fm_fnum[fb_ch] = (fm_fnum[fb_ch] & 0x00FF)
+                                   | ((uint16_t)(fb_b2 & 0x07) << 8);
+                } else {
+                    goto ym1_fm_passthru;  /* reg 0xA3 — не используется */
+                }
+                {
+                    /* FM runtime scaling: fnum ± (fnum × mul + div/2) / div */
+                    uint16_t fn = fm_fnum[fb_ch];
+                    uint16_t adj = ((uint16_t)(fn * fm_adj_mul)
+                                    + (fm_adj_div >> 1)) / fm_adj_div;
+                    uint16_t new_fnum;
+                    uint8_t blk = fm_block[fb_ch];
+                    if (fm_adj_sub) {
+                        new_fnum = fn - adj;
+                    } else {
+                        new_fnum = fn + adj;
+                        if (new_fnum > 0x7FF) {
+                            new_fnum = (new_fnum + 1) >> 1;
+                            if (new_fnum > 0x7FF) new_fnum = 0x7FF;
+                            blk++;
+                            if (blk > 7) blk = 7;
+                        }
+                    }
+                    /* Отправляем оба: 0xA4+ch (hi+block), затем 0xA0+ch (lo) */
+                    fb_wp[0] = CMD_WRITE_AY;
+                    fb_wp[1] = 0xA4 + fb_ch;
+                    fb_wp[2] = (blk << 3) | (uint8_t)((new_fnum >> 8) & 0x07);
+                    fb_wp += 4;
+                    fb_wp[0] = CMD_WRITE_AY;
+                    fb_wp[1] = 0xA0 + fb_ch;
+                    fb_wp[2] = (uint8_t)(new_fnum & 0xFF);
+                    fb_wp += 4;
+                    goto do_budget;
+                }
+            }
+ym1_fm_passthru:;
           }
             fb_wp[0] = CMD_WRITE_AY;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
@@ -1106,6 +1186,49 @@ next_hl:
             else if (fb_b1 == 0x06) {
                 fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
+            /* ── FM F-Number chip 2 (regs 0xA0-0xA2 lo, 0xA4-0xA6 hi+block) ── */
+            else if (fm_adj_div && fb_b1 >= 0xA0 && fb_b1 <= 0xA6) {
+                uint8_t fmr = fb_b1 - 0xA0;
+                if (fmr <= 2) {
+                    fb_ch = fmr;
+                    fm_fnum2[fb_ch] = (fm_fnum2[fb_ch] & 0x0700) | fb_b2;
+                } else if (fmr >= 4) {
+                    fb_ch = fmr - 4;
+                    fm_block2[fb_ch] = (fb_b2 >> 3) & 0x07;
+                    fm_fnum2[fb_ch] = (fm_fnum2[fb_ch] & 0x00FF)
+                                    | ((uint16_t)(fb_b2 & 0x07) << 8);
+                } else {
+                    goto ym2_fm_passthru;
+                }
+                {
+                    uint16_t fn = fm_fnum2[fb_ch];
+                    uint16_t adj = ((uint16_t)(fn * fm_adj_mul)
+                                    + (fm_adj_div >> 1)) / fm_adj_div;
+                    uint16_t new_fnum;
+                    uint8_t blk = fm_block2[fb_ch];
+                    if (fm_adj_sub) {
+                        new_fnum = fn - adj;
+                    } else {
+                        new_fnum = fn + adj;
+                        if (new_fnum > 0x7FF) {
+                            new_fnum = (new_fnum + 1) >> 1;
+                            if (new_fnum > 0x7FF) new_fnum = 0x7FF;
+                            blk++;
+                            if (blk > 7) blk = 7;
+                        }
+                    }
+                    fb_wp[0] = CMD_WRITE_AY2;
+                    fb_wp[1] = 0xA4 + fb_ch;
+                    fb_wp[2] = (blk << 3) | (uint8_t)((new_fnum >> 8) & 0x07);
+                    fb_wp += 4;
+                    fb_wp[0] = CMD_WRITE_AY2;
+                    fb_wp[1] = 0xA0 + fb_ch;
+                    fb_wp[2] = (uint8_t)(new_fnum & 0xFF);
+                    fb_wp += 4;
+                    goto do_budget;
+                }
+            }
+ym2_fm_passthru:;
           }
             fb_wp[0] = CMD_WRITE_AY2;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;

@@ -154,6 +154,10 @@ static void build_playback_queue(void)
                 (vgm_chip_type == VGM_CHIP_OPL3) ? CMDBLK_INIT_OPL3
                                                   : CMDBLK_INIT_OPL2);
     }
+    if (s_has_ym2203)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_YM2203);
+    if (s_has_ym2203_2)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_YM2203_2);
 
     /* Включить SAA clock через MultiSound ctrl перед воспроизведением.
      * CMDBLK_SAA_CLK_ON пишет 0xF3 в #FFFD через очередь ISR-команд,
@@ -496,11 +500,16 @@ uint8_t drow_ui(void)
     if (row <= ROW_VGM_END) {
         buf_clear(work_buf);
         buf_append_str(work_buf, "Loop        : ");
-        if (vgm_loop_addr)
+        if (vgm_loop_addr && vgm_loop_enabled)
             buf_append_str(work_buf, "Yes");
+        else if (vgm_loop_addr && !vgm_loop_enabled)
+            buf_append_str(work_buf, "Skip");
         else
             buf_append_str(work_buf, "No");
-        print_line(&s_wnd, row++, work_buf, CLR_WIN);
+        print_line(&s_wnd, row++, work_buf,
+            (vgm_loop_addr && !vgm_loop_enabled)
+                ? WC_COLOR(WC_YELLOW, WC_BLACK)
+                : CLR_WIN);
     }
 
     /* Информация о режиме частот */
@@ -508,7 +517,9 @@ uint8_t drow_ui(void)
         buf_clear(work_buf);
         buf_append_str(work_buf, "Freq        : ");
         if (vgm_freq_mode == FREQ_MODE_TABLE) {
-            buf_append_str(work_buf, "table");
+            buf_append_str(work_buf, "table ");
+            buf_append_u16_dec(work_buf, vgm_freq_lut_khz);
+            buf_append_str(work_buf, " kHz");
         } else {
             buf_append_str(work_buf, "native");
         }
