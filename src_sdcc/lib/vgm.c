@@ -397,9 +397,9 @@ uint8_t vgm_parse_header(void)
         }
     }
 
-    /* ── Total playback duration + loop policy ────────────────────────
-     * total_samples (0x18) = samples in entire file (before loop).
-     * loop_samples  (0x20) = samples in one loop iteration.
+    /* ── Общая длительность + политика лупа ───────────────────────────
+     * total_samples (0x18) = число сэмплов всего файла (до лупа).
+     * loop_samples  (0x20) = число сэмплов одной итерации лупа.
      *
      * Loop отключается если:
      *  1) loop_addr == 0 (нет лупа в файле)
@@ -1177,28 +1177,26 @@ next_hl:
                 fb_wp += 4;
                 goto do_budget;
             }
-            /* ── Noise period (reg 0x06): 5-bit ── */
+            /* ── Noise period (reg 0x06): 5-bit, clamp ── */
             else if (fb_b1 == 0x06) {
-                fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
+                fb_b2 = (uint8_t)freq_lut_base[fb_b2 & 0x1F];
+                if (fb_b2 > 31) fb_b2 = 31;
             }
             /* ── FM F-Number (regs 0xA0-0xA2 lo, 0xA4-0xA6 hi+block) ── */
             else if (fm_mul && fb_b1 >= 0xA0 && fb_b1 <= 0xA6) {
                 uint8_t fmr = fb_b1 - 0xA0;  /* 0..6 */
                 if (fmr <= 2) {
-                    /* 0xA0-0xA2: F-Number low 8 bits */
-                    fb_ch = fmr;  /* ch 0,1,2 */
+                    fb_ch = fmr;
                     fm_fnum[fb_ch] = (fm_fnum[fb_ch] & 0x0700) | fb_b2;
                 } else if (fmr >= 4) {
-                    /* 0xA4-0xA6: block[5:3] + fnum_hi[2:0] */
-                    fb_ch = fmr - 4;  /* ch 0,1,2 */
+                    fb_ch = fmr - 4;
                     fm_block[fb_ch] = (fb_b2 >> 3) & 0x07;
                     fm_fnum[fb_ch] = (fm_fnum[fb_ch] & 0x00FF)
                                    | ((uint16_t)(fb_b2 & 0x07) << 8);
                 } else {
-                    goto ym1_fm_passthru;  /* reg 0xA3 — не используется */
+                    goto ym1_fm_passthru;  /* 0xA3 */
                 }
                 {
-                    /* FM ASM scaling: fnum × fm_mul / 7 */
                     uint8_t blk = fm_block[fb_ch];
                     fb_scaled = fm_fnum[fb_ch];
                     asm_scale_fm();
@@ -1208,15 +1206,16 @@ next_hl:
                         blk++;
                         if (blk > 7) blk = 7;
                     }
-                    /* Отправляем оба: 0xA4+ch (hi+block), затем 0xA0+ch (lo) */
                     fb_wp[0] = CMD_WRITE_AY;
                     fb_wp[1] = 0xA4 + fb_ch;
                     fb_wp[2] = (blk << 3) | (uint8_t)((fb_scaled >> 8) & 0x07);
                     fb_wp += 4;
-                    fb_wp[0] = CMD_WRITE_AY;
-                    fb_wp[1] = 0xA0 + fb_ch;
-                    fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
-                    fb_wp += 4;
+                    if (fmr <= 2) {
+                        fb_wp[0] = CMD_WRITE_AY;
+                        fb_wp[1] = 0xA0 + fb_ch;
+                        fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
+                        fb_wp += 4;
+                    }
                     goto do_budget;
                 }
             }
@@ -1256,9 +1255,10 @@ ym1_fm_passthru:;
                 goto do_budget;
             }
             else if (fb_b1 == 0x06) {
-                fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
+                fb_b2 = (uint8_t)freq_lut_base[fb_b2 & 0x1F];
+                if (fb_b2 > 31) fb_b2 = 31;
             }
-            /* ── FM F-Number chip 2 (regs 0xA0-0xA2 lo, 0xA4-0xA6 hi+block) ── */
+            /* ── FM F-Number чип 2 (regs 0xA0-0xA6) ── */
             else if (fm_mul && fb_b1 >= 0xA0 && fb_b1 <= 0xA6) {
                 uint8_t fmr = fb_b1 - 0xA0;
                 if (fmr <= 2) {
@@ -1286,10 +1286,12 @@ ym1_fm_passthru:;
                     fb_wp[1] = 0xA4 + fb_ch;
                     fb_wp[2] = (blk << 3) | (uint8_t)((fb_scaled >> 8) & 0x07);
                     fb_wp += 4;
-                    fb_wp[0] = CMD_WRITE_AY2;
-                    fb_wp[1] = 0xA0 + fb_ch;
-                    fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
-                    fb_wp += 4;
+                    if (fmr <= 2) {
+                        fb_wp[0] = CMD_WRITE_AY2;
+                        fb_wp[1] = 0xA0 + fb_ch;
+                        fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
+                        fb_wp += 4;
+                    }
                     goto do_budget;
                 }
             }
@@ -1335,7 +1337,8 @@ ym2_fm_passthru:;
             }
             /* Noise period (reg 6) */
             else if (fb_reg == 0x06) {
-                fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
+                fb_b2 = (uint8_t)freq_lut_base[fb_b2 & 0x1F];
+                if (fb_b2 > 31) fb_b2 = 31;
             }
           }
 

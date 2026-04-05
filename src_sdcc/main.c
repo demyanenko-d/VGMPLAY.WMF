@@ -45,8 +45,8 @@ extern uint8_t  ifl_pb_green;
 static void border(uint8_t c) { sfr_zx_fe = c; }
 #endif
 
-/* ── Debug port trace (emulator "Illegal port!" log) ─────────────── */
-/* Define DBG_ENABLE to compile debug port output; disabled by default */
+/* ── Отладка через порт (emulator "Illegal port!" log) ────────────── */
+/* Включите DBG_ENABLE для отладочного вывода в порт; по умолчанию выкл */
 /* #define DBG_ENABLE */
 
 #ifdef DBG_ENABLE
@@ -209,16 +209,16 @@ static void build_playback_queue(void)
 static const char s_win_title[] = " VGM Player " APP_VERSION " ";
 
 /* ── Фиксированные строки окна (1-based content rows) ───────────────
- * Height=23 → interior rows 1..21, border rows 0 and 22.
- *   Row 1:      Title (blue)
- *   Rows 2-4:   File info section
- *   Rows 5-6:   (empty)
- *   Row 7:      ← divider 1 (from_bottom = 23-7 = 16)
- *   Rows 8-14:  VGM info section (ver, chips, loop, freq, GD3)
- *   Row 15:     ← divider 2 (from_bottom = 23-15 = 8)
- *   Row 16:     Progress bar
- *   Rows 17-20: Spectrum analyzer (4 rows)
- *   Row 21:     Help keys                                            */
+ * Высота=23 → строки контента 1..21, рамка 0 и 22.
+ *   Стр 1:      Заголовок
+ *   Стр 2-4:    Информация о файле
+ *   Стр 5-6:    (пусто)
+ *   Стр 7:      ← разделитель 1
+ *   Стр 8-14:   Информация VGM (ver, чипы, луп, freq, GD3)
+ *   Стр 15:     ← разделитель 2
+ *   Стр 16:     Прогресс-бар
+ *   Стр 17-20:  Спектро-анализатор (4 строки)
+ *   Стр 21:     Подсказки клавиш                                     */
 #define ROW_TITLE         1
 #define ROW_FILE_START    2
 #define ROW_VGM_START     6
@@ -425,7 +425,7 @@ uint8_t drow_ui(void)
     uint8_t row;
     uint8_t gd3_count = 0;
 
-    /* ── Section 1: File info (rows 1-3) ────────────────────────── */
+    /* ── Секция 1: Информация о файле (строки 1-3) ────────────── */
     row = ROW_FILE_START;
 
     buf_clear(work_buf);
@@ -451,7 +451,7 @@ uint8_t drow_ui(void)
     buf_append_u16_dec(work_buf, s_pages);
     print_line(&s_wnd, row, work_buf, CLR_WIN);
 
-    /* ── Section 2: VGM info (rows 5..ROW_VGM_END) ─────────────── */
+    /* ── Секция 2: Данные VGM (строки 5..ROW_VGM_END) ────────── */
     row = ROW_VGM_START;
 
     buf_clear(work_buf);
@@ -517,16 +517,14 @@ uint8_t drow_ui(void)
         buf_clear(work_buf);
         buf_append_str(work_buf, "Freq        : ");
         if (vgm_freq_mode == FREQ_MODE_TABLE) {
-            buf_append_str(work_buf, "table ");
-            buf_append_u16_dec(work_buf, vgm_freq_lut_khz);
-            buf_append_str(work_buf, " kHz");
+            buf_append_str(work_buf, "table");   /* таблица (CP866) */
         } else {
-            buf_append_str(work_buf, "native");
+            buf_append_str(work_buf, "native");              /* натив (CP866) */
         }
         print_line(&s_wnd, row++, work_buf,
             (vgm_freq_mode == FREQ_MODE_NATIVE)
                 ? CLR_WIN
-                : WC_COLOR(WC_WHITE, WC_GREEN));
+                : WC_COLOR(WC_WHITE, WC_BLUE));
     }
 
     /* ── GD3 метаданные (English, max 4) ──────────────────────────── */
@@ -559,7 +557,7 @@ uint8_t drow_ui(void)
         gd3_count++;
     }
 
-    /* ── Help line (fixed row) ──────────────────────────────────── */
+    /* ── Строка подсказок (фиксированная позиция) ─────────────── */
     buf_clear(work_buf);
     buf_append_str(work_buf, " [N]ext [P]rev [Q] Exit");
     print_line(&s_wnd, ROW_HELP, work_buf, CLR_TITLE);
@@ -693,7 +691,7 @@ void start_playback(void)
 {
     ints_disable();
 
-    /* Enable 512-byte cache for Window 2 (#8000-#BFFF).
+    /* Включение 512-байт кэша для Window 2 (#8000-#BFFF).
      * Ускоряет code fetch и доступ к static fb_* переменным.
      * ДОЛЖНО быть после inflate/load — DMA/page I/O испортят cache.
      * SysConfig bit 2 = global enable, CacheConfig bit 2 = win2.    */
