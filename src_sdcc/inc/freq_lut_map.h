@@ -23,15 +23,6 @@ typedef struct {
     uint16_t offset;    /* PSG table byte offset within page */
 } freq_lut_entry_t;
 
-/* FM F-Number scaling (YM2203): runtime дробные коэффициенты.
- * FM ratio = srcYM2203 / HW_CLK_YM2203, decomposed as 1 ± mul/div.
- * scaled_fnum = fnum ± (fnum × mul + div/2) / div */
-typedef struct {
-    uint8_t mul;   /* numerator of adjustment fraction   */
-    uint8_t div;   /* denominator                        */
-    uint8_t sub;   /* 1 = subtract (ratio<1), 0 = add   */
-} fm_frac_t;
-
 /* AY/YM2149 PSG table map (tolerance = 5% of canonical PSG clock)
  * Layout: 2 ratios per page, PSG_A@0x0000, PSG_B@0x2000 */
 static const freq_lut_entry_t freq_lut_map_ay[FREQ_LUT_AY_COUNT] = {
@@ -52,14 +43,15 @@ static const freq_lut_entry_t freq_lut_map_ym[FREQ_LUT_YM_COUNT] = {
     { 1500u,  75u, 3, 0x2000 }   /* 1500_750 (YM2203@1500kHz) */
 };
 
-/* FM fraction table — indexed same as freq_lut_map_ym[].
- * Runtime: scaled = fnum ± (fnum × mul + div/2) / div */
-static const fm_frac_t freq_lut_fm_frac[FREQ_LUT_YM_COUNT] = {
-    { 1, 44, 0 },  /* NTSC_1790: 1.022727 = 1+1/44 */
-    { 1,  7, 1 },  /* 3MHz_1500: 0.857143 = 1-1/7 */
-    { 1,  7, 0 },  /* 4MHz_2000: 1.142857 = 1+1/7 */
-    { 2,  7, 1 },  /* 1250: 0.714286 = 1-2/7 */
-    { 4,  7, 1 }   /* 1500_750: 0.428571 = 1-4/7 */
+/* FM F-Number множитель (YM2203): scaled = fnum × fm_mul / 7.
+ * 0 = bypass (масштабирование не нужно).
+ * ASM на Z80: умножение через shifts+adds, деление на 7 binary division */
+static const uint8_t freq_lut_fm_mul[FREQ_LUT_YM_COUNT] = {
+    0,  /* NTSC_1790: 1.022727 = bypass (2.3%) */
+    6,  /* 3MHz_1500: 0.857143 = ×6/7 */
+    8,  /* 4MHz_2000: 1.142857 = ×8/7 */
+    5,  /* 1250: 0.714286 = ×5/7 */
+    3   /* 1500_750: 0.428571 = ×3/7 */
 };
 
 /*
@@ -67,12 +59,11 @@ static const fm_frac_t freq_lut_fm_frac[FREQ_LUT_YM_COUNT] = {
  *
  *   1. Bypass check: |clock_khz - HW| <= BYPASS_TOL → native
  *   2. Find matching table → set page, PSG base = offset
- *   3. For YM2203: also set fm_adj_{mul,div,sub} from fm_frac[j]
+ *   3. For YM2203: fm_mul = freq_lut_fm_mul[j]
  *
  *   PSG: scaled_period = freq_lut_base[period_12bit]
- *   FM:  adj = (fnum × mul + div/2) / div
- *        scaled = sub ? fnum-adj : fnum+adj
- *        if (scaled > 2047) block++, scaled >>= 1
+ *   FM:  asm_scale_fm() : fb_scaled = fnum × fm_mul / 7
+ *        if (fb_scaled > 2047) block++, fb_scaled >>= 1
  */
 
 #endif /* FREQ_LUT_MAP_H */

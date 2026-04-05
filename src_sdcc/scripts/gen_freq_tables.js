@@ -50,6 +50,11 @@ const BYPASS_PCT          = 2.0;   /* % — порог bypass (≈1:1)       */
  *   PSG: scaled_period = period × (HW_CLK_AY / srcPsgHz)
  *   FM:  scaled_fnum   = fnum   × (srcYM2203 / HW_CLK_YM2203)
  *
+ * FM масштабирование: все используемые FM ratios сводятся к N/7,
+ * поэтому fm_scale хранит множитель N (0=bypass, 3, 5, 6, 8).
+ * В ASM на Z80: fnum × N через shifts+adds, затем /7 binary division.
+ * NTSC (45/44 ≈ 1.023) — bypass, погрешность 2.3% в рамках 5% допуска.
+ *
  * Близкие частоты (≤ MATCH_TOLERANCE_PCT) объединяются:
  *   1996800 Hz ≈ 2000000 Hz (0.16%) → используют одну таблицу '4MHz_2000'
  *   3993600 Hz ≈ 4000000 Hz (0.16%) → то же самое
@@ -59,21 +64,21 @@ const RATIOS = [
         name: 'NTSC_1790',
         srcPsgHz:  1789773,  /* AY8910 @ 1789773 или YM2203 @ 3579545 (SSG=1789773) */
         srcYM2203: 3579545,
-        fm_mul: 1, fm_div: 44, fm_sub: 0,  /* 45/44 = 1+1/44 */
+        fm_scale: 0,  /* 45/44 ≈ 1.023 — bypass (2.3% в рамках 5% допуска) */
         desc: 'NTSC-derived (NES, many JP computers)',
     },
     {
         name: '3MHz_1500',
         srcPsgHz:  1500000,  /* AY8910 @ 1.5M или YM2203 @ 3M */
         srcYM2203: 3000000,
-        fm_mul: 1, fm_div: 7, fm_sub: 1,   /* 6/7 = 1-1/7 */
+        fm_scale: 6,  /* 6/7 — fnum × 6 / 7 */
         desc: 'PC-88, MSX (3 MHz YM2203)',
     },
     {
         name: '4MHz_2000',
         srcPsgHz:  2000000,  /* AY8910 @ 2M или YM2203 @ 4M (≈1996800/3993600) */
         srcYM2203: 4000000,
-        fm_mul: 1, fm_div: 7, fm_sub: 0,   /* 8/7 = 1+1/7 */
+        fm_scale: 8,  /* 8/7 — fnum × 8 / 7 */
         desc: 'Arcade boards (4 MHz YM2203, covers 3.9936 MHz)',
     },
     {
@@ -86,14 +91,14 @@ const RATIOS = [
         name: '1250',
         srcPsgHz:  1250000,
         srcYM2203: 2500000,
-        fm_mul: 2, fm_div: 7, fm_sub: 1,   /* 5/7 = 1-2/7 */
+        fm_scale: 5,  /* 5/7 — fnum × 5 / 7 */
         desc: 'Some boards (1.25 MHz AY / 2.5 MHz YM2203)',
     },
     {
         name: '1500_750',
         srcPsgHz:   750000,  /* YM2203 @ 1.5M → SSG = 750 kHz */
         srcYM2203: 1500000,
-        fm_mul: 4, fm_div: 7, fm_sub: 1,   /* 3/7 = 1-4/7 */
+        fm_scale: 3,  /* 3/7 — fnum × 3 / 7 */
         desc: 'Arcade/custom boards (1.5 MHz YM2203, SSG=750 kHz)',
     },
 ];
@@ -181,7 +186,8 @@ function printInfo() {
         console.log(`    Page ${page}, slot ${slot} (offset 0x${offset.toString(16).toUpperCase()})`);
         if (rt.srcYM2203) {
             const fmRatio = rt.srcYM2203 / HW_CLK_YM2203;
-            console.log(`    FM: YM2203 @ ${rt.srcYM2203} Hz → fm_ratio = ${fmRatio.toFixed(6)} (runtime frac: ${rt.fm_sub ? '1-' : '1+'}${rt.fm_mul}/${rt.fm_div})`);
+            const fmDesc = rt.fm_scale ? `×${rt.fm_scale}/7` : 'bypass';
+            console.log(`    FM: YM2203 @ ${rt.srcYM2203} Hz → fm_ratio = ${fmRatio.toFixed(6)} (${fmDesc})`);
         }
 
         /* Проверка нескольких ключевых значений */
@@ -349,15 +355,7 @@ function generateCHeader(outPath) {
     h += '    uint16_t offset;    /* PSG table byte offset within page */\n';
     h += '} freq_lut_entry_t;\n\n';
 
-    /* FM fraction type for runtime FM F-Number scaling */
-    h += '/* FM F-Number scaling (YM2203): runtime \u0434\u0440\u043e\u0431\u043d\u044b\u0435 \u043a\u043e\u044d\u0444\u0444\u0438\u0446\u0438\u0435\u043d\u0442\u044b.\n';
-    h += ' * FM ratio = srcYM2203 / HW_CLK_YM2203, decomposed as 1 \u00b1 mul/div.\n';
-    h += ' * scaled_fnum = fnum \u00b1 (fnum \u00d7 mul + div/2) / div */\n';
-    h += 'typedef struct {\n';
-    h += '    uint8_t mul;   /* numerator of adjustment fraction   */\n';
-    h += '    uint8_t div;   /* denominator                        */\n';
-    h += '    uint8_t sub;   /* 1 = subtract (ratio<1), 0 = add   */\n';
-    h += '} fm_frac_t;\n\n';
+
 
     /* AY map — PSG only */
     h += `/* AY/YM2149 PSG table map (tolerance = ${MATCH_TOLERANCE_PCT}% of canonical PSG clock)\n`;
@@ -391,10 +389,11 @@ function generateCHeader(outPath) {
     }
     h += '};\n\n';
 
-    /* FM fraction table — indexed same as freq_lut_map_ym[] */
-    h += '/* FM fraction table \u2014 indexed same as freq_lut_map_ym[].\n';
-    h += ' * Runtime: scaled = fnum \u00b1 (fnum \u00d7 mul + div/2) / div */\n';
-    h += 'static const fm_frac_t freq_lut_fm_frac[FREQ_LUT_YM_COUNT] = {\n';
+    /* FM multiplier table — indexed same as freq_lut_map_ym[] */
+    h += '/* FM F-Number \u043c\u043d\u043e\u0436\u0438\u0442\u0435\u043b\u044c (YM2203): scaled = fnum \u00d7 fm_mul / 7.\n';
+    h += ' * 0 = bypass (\u043c\u0430\u0441\u0448\u0442\u0430\u0431\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0435 \u043d\u0435 \u043d\u0443\u0436\u043d\u043e).\n';
+    h += ' * ASM \u043d\u0430 Z80: \u0443\u043c\u043d\u043e\u0436\u0435\u043d\u0438\u0435 \u0447\u0435\u0440\u0435\u0437 shifts+adds, \u0434\u0435\u043b\u0435\u043d\u0438\u0435 \u043d\u0430 7 binary division */\n';
+    h += 'static const uint8_t freq_lut_fm_mul[FREQ_LUT_YM_COUNT] = {\n';
 
     ymIdx = 0;
     for (let r = 0; r < RATIOS.length; r++) {
@@ -403,8 +402,8 @@ function generateCHeader(outPath) {
         const fmRatio = rt.srcYM2203 / HW_CLK_YM2203;
         ymIdx++;
         const comma = (ymIdx < ymEntries.length) ? ',' : ' ';
-        const sign = rt.fm_sub ? '-' : '+';
-        h += `    { ${rt.fm_mul}, ${rt.fm_div.toString().padStart(2)}, ${rt.fm_sub} }${comma}  /* ${rt.name}: ${fmRatio.toFixed(6)} = 1${sign}${rt.fm_mul}/${rt.fm_div} */\n`;
+        const fmDesc = rt.fm_scale ? `\u00d7${rt.fm_scale}/7` : 'bypass (2.3%)';
+        h += `    ${rt.fm_scale}${comma}  /* ${rt.name}: ${fmRatio.toFixed(6)} = ${fmDesc} */\n`;
     }
     h += '};\n\n';
 
@@ -413,12 +412,11 @@ function generateCHeader(outPath) {
     h += ' *\n';
     h += ' *   1. Bypass check: |clock_khz - HW| <= BYPASS_TOL \u2192 native\n';
     h += ' *   2. Find matching table \u2192 set page, PSG base = offset\n';
-    h += ' *   3. For YM2203: also set fm_adj_{mul,div,sub} from fm_frac[j]\n';
+    h += ' *   3. For YM2203: fm_mul = freq_lut_fm_mul[j]\n';
     h += ' *\n';
     h += ' *   PSG: scaled_period = freq_lut_base[period_12bit]\n';
-    h += ' *   FM:  adj = (fnum \u00d7 mul + div/2) / div\n';
-    h += ' *        scaled = sub ? fnum-adj : fnum+adj\n';
-    h += ' *        if (scaled > 2047) block++, scaled >>= 1\n';
+    h += ' *   FM:  asm_scale_fm() : fb_scaled = fnum \u00d7 fm_mul / 7\n';
+    h += ' *        if (fb_scaled > 2047) block++, fb_scaled >>= 1\n';
     h += ' */\n\n';
 
     h += '#endif /* FREQ_LUT_MAP_H */\n';
