@@ -37,9 +37,9 @@
 /* ── Спектроанализатор: скорости затухания (в TV-кадрах) ────────── */
 /* Меньше = быстрее затухание.  1 = каждый кадр (~20 мс).             */
 /* Синхронизировать с EQU в spectrum.s!                                */
-#define DECAY_FRAMES_FAST     2   /* уровни >= 6                      */
-#define DECAY_FRAMES_MED      3   /* уровни 3-5                       */
-#define DECAY_FRAMES_SLOW     5   /* уровни 1-2                       */
+#define DECAY_FRAMES_FAST     1   /* уровни >= 6                      */
+#define DECAY_FRAMES_MED      2   /* уровни 3-5                       */
+#define DECAY_FRAMES_SLOW     4   /* уровни 1-2                       */
 
 /* ── Отключение обработки коротких пауз 0x70-0x7F ────────────────── */
 /* Раскомментировать для «no short waits» варианта:                    */

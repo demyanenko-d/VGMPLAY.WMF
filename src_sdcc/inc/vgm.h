@@ -92,13 +92,9 @@
 
 #include "types.h"
 
-/* ── Пересчёт частот под реальное железо (compile-time switch) ──────── */
-#define VGM_FREQ_SCALE
-
-#ifdef VGM_FREQ_SCALE
-/** Режим масштабирования частот */
-#define FREQ_MODE_NATIVE   0   /* HW clock ≈ VGM clock (±2%), no scaling */
-#define FREQ_MODE_TABLE    1   /* LUT table match (±5%)                 */
+/* ── Масштабирование частот PSG под реальное железо ─────────────────── */
+#define FREQ_MODE_NATIVE   0   /* HW clock ≈ VGM clock (±2%), без пересчёта */
+#define FREQ_MODE_TABLE    1   /* LUT table match (±5%)                     */
 
 /** Текущий режим масштабирования (FREQ_MODE_xxx) */
 extern uint8_t vgm_freq_mode;
@@ -107,9 +103,8 @@ extern uint8_t vgm_freq_mode;
  *  Используется в TABLE mode: freq_lut_base[period] → scaled period.
  *  NULL (0) если режим не TABLE.
  *  PSG: индекс 0..4095 (12-bit), FM: индекс 0..2047 (11-bit).
- *  Таблица лежит в plugin page N, подключенной через wc_mng0_pl(N). */
+ *  Таблица в plugin page N, подключённой через wc_mng0_pl(N). */
 extern uint16_t *freq_lut_base;
-#endif /* VGM_FREQ_SCALE */
 
 /* ══════════════════════════════════════════════════════════════════════
  * ID чипов = смещение clock-поля в VGM-заголовке.

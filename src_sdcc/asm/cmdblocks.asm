@@ -347,8 +347,11 @@ blk_saa_clock_off:
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════
-; CMDBLK_SILENCE_YM2203 — Silence YM2203 (SSG + FM)
+; CMDBLK_SILENCE_YM2203 — Silence YM2203 (SSG + FM) + reset prescaler
 ;
+; Prescaler reset (reg 0x2D, write-only, value ignored):
+;   55 2D 00    Reset prescaler → defaults: /6 FM, /4 SSG
+;               Prevents state leak from tracks that set /3+/2 via 0x2E.
 ; SSG (AY-compatible):
 ;   55 07 3F    Mixer: all tone+noise off
 ;   55 08 00    SSG Volume A = 0
@@ -363,14 +366,14 @@ blk_saa_clock_off:
 ;   55 44..46 7F   slot 3 (C1): ch 0,1,2
 ;   55 48..4A 7F   slot 2 (M2): ch 0,1,2
 ;   55 4C..4E 7F   slot 4 (C2): ch 0,1,2
-; Total: 19 VGM commands + end = 58 bytes
+; Total: 20 VGM commands + end = 61 bytes
 ; ═══════════════════════════════════════════════════════════════════════
 blk_silence_ym2203:
         ; ── SSG silence — VGM: 55 rr vv ──
-        ym2203_write 7, #3F        ; VGM: 55 07 3F — Mixer off
-        ym2203_write 8, #00        ; VGM: 55 08 00 — SSG Vol A = 0
-        ym2203_write 9, #00        ; VGM: 55 09 00 — SSG Vol B = 0
-        ym2203_write 10, #00       ; VGM: 55 0A 00 — SSG Vol C = 0
+        ym2203_write 7,   #3F      ; VGM: 55 07 3F — Mixer off
+        ym2203_write 8,   #00      ; VGM: 55 08 00 — SSG Vol A = 0
+        ym2203_write 9,   #00      ; VGM: 55 09 00 — SSG Vol B = 0
+        ym2203_write 10,  #00      ; VGM: 55 0A 00 — SSG Vol C = 0
         ; ── FM Key Off — VGM: 55 28 xx ──
         ym2203_write #28, #00      ; VGM: 55 28 00 — Key Off ch 0
         ym2203_write #28, #01      ; VGM: 55 28 01 — Key Off ch 1
@@ -388,6 +391,12 @@ blk_silence_ym2203:
         ym2203_write #4C, #7F      ; VGM: 55 4C 7F — TL slot4 ch0
         ym2203_write #4D, #7F      ; VGM: 55 4D 7F — TL slot4 ch1
         ym2203_write #4E, #7F      ; VGM: 55 4E 7F — TL slot4 ch2
+
+        ; ── Prescaler reset — VGM: 55 2D 00 ──
+        ym2203_write #2D, #00      ; VGM: 55 2D 00 — Reset prescaler (/6 FM, /4 SSG)
+        ym2203_write #2E, #00      ; VGM: A5 2E 00 — Prescaler /6 FM, /4 SSG (redundant reset)
+        ym2203_write #2F, #00      ; VGM: A5 2F 00 — Prescaler /6 FM, /4 SSG (redundant reset)
+        
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════
@@ -396,6 +405,8 @@ blk_silence_ym2203:
 ; Uses VGM opcode 0xA5 (dual chip: 0x55 → 0xA5) → vgm_fill_buffer
 ; generates CMD_WRITE_AY2 which selects chip 2 via isr_ms_ctrl.
 ;
+; Prescaler reset:
+;   A5 2D 00    Reset prescaler → defaults: /6 FM, /4 SSG
 ; SSG (chip 2):
 ;   A5 07 3F    Mixer: all tone+noise off
 ;   A5 08 00    SSG Volume A = 0
@@ -410,7 +421,7 @@ blk_silence_ym2203:
 ;   A5 44..46 7F   slot 3 (C1): ch 0,1,2
 ;   A5 48..4A 7F   slot 2 (M2): ch 0,1,2
 ;   A5 4C..4E 7F   slot 4 (C2): ch 0,1,2
-; Total: 19 VGM commands + end = 58 bytes
+; Total: 20 VGM commands + end = 61 bytes
 ; ═══════════════════════════════════════════════════════════════════════
 blk_silence_ym2203_2:
         ; ── SSG silence (chip 2) — VGM: A5 rr vv ──
@@ -435,6 +446,12 @@ blk_silence_ym2203_2:
         ym2203_2_write #4C, #7F     ; VGM: A5 4C 7F — TL slot4 ch0
         ym2203_2_write #4D, #7F     ; VGM: A5 4D 7F — TL slot4 ch1
         ym2203_2_write #4E, #7F     ; VGM: A5 4E 7F — TL slot4 ch2
+
+        ; ── Prescaler reset (chip 2) — VGM: A5 2D 00 ──
+        ym2203_2_write #2D, #00      ; VGM: A5 2D 00 — Reset prescaler
+        ym2203_2_write #2E, #00      ; VGM: A5 2E 00 — Prescaler /6 FM, /4 SSG (redundant reset)
+        ym2203_2_write #2F, #00      ; VGM: A5 2F 00 — Prescaler /6 FM, /4 SSG (redundant reset)
+
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════

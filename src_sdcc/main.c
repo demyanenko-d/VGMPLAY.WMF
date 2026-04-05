@@ -38,7 +38,12 @@ extern uint8_t  ifl_pb_bw;
 extern uint8_t  ifl_pb_green;
 
 /* ── Бордюр-отладка ─────────────────────────────────────────────────── */
+/* Define DEBUG_BORDER to show fill_buffer timing via border color */
+/* #define DEBUG_BORDER */
+
+#ifdef DEBUG_BORDER
 static void border(uint8_t c) { sfr_zx_fe = c; }
+#endif
 
 /* ── Debug port trace (emulator "Illegal port!" log) ─────────────── */
 /* Define DBG_ENABLE to compile debug port output; disabled by default */
@@ -150,6 +155,12 @@ static void build_playback_queue(void)
                                                   : CMDBLK_INIT_OPL2);
     }
 
+    /* Enable SAA clock via MultiSound ctrl before playback.
+     * CMDBLK_SAA_CLK_ON writes 0xF3 to #FFFD through the ISR command
+     * queue, ensuring SAA clock persists even if WC handler touches #FFFD. */
+    if (s_has_saa)
+        hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_ON);
+
     /* Main playback */
     hl_push(HLCMD_PLAY, 0);
 
@@ -183,9 +194,8 @@ static void build_playback_queue(void)
 }
 
 /* ── Размеры и цвета окна ───────────────────────────────────────────── */
-/* TextMode=2 (wc.ini) → 90×36. Центровка: (90-60)/2=15, (36-22)/2=7  */
-#define WND_X 14
-#define WND_Y 7
+/* Координаты вычисляются динамически в main() через wc_get_height().
+ * TextMode=0: 80×25, TextMode=1: 80×30, TextMode=2: 90×36.           */
 #define WND_W 62
 #define WND_H 22
 
@@ -208,7 +218,7 @@ static const char s_win_title[] = " VGM Player " APP_VERSION " ";
 #define ROW_TITLE         1
 #define ROW_FILE_START    2
 #define ROW_VGM_START     6
-#define ROW_VGM_END       14   /* максимальная строка для VGM/GD3 info   */
+#define ROW_VGM_END       13   /* максимальная строка для VGM/GD3 info   */
 #define ROW_PROGRESS      15
 #define ROW_SPECTRUM      16   /* 4 rows: 16,17,18,19                    */
 #define ROW_HELP          20
@@ -449,6 +459,16 @@ uint8_t drow_ui(void)
 
     for (uint8_t i = 0; i < vgm_chip_count && row <= ROW_VGM_END; i++)
     {
+        /* Compact: show max 2 full chip lines; rest as "+ N more" */
+        if (i >= 2 && vgm_chip_count > 3) {
+            buf_clear(work_buf);
+            buf_append_str(work_buf, "              + ");
+            buf_append_u16_dec(work_buf, (uint16_t)(vgm_chip_count - 2));
+            buf_append_str(work_buf, " more");
+            print_line(&s_wnd, row++, work_buf, CLR_WIN);
+            break;
+        }
+
         const vgm_chip_entry_t *chip = &vgm_chip_list[i];
 
         buf_clear(work_buf);
@@ -483,7 +503,6 @@ uint8_t drow_ui(void)
         print_line(&s_wnd, row++, work_buf, CLR_WIN);
     }
 
-#ifdef VGM_FREQ_SCALE
     /* Информация о режиме частот */
     if (row <= ROW_VGM_END) {
         buf_clear(work_buf);
@@ -498,7 +517,6 @@ uint8_t drow_ui(void)
                 ? CLR_WIN
                 : WC_COLOR(WC_WHITE, WC_GREEN));
     }
-#endif
 
     /* ── GD3 метаданные (English, max 4) ──────────────────────────── */
     if (vgm_gd3_track[0] && row <= ROW_VGM_END && gd3_count < 4) {
@@ -707,6 +725,29 @@ void start_playback(void)
             out  (c), a
         __endasm;
 
+        // SAA1099: принудительный Sound Enable ON до начала воспроизведения.
+
+        if (s_has_saa) {
+            __asm
+                ;; TURBO 7 MHz
+                ld   bc, #0x20AF
+                ld   a, #0x01       ; TURBO_7MHZ
+                out  (c), a
+                ;; SAA1: reg 0x1C (Sound Enable)
+                ld   a, #0x1C
+                ld   bc, #0x00FF    ; SAA1 address port
+                out  (c), a
+                ;; SAA1: val 0x01 (Sound Enable ON)
+                ld   a, #0x01
+                ld   b, #0x01      ; BC = #01FF  SAA1 data port
+                out  (c), a
+                ;; TURBO 14 MHz
+                ld   bc, #0x20AF
+                ld   a, #0x02       ; TURBO_14MHZ
+                out  (c), a
+            __endasm;
+        }
+
         /* Build HL command queue for this track */
         build_playback_queue();
 
@@ -840,14 +881,18 @@ void update_buffer(void)
         return;
 
     /* Fill the free buffer — vgm_fill_buffer handles HL transitions */
+#ifdef DEBUG_BORDER
     isr_border_color = 2;
     border(2);
+#endif
 
     vgm_fill_buffer(free_idx);
     s_buf_ready[free_idx] = 1;
 
+#ifdef DEBUG_BORDER
     isr_border_color = 0;
     border(0);
+#endif
 }
 
 void update_playback_info(void)
@@ -957,8 +1002,15 @@ void main(void)
     // SOW — рамка с тенью (TYPE3, заголовок рисуем вручную)
     s_wnd.type = WC_WIN_TYPE3 | WC_WIN_SHADOW;
     s_wnd.cur_mask = 0x05;
-    s_wnd.x = WND_X;
-    s_wnd.y = WND_Y;
+
+    /* Dynamic centering based on WC text mode */
+    {
+        uint8_t scr_h = wc_get_height();   /* 25/30/36 */
+        uint8_t scr_w = (scr_h >= 36) ? 90 : 80;
+        s_wnd.x = (scr_w > WND_W) ? (scr_w - WND_W) / 2 : 0;
+        s_wnd.y = (scr_h > WND_H) ? (scr_h - WND_H) / 2 : 0;
+    }
+
     s_wnd.width = WND_W;
     s_wnd.height = WND_H;
     s_wnd.color = CLR_WIN;

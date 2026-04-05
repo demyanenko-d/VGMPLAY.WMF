@@ -162,7 +162,7 @@ function printInfo() {
 
     for (let r = 0; r < RATIOS.length; r++) {
         const rt = RATIOS[r];
-        const ratio = rt.srcPsgHz / HW_CLK_AY;
+        const ratio = HW_CLK_AY / rt.srcPsgHz;  /* same as generateTable: target/source */
         const page  = Math.floor(r / 2) + PAGE_BASE; /* plugin page (PAGE_BASE = after code pages) */
         const slot  = r % 2;                          /* 0 or 1 within page */
         const base  = slot * TABLE_BYTES;           /* byte offset within page */

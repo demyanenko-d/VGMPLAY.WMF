@@ -30,9 +30,7 @@
 #include "../inc/vgm.h"
 #include "../inc/isr.h"
 #include "../inc/wc_api.h"
-#ifdef VGM_FREQ_SCALE
 #include "../inc/freq_lut_map.h"
-#endif
 
 /* ── Состояние парсера ──────────────────────────────────────────────── */
 volatile uint8_t vgm_song_ended; // 1 = достигнут конец (0x66), main loop может остановить воспроизведение
@@ -76,7 +74,6 @@ uint8_t  spec_saa_oct[6];      /* SAA octave shadow: channels 0-5       */
 uint8_t  spec_opl_bd;          /* OPL 0xBD shadow for rising-edge detect */
 uint8_t  spec_fm_block[6];     /* YM2203 FM block shadow: ch0-2(chip1/2)*/
 
-#ifdef VGM_FREQ_SCALE
 /* ── Масштабирование частот PSG/FM (только LUT) ─────────────────────── */
 uint8_t vgm_freq_mode;
 uint16_t *freq_lut_base;
@@ -86,7 +83,6 @@ static uint8_t freq_lut_page;   /* plugin page для Window 0 (LUT)       */
  * Обновляются при записи lo/hi, используются для LUT lookup. */
 static uint16_t psg_shadow[3];   /* каналы 0,1,2 — chip 1 */
 static uint16_t psg_shadow2[3];  /* каналы 0,1,2 — chip 2 (0xA5) */
-#endif /* VGM_FREQ_SCALE */
 
 /* ── Бюджеты для вставки служебных ISR-команд ──────────────────────── */
 static uint16_t vgm_sec_budget = ISR_FREQ;  /* тиков до CMD_INC_SEC  */
@@ -111,11 +107,9 @@ static uint16_t fb_w;      /* temp: emit_wait split value               */
 static uint8_t  fb_n;      /* temp: skip byte count                    */
 static uint8_t *fb_end;    /* precomputed fb_buf + (CMD_BUF_SIZE - 48)  */
 static hl_entry_t *fb_e;   /* temp: HL queue entry pointer              */
-#ifdef VGM_FREQ_SCALE
 static uint8_t  fb_ch;     /* temp: PSG/FM channel index               */
 static uint16_t fb_scaled; /* temp: scaled frequency value              */
 static uint8_t  fb_reg;    /* temp: AY register (0xA0 handler)         */
-#endif
 
 /* VGM_FILL_CMD_BUDGET определён в variant_cfg.h (через isr.h) */
 
@@ -288,8 +282,7 @@ uint8_t vgm_parse_header(void)
             vgm_chip_type = VGM_CHIP_OPL;
     }
 
-#ifdef VGM_FREQ_SCALE
-    /* ── Расчёт масштабов частот PSG ─────────────────────────────────
+    /* ── Подбор LUT для пересчёта частот PSG ─────────────────────────
      * YM2203: psg_khz = полный master clock → ищем в freq_lut_map_ym[]
      * AY8910: psg_khz = clock как есть      → ищем в freq_lut_map_ay[]
      * Ratio одинаковый: HW_AY/AY_src = HW_YM/YM_src, таблицы общие. */
@@ -298,6 +291,7 @@ uint8_t vgm_parse_header(void)
     freq_lut_page = 0;
     psg_shadow[0] = 0; psg_shadow[1] = 0; psg_shadow[2] = 0;
     psg_shadow2[0] = 0; psg_shadow2[1] = 0; psg_shadow2[2] = 0;
+
     for (i = 0; i < vgm_chip_count; i++) {
         uint16_t psg_khz;
         uint16_t hw_khz;
@@ -323,14 +317,14 @@ uint8_t vgm_parse_header(void)
 
         /* ── Определяем режим масштабирования ─────────────────────
          * 1) bypass: |psg_khz - HW| ≤ 2% → native
-         * 2) LUT table match (±5%) → table mode (Window 0)
+         * 2) LUT table match (±5%) → TABLE mode (Window 0)
          * Нет match → остаётся native (экзотика <1% файлов) */
         {
             uint16_t diff = (psg_khz > hw_khz)
                           ? (psg_khz - hw_khz)
                           : (hw_khz - psg_khz);
             if (diff <= bypass_tol) {
-                /* ±2% — native, no scaling needed */
+                /* ±2% — native, пересчёт не нужен */
                 vgm_freq_mode = FREQ_MODE_NATIVE;
             } else {
                 /* Ищем подходящую предрасчитанную таблицу (±5%) */
@@ -353,7 +347,6 @@ uint8_t vgm_parse_header(void)
         }
         break;
     }
-#endif
 
     /* ── Loop offset ──────────────────────────────────────────────────
      * Relative offset from 0x1C. Если значение невалидно — loop отключаем.
@@ -888,6 +881,7 @@ static void emit_wait(uint16_t tk)
  * EOF-проверка удалена из горячего цикла — при загрузке в конец
  * VGM-данных вписывается 0x66-сентинел (см. main.c write_vgm_sentinel).
  * ───────────────────────────────────────────────────────────────────── */
+
 void vgm_fill_buffer(uint8_t buf_idx)
 {
     fb_buf = buf_idx ? cmd_buf_b : cmd_buf_a;
@@ -942,11 +936,9 @@ next_hl:
         fb_cpg  = vgm_cur_page;
         fb_rp   = (uint8_t *)vgm_read_ptr;
         wc_mngcvpl(fb_cpg);
-#ifdef VGM_FREQ_SCALE
-        /* Re-map LUT page: WC API (print_line etc.) may remap Window 0 */
+        /* Переподключить LUT: WC API (print_line и т.д.) мог перемапить Window 0 */
         if (vgm_freq_mode == FREQ_MODE_TABLE)
             wc_mng0_pl(freq_lut_page);
-#endif
         fb_is_vgm = 1;
         break;
 
@@ -962,10 +954,8 @@ next_hl:
         fb_rp   = (uint8_t *)vgm_read_ptr;
         fb_wacc = vgm_wait_accum;
         wc_mngcvpl(fb_cpg);
-#ifdef VGM_FREQ_SCALE
         if (vgm_freq_mode == FREQ_MODE_TABLE)
             wc_mng0_pl(freq_lut_page);
-#endif
         fb_is_vgm = 1;
         break;
 
@@ -1048,7 +1038,6 @@ next_hl:
         {
             asm_read_2bytes();
             spectrum_ay(fb_b1, fb_b2);
-#ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             /* ── PSG tone period (reg 0x00-0x05): 12-bit, парами lo/hi ── */
             if (fb_b1 <= 0x05) {
@@ -1063,7 +1052,7 @@ next_hl:
                 }
                 fb_scaled = freq_lut_base[psg_shadow[fb_ch]];
                 if (fb_scaled > 0x0FFF) fb_scaled = 0x0FFF;
-                /* Emit оба lo+hi: scaled меняет оба байта одновременно */
+                /* Отправляем оба lo+hi: scaled меняет оба байта одновременно */
                 fb_wp[0] = CMD_WRITE_AY;
                 fb_wp[1] = fb_ch << 1;  /* reg = 0,2,4 */
                 fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
@@ -1080,7 +1069,6 @@ next_hl:
             }
             /* FM regs (>0x0D): без масштабирования (TODO: F-Number shadow) */
           }
-#endif /* VGM_FREQ_SCALE */
             fb_wp[0] = CMD_WRITE_AY;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -1093,7 +1081,6 @@ next_hl:
         {
             asm_read_2bytes();
             spectrum_ay2(fb_b1, fb_b2);
-#ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             if (fb_b1 <= 0x05) {
                 fb_ch = fb_b1 >> 1;
@@ -1119,7 +1106,6 @@ next_hl:
                 fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
           }
-#endif /* VGM_FREQ_SCALE */
             fb_wp[0] = CMD_WRITE_AY2;
             fb_wp[1] = fb_b1; fb_wp[2] = fb_b2;
             fb_wp += 4;
@@ -1134,7 +1120,6 @@ next_hl:
                 spectrum_ay2(fb_b1 & 0x7F, fb_b2);
             else
                 spectrum_ay(fb_b1 & 0x7F, fb_b2);
-#ifdef VGM_FREQ_SCALE
           if (vgm_freq_mode != FREQ_MODE_NATIVE) {
             fb_reg = fb_b1 & 0x7F;
             /* PSG tone period (reg 0-5): полный 12-бит через shadow */
@@ -1148,7 +1133,7 @@ next_hl:
                 }
                 fb_scaled = freq_lut_base[psg_shadow[fb_ch]];
                 if (fb_scaled > 0x0FFF) fb_scaled = 0x0FFF;
-                /* AY (0xA0): emit оба байта сразу */
+                /* AY (0xA0): отправляем оба байта сразу */
                 fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
                 fb_wp[1] = fb_ch << 1;  /* lo reg */
                 fb_wp[2] = (uint8_t)(fb_scaled & 0xFF);
@@ -1164,7 +1149,6 @@ next_hl:
                 fb_b2 = (uint8_t)(freq_lut_base[fb_b2 & 0x1F] & 0x1F);
             }
           }
-#endif /* VGM_FREQ_SCALE */
 
             fb_wp[0] = (fb_b1 & 0x80) ? CMD_WRITE_AY2 : CMD_WRITE_AY;
             fb_wp[1] = fb_b1 & 0x7F;

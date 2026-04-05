@@ -71,6 +71,7 @@ sd_last_tick:   .db 0                   ; isr_tick_ctr snapshot for frame gate
 sd_fast_ctr:    .db DECAY_FAST          ; countdown: decay levels >= 6
 sd_med_ctr:     .db DECAY_MED           ; countdown: decay levels 3-5
 sd_slow_ctr:    .db DECAY_SLOW          ; countdown: decay levels 1-2
+sr_prev_hash:   .db 0                   ; XOR-rotate hash of spectrum_levels from previous render
 sfont_save:     .ds 16                  ; backup of original font glyphs 0x01-0x02
 
         .area   _CODE
@@ -111,6 +112,22 @@ sr_row_params:
 ;======================================================================
 
 _spectrum_render::
+        ; XOR-rotate hash over spectrum_levels[16] (~100T).
+        ; Detects ANY change versus previous frame, not just zero/non-zero.
+        ; Hash = seed, then for each byte: RLCA + XOR (hl).
+        ld      hl, #_spectrum_levels
+        xor     a
+        .rept 16
+        rlca
+        xor     (hl)
+        inc     hl
+        .endm
+        ; A = rolling hash of current levels
+        ld      hl, #sr_prev_hash
+        cp      (hl)                    ; same as last frame?
+        ret     z                       ; unchanged → skip render (~7000T saved)
+        ld      (hl), a                 ; store new hash
+
         push    ix
         push    iy
 
@@ -246,6 +263,9 @@ _spectrum_decay_reset::
         ld      (sd_med_ctr), a
         ld      a, #DECAY_SLOW
         ld      (sd_slow_ctr), a
+        ; Reset render hash so first frame always renders
+        ld      a, #0xFF
+        ld      (sr_prev_hash), a
         ret
 
 ;======================================================================
@@ -303,6 +323,16 @@ sd_ns:
         ret     z                       ; no tier expired → nothing to decay
 
         ; ── Single loop over 16 bars ────────────────────────────────
+        ld      hl, #_spectrum_levels
+        ; Quick all-zero check: if all bars are 0, skip decay loop
+        ld      a, (hl)
+        inc     hl
+        .rept 15
+        or      (hl)
+        inc     hl
+        .endm
+        ret     z              ; all bars zero → nothing to decay
+
         ld      hl, #_spectrum_levels
         ld      b, #SPEC_BARS
 

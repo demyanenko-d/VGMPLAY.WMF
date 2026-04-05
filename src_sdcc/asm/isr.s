@@ -65,6 +65,9 @@ CMD_WAIT      = 0xC0
 CMD_END_BUF   = 0xE0
 CMD_ISR_DONE  = 0xF0
 
+; Отладка: раскрасить бордюр во время ISR (0=выкл, 1=вкл)
+DEBUG_BORDER = 0
+
 ; Порты OPL3
 OPL3_ADDR0 = 0xC4
 OPL3_DATA0 = 0xC5
@@ -195,8 +198,10 @@ _isr_deinit::
 
 _isr_handler::
         push    af
+.if DEBUG_BORDER
         ld      a, #0x06            ; DEBUG: yellow border
         out     (0xFE), a
+.endif
         push    hl
         push    bc
         push    de
@@ -232,8 +237,10 @@ _isr_handler::
         ld      (_isr_wait_ctr), hl
 
 _isr_exit:
+.if DEBUG_BORDER
         ld      a, (_isr_border_color) ; DEBUG: restore border from variable
         out     (0xFE), a
+.endif
         pop     de
         pop     bc
         pop     hl
