@@ -26,11 +26,11 @@
 #include "inc/version.h"
 #include <string.h>
 
-/* Stringify helpers for compile-time ISR_FREQ / budget in title */
+/* Хелперы stringify для compile-time ISR_FREQ / budget в заголовке */
 #define _STR(x) #x
 #define STR(x)  _STR(x)
 
-/* ── Inflate progress bar params (defined in inflate_call.s _DATA) ────── */
+/* ── Параметры progress bar для inflate (определены в inflate_call.s _DATA) ── */
 extern uint8_t  ifl_pb_text_pg;
 extern uint16_t ifl_pb_attr_ofs;
 extern uint8_t  ifl_pb_total;
@@ -38,7 +38,7 @@ extern uint8_t  ifl_pb_bw;
 extern uint8_t  ifl_pb_green;
 
 /* ── Бордюр-отладка ─────────────────────────────────────────────────── */
-/* Define DEBUG_BORDER to show fill_buffer timing via border color */
+/* Включить DEBUG_BORDER для отображения времени fill_buffer через цвет бордюра */
 /* #define DEBUG_BORDER */
 
 #ifdef DEBUG_BORDER
@@ -104,7 +104,7 @@ static void detect_active_chips(void)
         case VGM_OFF_YM2203:
             s_has_ym2203 = 1;
             if (dual) s_has_ym2203_2 = 1;
-            /* fallthrough */
+            /* fallthrough (проваливаемся) */
         case VGM_OFF_AY8910:
             s_has_ay = 1;
             if (dual) s_has_ay2 = 1;
@@ -126,7 +126,7 @@ static void detect_active_chips(void)
     }
 }
 
-/* cfg_loop_rewinds, cfg_min_duration, cfg_max_duration are in vgm.c */
+/* cfg_loop_rewinds, cfg_min_duration, cfg_max_duration определены в vgm.c */
 
 /* ── HL queue helpers ────────────────────────────────────────────────
  * The queue itself and its state live in vgm.c (vgm_hl_queue etc.)
@@ -142,12 +142,12 @@ static void hl_push(uint8_t cmd, uint8_t param)
     }
 }
 
-/* ── Build the playback queue based on detected chips / loop info ─── */
+/* ── Построение очереди воспроизведения по обнаруженным чипам / loop info ─ */
 static void build_playback_queue(void)
 {
     vgm_hl_len = 0;
 
-    /* Init phase: silence (clear residual state) + init */
+    /* Фаза инициализации: silence (очистка остаточного состояния) + init */
     if (s_has_opl) {
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_OPL);
         hl_push(HLCMD_CMDBLK,
@@ -155,13 +155,13 @@ static void build_playback_queue(void)
                                                   : CMDBLK_INIT_OPL2);
     }
 
-    /* Enable SAA clock via MultiSound ctrl before playback.
-     * CMDBLK_SAA_CLK_ON writes 0xF3 to #FFFD through the ISR command
-     * queue, ensuring SAA clock persists even if WC handler touches #FFFD. */
+    /* Включить SAA clock через MultiSound ctrl перед воспроизведением.
+     * CMDBLK_SAA_CLK_ON пишет 0xF3 в #FFFD через очередь ISR-команд,
+     * гарантируя сохранение SAA clock даже если WC handler трогает #FFFD. */
     if (s_has_saa)
         hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_ON);
 
-    /* Main playback */
+    /* Основное воспроизведение */
     hl_push(HLCMD_PLAY, 0);
 
     /* Loop repeats — только если vgm_parse_header разрешил loop.
@@ -171,7 +171,7 @@ static void build_playback_queue(void)
             hl_push(HLCMD_LOOP, 0);
     }
 
-    /* ── Shutdown sequence (abort target) ──────────────────────── */
+    /* ── Последовательность завершения (abort target) ──────────────── */
     vgm_hl_abort_pos = vgm_hl_len;
 
     if (s_has_opl)
@@ -227,7 +227,7 @@ static const char s_win_title[] = " VGM Player " APP_VERSION " ";
 
 static wc_window_t s_wnd;
 static uint8_t s_pages;
-/* pbinfo_start_row replaced by ROW_PROGRESS constant */
+/* pbinfo_start_row заменён константой ROW_PROGRESS */
 
 static uint8_t s_playback_inited = 0;
 static uint8_t s_last_active_buf = 0;
@@ -242,12 +242,12 @@ static uint8_t s_pb_d_sec10 = '0';
 static uint8_t s_pb_d_sec1  = '0';
 
 /* ── Progress bar state (предвычисленные параметры) ───────────────── */
-uint8_t  s_pb_text_pg;            /* physical page of text screen (non-static: ASM) */
-static uint16_t s_pb_char_ofs;    /* char area offset within text page     */
-static uint16_t s_pb_attr_ofs;    /* attr area offset within text page     */
-static uint8_t  s_pb_width;       /* bar width in columns                  */
-static uint16_t s_pb_err;         /* Bresenham error accumulator           */
-static uint8_t  s_pb_col;         /* current green column count            */
+uint8_t  s_pb_text_pg;            /* физ. страница текстового экрана (не static: ASM) */
+static uint16_t s_pb_char_ofs;    /* смещение символов в текстовой странице  */
+static uint16_t s_pb_attr_ofs;    /* смещение атрибутов в текстовой странице  */
+static uint8_t  s_pb_width;       /* ширина полосы в колонках                */
+static uint16_t s_pb_err;         /* аккумулятор ошибки Bresenham             */
+static uint8_t  s_pb_col;         /* текущее кол-во зелёных колонок         */
 
 /* Позиции изменяемых символов внутри строки progress bar:
  * "Playing  MM:SS / MM:SS  Loop N"
@@ -258,16 +258,16 @@ static uint8_t  s_pb_col;         /* current green column count            */
 #define PB_OFS_SEC1   13
 #define PB_OFS_LOOP   29
 
-/* ── Spectrum analyzer rendering (ASM: asm/spectrum.s) ────────────────
- * 16 bars, 4 rows (ROW_SPECTRUM..ROW_SPECTRUM+3), bottom-up.
- * spectrum_render() and hot-loop spectrum helpers are in asm/spectrum.s.
- * Variables below are non-static so ASM can access them via _symbol. */
+/* ── Рендеринг spectrum analyzer (ASM: asm/spectrum.s) ──────────────
+ * 16 полос, 4 строки (ROW_SPECTRUM..ROW_SPECTRUM+3), снизу вверх.
+ * spectrum_render() и хелперы горячего цикла — в asm/spectrum.s.
+ * Переменные ниже не static, чтобы ASM мог обращаться по _symbol. */
 
 /* Предвычисленные адреса для прямого доступа к текстовой странице */
-uint16_t s_spec_char_ofs[4];  /* char offsets for 4 rows       */
-uint16_t s_spec_attr_ofs[4];  /* attr offsets for 4 rows       */
+uint16_t s_spec_char_ofs[4];  /* смещения символов для 4 строк  */
+uint16_t s_spec_attr_ofs[4];  /* смещения атрибутов для 4 строк */
 
-/* spectrum_render/font/decay() are in asm/spectrum.s */
+/* spectrum_render/font/decay() находятся в asm/spectrum.s */
 void spectrum_render(void);
 void spectrum_decay(void);
 void spectrum_decay_reset(void);
@@ -338,7 +338,7 @@ static uint8_t kbd_poll(void)
     return KEY_NONE;
 }
 
-/* VGZ info for display */
+/* Информация VGZ для отображения */
 static uint8_t  s_is_vgz;
 static uint32_t s_vgm_unpacked_size;
 static uint8_t  s_vgz_compressed_pages;
@@ -459,7 +459,7 @@ uint8_t drow_ui(void)
 
     for (uint8_t i = 0; i < vgm_chip_count && row <= ROW_VGM_END; i++)
     {
-        /* Compact: show max 2 full chip lines; rest as "+ N more" */
+        /* Компактно: макс. 2 полных строки чипов; остальные как "+ N more" */
         if (i >= 2 && vgm_chip_count > 3) {
             buf_clear(work_buf);
             buf_append_str(work_buf, "              + ");
@@ -492,7 +492,7 @@ uint8_t drow_ui(void)
         print_line(&s_wnd, row++, work_buf, CLR_WIN);
     }
 
-    /* Loop info */
+    /* Информация о loop */
     if (row <= ROW_VGM_END) {
         buf_clear(work_buf);
         buf_append_str(work_buf, "Loop        : ");
@@ -556,7 +556,7 @@ uint8_t drow_ui(void)
     return ROW_PROGRESS;
 }
 
-/* render_static_info() removed — replaced by drow_ui() */
+/* render_static_info() удалена — заменена на drow_ui() */
 
 /* Проверить расширение файла: .vgz / .VGZ */
 static uint8_t is_vgz_filename(void)
@@ -635,7 +635,7 @@ uint8_t load_vgm(void)
         /* Копировать VGZ из мегабуфера → TAP-страницы (DI/EI внутри) */
         copy_pages_to_tap(vgz_pages);
 
-        /* Set progress bar total (estimated output pages) */
+        /* Установить total для progress bar (оценка выходных страниц) */
         {
             uint8_t est = (uint8_t)(vgz_pages * 3u);
             if (est > 64) est = 64;
@@ -683,8 +683,8 @@ void start_playback(void)
     ints_disable();
 
     /* Enable 512-byte cache for Window 2 (#8000-#BFFF).
-     * Speeds up code fetches and static fb_* variable access.
-     * MUST be after inflate/load — DMA/page I/O would corrupt cache.
+     * Ускоряет code fetch и доступ к static fb_* переменным.
+     * ДОЛЖНО быть после inflate/load — DMA/page I/O испортят cache.
      * SysConfig bit 2 = global enable, CacheConfig bit 2 = win2.    */
     //tsconf_set_cache(TSCONF_CACHE_EN_8000);
     //tsconf_set_cpu_cache(TSCONF_CPU_14MHZ, 1);
@@ -709,16 +709,16 @@ void start_playback(void)
         isr_wait_ctr = 0;
         isr_done = 0;
 
-        /* MultiSound ctrl: enable FM/SAA only for chips present.
+        /* MultiSound ctrl: включить FM/SAA только для присутствующих чипов.
          * 0xF2 = FM ON + SAA ON + normal read + chip1 (base).
-         * bit2: 1 = FM OFF  (set when no YM2203)
-         * bit3: 1 = SAA OFF (set when no SAA1099) */
+         * bit2: 1 = FM OFF  (установить если нет YM2203)
+         * bit3: 1 = SAA OFF (установить если нет SAA1099) */
         isr_ms_ctrl = 0xF2
             | (s_has_ym2203 ? 0x00 : 0x04)
             | (s_has_saa ? 0x00 : 0x08);
 
-        /* Apply MultiSound config to hardware immediately
-         * (needed for SAA-only music where no AY writes occur) */
+        /* Применить конфиг MultiSound к железу немедленно
+         * (нужно для SAA-only музыки, где AY-записей нет) */
         __asm
             ld   bc, #0xFFFD
             ld   a, (_isr_ms_ctrl)
@@ -748,15 +748,15 @@ void start_playback(void)
             __endasm;
         }
 
-        /* Build HL command queue for this track */
+        /* Построить очередь HL-команд для этого трека */
         build_playback_queue();
 
         /* Инициализация IM2: перехват вектора WC #5BFF */
         isr_init();
 
-        /* Fill both buffers from the HL queue.
-         * vgm_fill_buffer handles HL transitions internally —
-         * init cmdblocks + start of VGM data may all go in buf 0. */
+        /* Заполнить оба буфера из HL queue.
+         * vgm_fill_buffer обрабатывает HL-переходы внутри —
+         * init cmdblocks + начало VGM-данных могут попасть в buf 0. */
         vgm_fill_buffer(0);
         s_buf_ready[0] = 1;
 
@@ -782,7 +782,7 @@ void stop_playback(void)
     isr_enabled = 0;
     isr_deinit();   /* восстановить вектор WC */
 
-    /* MultiSound: disable FM + SAA, select chip1 (hardware + variable) */
+    /* MultiSound: отключить FM + SAA, выбрать chip1 (железо + переменная) */
     isr_ms_ctrl = 0xFE;
     __asm
         ld   bc, #0xFFFD
@@ -790,9 +790,9 @@ void stop_playback(void)
         out  (c), a
     __endasm;
 
-    /* Disable cache before returning to WC.
-     * CacheConfig = 0 disables all per-window caches.
-     * SysConfig: keep 14 MHz, clear global cache bit.  */
+    /* Отключить cache перед возвратом в WC.
+     * CacheConfig = 0 отключает все per-window caches.
+     * SysConfig: оставить 14 МГц, очистить global cache bit.  */
     //tsconf_set_cpu_cache(TSCONF_CPU_14MHZ, 0);
     //tsconf_set_cache(TSCONF_CACHE_NONE);
     
@@ -880,7 +880,7 @@ void update_buffer(void)
     if (s_buf_ready[free_idx])
         return;
 
-    /* Fill the free buffer — vgm_fill_buffer handles HL transitions */
+    /* Заполнить свободный буфер — vgm_fill_buffer обрабатывает HL-переходы */
 #ifdef DEBUG_BORDER
     isr_border_color = 2;
     border(2);
@@ -1003,7 +1003,7 @@ void main(void)
     s_wnd.type = WC_WIN_TYPE3 | WC_WIN_SHADOW;
     s_wnd.cur_mask = 0x05;
 
-    /* Dynamic centering based on WC text mode */
+    /* Динамическое центрирование по WC text mode */
     {
         uint8_t scr_h = wc_get_height();   /* 25/30/36 */
         uint8_t scr_w = (scr_h >= 36) ? 90 : 80;
@@ -1041,14 +1041,14 @@ void main(void)
         buf_append_str(work_buf, "             Unpacking...");
         print_line(&s_wnd, ROW_VGM_START, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
 
-        /* Setup progress bar: get text screen address for VGM section col 2 */
+        /* Настройка progress bar: получить адрес текст. экрана для VGM секции col 2 */
         {
             uint16_t bar_addr = wc_gadrw(&s_wnd, ROW_VGM_START, 2);
-            ifl_pb_text_pg  = wc_get_pgc();   /* phys page of text screen */
-            ifl_pb_attr_ofs = (bar_addr & 0x3FFF) | 0x0080; /* SET 7,L = attr area */
+            ifl_pb_text_pg  = wc_get_pgc();   /* физ. страница текст. экрана */
+            ifl_pb_attr_ofs = (bar_addr & 0x3FFF) | 0x0080; /* SET 7,L = область атрибутов */
             ifl_pb_bw       = get_content_width(&s_wnd);
             ifl_pb_green    = WC_COLOR(WC_GREEN, WC_BLACK);
-            ifl_pb_total    = 0;  /* will be set in load_vgm() */
+            ifl_pb_total    = 0;  /* будет установлено в load_vgm() */
         }
     }
 

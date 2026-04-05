@@ -259,10 +259,10 @@ const char *vgm_chip_name(uint8_t id);
 
 /* ─── VGM-format command blocks (cmdblocks page) ────────────────── */
 
-/** Plugin page containing VGM-format command blocks */
+/** Plugin page содержащая VGM-format command blocks */
 #define CMDBLK_PAGE         5
 
-/** Block indices in the pointer table at 0xC000 */
+/** Индексы блоков в таблице указателей по адресу 0xC000 */
 #define CMDBLK_INIT_OPL3    0   /* OPL3 init: NEW=1, 4-op=0, test=0   */
 #define CMDBLK_INIT_OPL2    1   /* OPL2 compat: NEW=0, 4-op=0, test=0 */
 #define CMDBLK_SILENCE_OPL  2   /* OPL silence: KeyOff+TL+waveform+BD */
@@ -275,25 +275,25 @@ const char *vgm_chip_name(uint8_t id);
 #define CMDBLK_SILENCE_YM2203   9 /* YM2203 chip 1: SSG+FM silence      */
 #define CMDBLK_SILENCE_YM2203_2 10 /* YM2203 chip 2 (TS): SSG+FM silence */
 
-/* ─── High-level command queue (HL queue) ───────────────────────── */
+/* ─── Очередь высокоуровневых команд (HL queue) ───────────────── */
 
-/** HL command types */
-#define HLCMD_CMDBLK    1   /* Execute VGM-format cmdblock (param = CMDBLK_xxx) */
-#define HLCMD_PLAY      2   /* Play VGM from current position until 0x66        */
-#define HLCMD_LOOP      3   /* Rewind to loop point, then play (morphs→PLAY)    */
-#define HLCMD_ISR_DONE  4   /* Emit CMD_ISR_DONE in buffer, ISR freezes         */
+/** Типы HL-команд */
+#define HLCMD_CMDBLK    1   /* Выполнить VGM-format cmdblock (param = CMDBLK_xxx) */
+#define HLCMD_PLAY      2   /* Воспроизведение VGM с текущей позиции до 0x66      */
+#define HLCMD_LOOP      3   /* Перемотка к loop-точке, затем play (морфируется→PLAY) */
+#define HLCMD_ISR_DONE  4   /* Записать CMD_ISR_DONE в буфер, ISR замирает       */
 
 #define HL_QUEUE_MAX 16
 
 typedef struct { uint8_t cmd, param; } hl_entry_t;
 
-/** HL queue globals — written by main.c (build_playback_queue),
- *  consumed inside vgm_fill_buffer(). */
+/** Глобальные переменные HL queue — заполняются в main.c (build_playback_queue),
+ *  используются внутри vgm_fill_buffer(). */
 extern hl_entry_t vgm_hl_queue[HL_QUEUE_MAX];
-extern uint8_t vgm_hl_len;        /* total entries              */
-extern uint8_t vgm_hl_pos;        /* current entry              */
-extern uint8_t vgm_hl_abort_pos;  /* jump-to on user abort      */
-extern uint8_t vgm_loop_count;    /* incremented on each LOOP   */
+extern uint8_t vgm_hl_len;        /* всего записей                   */
+extern uint8_t vgm_hl_pos;        /* текущая запись                 */
+extern uint8_t vgm_hl_abort_pos;  /* переход при abort пользователя */
+extern uint8_t vgm_loop_count;    /* инкрементируется при каждом LOOP */
 
 /* ─── VGZ (gzip-сжатый VGM) ─────────────────────────────────────── */
 

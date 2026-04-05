@@ -391,12 +391,11 @@ blk_silence_ym2203:
         ym2203_write #4C, #7F      ; VGM: 55 4C 7F — TL slot4 ch0
         ym2203_write #4D, #7F      ; VGM: 55 4D 7F — TL slot4 ch1
         ym2203_write #4E, #7F      ; VGM: 55 4E 7F — TL slot4 ch2
-
-        ; ── Prescaler reset — VGM: 55 2D 00 ──
-        ym2203_write #2D, #00      ; VGM: 55 2D 00 — Reset prescaler (/6 FM, /4 SSG)
-        ym2203_write #2E, #00      ; VGM: A5 2E 00 — Prescaler /6 FM, /4 SSG (redundant reset)
-        ym2203_write #2F, #00      ; VGM: A5 2F 00 — Prescaler /6 FM, /4 SSG (redundant reset)
         
+        ; ── Prescaler reset — VGM: 55 2D 00 ──
+        ym2203_write #2F, #01      ; VGM: 55 2D 00
+        ym2203_write #2D, #01      ; VGM: A5 2E 00
+
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════
@@ -448,9 +447,9 @@ blk_silence_ym2203_2:
         ym2203_2_write #4E, #7F     ; VGM: A5 4E 7F — TL slot4 ch2
 
         ; ── Prescaler reset (chip 2) — VGM: A5 2D 00 ──
-        ym2203_2_write #2D, #00      ; VGM: A5 2D 00 — Reset prescaler
-        ym2203_2_write #2E, #00      ; VGM: A5 2E 00 — Prescaler /6 FM, /4 SSG (redundant reset)
-        ym2203_2_write #2F, #00      ; VGM: A5 2F 00 — Prescaler /6 FM, /4 SSG (redundant reset)
+        ; ── Prescaler reset — VGM: 55 2D 00 ──
+        ym2203_2_write #2F, #01      ; VGM: 55 2D 00
+        ym2203_2_write #2D, #01      ; VGM: A5 2E 00
 
         blk_end
 

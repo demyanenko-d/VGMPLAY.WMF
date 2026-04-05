@@ -66,12 +66,12 @@ uint8_t vgm_loop_count;
 /* ── Аккумулятор остатка задержки (VGM samples, 0..15) ─────────────── */
 static uint16_t vgm_wait_accum = 0;
 
-/* ── Spectrum analyzer bitmask (fill_buffer → pad bytes → ISR) ──── */
-/* Non-static: accessed by ASM spectrum helpers (asm/spectrum.s)     */
-uint16_t spec_mask;            /* 16-bit: bit N → bar N at max           */
+/* ── Битовая маска spectrum analyzer (fill_buffer → pad bytes → ISR) ── */
+/* Не static: используется ASM-хелперами spectrum (asm/spectrum.s)      */
+uint16_t spec_mask;            /* 16-бит: bit N → полоса N на максимум   */
 uint16_t spec_ay_period[6];    /* AY period shadow: ch0-2(chip1), ch0-2(chip2) */
-uint8_t  spec_saa_oct[6];      /* SAA octave shadow: channels 0-5       */
-uint8_t  spec_opl_bd;          /* OPL 0xBD shadow for rising-edge detect */
+uint8_t  spec_saa_oct[6];      /* SAA octave shadow: каналы 0-5          */
+uint8_t  spec_opl_bd;          /* OPL 0xBD shadow для детекции фронта    */
 uint8_t  spec_fm_block[6];     /* YM2203 FM block shadow: ch0-2(chip1/2)*/
 
 /* ── Масштабирование частот PSG/FM (только LUT) ─────────────────────── */
@@ -79,7 +79,7 @@ uint8_t vgm_freq_mode;
 uint16_t *freq_lut_base;
 static uint8_t freq_lut_page;   /* plugin page для Window 0 (LUT)       */
 
-/* Shadow-регистры PSG: полные 12-бит tone period на канал.
+/* Shadow-регистры PSG: полный 12-бит tone period на канал.
  * Обновляются при записи lo/hi, используются для LUT lookup. */
 static uint16_t psg_shadow[3];   /* каналы 0,1,2 — chip 1 */
 static uint16_t psg_shadow2[3];  /* каналы 0,1,2 — chip 2 (0xA5) */
@@ -87,35 +87,35 @@ static uint16_t psg_shadow2[3];  /* каналы 0,1,2 — chip 2 (0xA5) */
 /* ── Бюджеты для вставки служебных ISR-команд ──────────────────────── */
 static uint16_t vgm_sec_budget = ISR_FREQ;  /* тиков до CMD_INC_SEC  */
 
-/* ── Static locals for vgm_fill_buffer / emit_wait ─────────────────
- * Eliminates SDCC's IX-frame (32-byte stack + 19T per ld r,-N(ix)).
- * Static access: ld a,(nn) = 13T, ld hl,(nn) = 16T.                   */
-static uint8_t *fb_buf;    /* base of current cmd_buf                   */
-static uint8_t *fb_wp;     /* write pointer into cmd_buf                */
-static uint8_t *fb_rp;     /* VGM read pointer (#C000-#FFFF)           */
-static uint8_t  fb_cpg;    /* local copy of vgm_cur_page               */
-static uint8_t  fb_budget; /* commands until forced yield               */
-static uint8_t  fb_yield_ticks; /* ticks consumed by budget yields      */
-static uint16_t fb_wacc;   /* wait accumulator (0..VGM_SAMPLE_MASK)     */
-static uint8_t  fb_op;     /* current VGM opcode                       */
-static uint8_t  fb_b1;     /* operand byte 1                           */
-static uint8_t  fb_b2;     /* operand byte 2                           */
+/* ── Статические локальные для vgm_fill_buffer / emit_wait ──────────
+ * Устраняет IX-frame SDCC (32 байта стека + 19T на ld r,-N(ix)).
+ * Static доступ: ld a,(nn) = 13T, ld hl,(nn) = 16T.                   */
+static uint8_t *fb_buf;    /* база текущего cmd_buf                     */
+static uint8_t *fb_wp;     /* указатель записи в cmd_buf                */
+static uint8_t *fb_rp;     /* указатель чтения VGM (#C000-#FFFF)       */
+static uint8_t  fb_cpg;    /* локальная копия vgm_cur_page              */
+static uint8_t  fb_budget; /* команд до принудительного yield            */
+static uint8_t  fb_yield_ticks; /* тиков потрачено на budget yield-ы     */
+static uint16_t fb_wacc;   /* аккумулятор задержки (0..VGM_SAMPLE_MASK)  */
+static uint8_t  fb_op;     /* текущий VGM opcode                       */
+static uint8_t  fb_b1;     /* байт операнда 1                           */
+static uint8_t  fb_b2;     /* байт операнда 2                           */
 static uint8_t  fb_is_vgm; /* 1 = VGM mega-buffer, 0 = cmdblk          */
-static uint16_t fb_tk;     /* temp: tick count for emit_wait            */
-static uint32_t fb_t32;    /* temp: 32-bit data-block size (0x67)       */
-static uint16_t fb_w;      /* temp: emit_wait split value               */
-static uint8_t  fb_n;      /* temp: skip byte count                    */
-static uint8_t *fb_end;    /* precomputed fb_buf + (CMD_BUF_SIZE - 48)  */
-static hl_entry_t *fb_e;   /* temp: HL queue entry pointer              */
-static uint8_t  fb_ch;     /* temp: PSG/FM channel index               */
-static uint16_t fb_scaled; /* temp: scaled frequency value              */
-static uint8_t  fb_reg;    /* temp: AY register (0xA0 handler)         */
+static uint16_t fb_tk;     /* temp: счётчик тиков для emit_wait         */
+static uint32_t fb_t32;    /* temp: 32-бит размер data-block (0x67)     */
+static uint16_t fb_w;      /* temp: промежуточное значение emit_wait    */
+static uint8_t  fb_n;      /* temp: число байт для пропуска             */
+static uint8_t *fb_end;    /* предвычисленный fb_buf + (CMD_BUF_SIZE-48) */
+static hl_entry_t *fb_e;   /* temp: указатель на запись HL queue         */
+static uint8_t  fb_ch;     /* temp: индекс канала PSG/FM                */
+static uint16_t fb_scaled; /* temp: масштабированная частота             */
+static uint8_t  fb_reg;    /* temp: AY регистр (обработчик 0xA0)        */
 
 /* VGM_FILL_CMD_BUDGET определён в variant_cfg.h (через isr.h) */
 
-/* ── Spectrum analyzer helpers (ASM: asm/spectrum.s) ─────────────── */
-/* 16 bars = 8 octaves × 2 sub-bands (matching OPL block*2+fnum_msb).
- * All implementations in hand-optimised Z80 ASM for hot-loop speed. */
+/* ── Хелперы spectrum analyzer (ASM: asm/spectrum.s) ────────────── */
+/* 16 полос = 8 октав × 2 поддиапазона (по OPL block*2+fnum_msb).
+ * Все реализации на оптимизированном Z80 ASM для горячего цикла.    */
 extern void spectrum_opl_b0(uint8_t reg, uint8_t val);
 extern void spectrum_opl_b1(uint8_t reg, uint8_t val);
 extern void spectrum_ay(uint8_t reg, uint8_t val);
@@ -123,7 +123,7 @@ extern void spectrum_ay2(uint8_t reg, uint8_t val);
 extern void spectrum_saa(uint8_t reg, uint8_t val);
 
 
-/* ── Chip scan table (ROM-const) ────────────────────────────────────── */
+/* ── Таблица сканирования чипов (ROM-const) ──────────────────────── */
 /* Каждая запись: { offset_in_header, min_version_lo }
  * offset — байтовое смещение 32-bit clock-поля в VGM заголовке.
  * minv_lo — младший байт минимальной VGM-версии (старший всегда 0x01).
@@ -634,9 +634,9 @@ static void asm_arb_wait(void) __naked {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * asm_read_byte — read one byte from fb_rp, handle page crossing
- * Returns A = byte.  Clobbers C, HL.
- * Fast-path: 74 T  (+ call 17 + ret 10 = 101 T total)
+ * asm_read_byte — чтение одного байта из fb_rp, обработка page-cross
+ * Возвращает A = byte.  Clobbers C, HL.
+ * Fast-path: 74 T  (+ call 17 + ret 10 = 101 T итого)
  * ───────────────────────────────────────────────────────────────────── */
 static uint8_t asm_read_byte(void) __naked
 {
@@ -665,9 +665,9 @@ static uint8_t asm_read_byte(void) __naked
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * asm_read_2bytes — read two consecutive bytes -> fb_b1, fb_b2
- * Writes directly to statics.  Handles page-cross per byte.
- * Fast-path: 124 T  (+ call 17 = 141 T total)
+ * asm_read_2bytes — чтение двух последовательных байт → fb_b1, fb_b2
+ * Пишет напрямую в static переменные.  Обрабатывает page-cross побайтно.
+ * Fast-path: 124 T  (+ call 17 = 141 T итого)
  * ───────────────────────────────────────────────────────────────────── */
 static void asm_read_2bytes(void) __naked
 {
@@ -708,15 +708,15 @@ static void asm_read_2bytes(void) __naked
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * asm_emit_skip_spec — emit CMD_SKIP_TICKS + spec_mask to cmd buffer
+ * asm_emit_skip_spec — запись CMD_SKIP_TICKS + spec_mask в cmd buffer
  *
- * Writes: [CMD_SKIP_TICKS, val, spec_mask_lo, spec_mask_hi].
- * Clears spec_mask, advances fb_wp by 4.
- * Replaces a 6-line C pattern that appears 9× in fill_buffer/emit_wait.
+ * Пишет: [CMD_SKIP_TICKS, val, spec_mask_lo, spec_mask_hi].
+ * Обнуляет spec_mask, продвигает fb_wp на 4.
+ * Заменяет 6-строчный C-паттерн, встречающийся 9× в fill_buffer/emit_wait.
  *
- * Input: A = byte1 (tick count minus 1, or literal).
+ * Вход: A = byte1 (tick count минус 1, или литерал).
  * Clobbers: A, C, HL.
- * Cost: ~119 T  (+ call 17 = 136 T total).
+ * Стоимость: ~119 T  (+ call 17 = 136 T итого).
  * ───────────────────────────────────────────────────────────────────── */
 static void asm_emit_skip_spec(uint8_t val) __naked {
     __asm
@@ -742,14 +742,15 @@ static void asm_emit_skip_spec(uint8_t val) __naked {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * asm_emit_opl_b0 — emit CMD_WRITE_B0 + tail-call spectrum_opl_b0
+ * asm_emit_opl_b0 — запись CMD_WRITE_B0 + tail-call spectrum_opl_b0
  *
- * Reads fb_b1, fb_b2 (set by prior asm_read_2bytes).
- * Writes [CMD_WRITE_B0, reg, val, x] to fb_wp, advances fb_wp += 4.
- * Tail-calls spectrum_opl_b0(A=reg, L=val) — its RET returns to caller.
+ * Читает fb_b1, fb_b2 (установлены asm_read_2bytes).
+ * Пишет [CMD_WRITE_B0, reg, val, x] в fb_wp, продвигает fb_wp += 4.
+ * Tail-call spectrum_opl_b0(A=reg, L=val) — его RET возвращает
+ * управление вызывающему.
  *
- * Cost: ~128 T body + 17 call + 10 jp = 155 T total.
- * Was ~223 T (SDCC codegen): saves ~68 T per OPL Bank0 write.
+ * Стоимость: ~128 T тело + 17 call + 10 jp = 155 T итого.
+ * Было ~223 T (SDCC codegen): экономия ~68 T на каждую запись OPL Bank0.
  * ───────────────────────────────────────────────────────────────────── */
 static void asm_emit_opl_b0(void) __naked {
     __asm
@@ -772,8 +773,8 @@ static void asm_emit_opl_b0(void) __naked {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * asm_emit_opl_b1 — emit CMD_WRITE_B1 + tail-call spectrum_opl_b1
- * Same pattern as asm_emit_opl_b0 but for OPL3 Bank 1.
+ * asm_emit_opl_b1 — запись CMD_WRITE_B1 + tail-call spectrum_opl_b1
+ * Аналогично asm_emit_opl_b0, но для OPL3 Bank 1.
  * ───────────────────────────────────────────────────────────────────── */
 static void asm_emit_opl_b1(void) __naked {
     __asm
@@ -982,7 +983,7 @@ next_hl:
         /* ── Читаем опкод ──────────────────────────────────────── */
         fb_op = asm_read_byte();
 
-        /* ═══════ OPL2 write (0x5A) — самая частая ═══════ */
+        /* ═══════ OPL2 запись (0x5A) — самая частая ═══════ */
         if (fb_op == 0x5A)
         {
             asm_read_2bytes();
@@ -999,7 +1000,7 @@ next_hl:
         }
 
         /* ═══════ OPL Bank 0: 0x5B(YM3526) / 0x5C(Y8950) / 0x5E(OPL3bk0) ═══════
-         * Range 0x5B..0x5E — одна проверка, все → bank0.
+         * Диапазон 0x5B..0x5E — одна проверка, все → bank0.
          * 0x5D (YMZ280B) не поддерживается — если встретится, запись в bank0 безвредна. */
         if ((uint8_t)(fb_op - 0x5B) <= (0x5E - 0x5B))
         {
@@ -1016,7 +1017,7 @@ next_hl:
         if (fb_op == 0x63)
         { asm_wait_63(); goto do_wait; }
 
-        /* ═══════ Short wait 1-16 samples (0x70-0x7F) ═══════ */
+        /* ═══════ Короткая пауза 1-16 samples (0x70-0x7F) ═══════ */
 #ifndef VGM_NO_SHORT_WAITS
         if ((fb_op & 0xF0) == 0x70)
         { asm_short_wait(); goto do_wait; }
@@ -1025,7 +1026,7 @@ next_hl:
         if ((fb_op & 0xF0) == 0x70) continue;
 #endif
 
-        /* ═══════ Arbitrary wait (0x61) ═══════ */
+        /* ═══════ Произвольная пауза (0x61) ═══════ */
         if (fb_op == 0x61)
         {
             asm_read_2bytes();
@@ -1164,7 +1165,7 @@ next_hl:
         {
             asm_read_2bytes();
             if (fb_b1 & 0x80)
-                goto do_budget;     /* skip chip 2 */
+                goto do_budget;     /* пропуск chip 2 */
             fb_wp[0] = CMD_WRITE_SAA;
             fb_wp[1] = fb_b1;
             fb_wp[2] = fb_b2;
@@ -1173,7 +1174,7 @@ next_hl:
             goto do_budget;
         }
 
-        /* ═══════ End of data (0x66) ═══════ */
+        /* ═══════ Конец данных (0x66) ═══════ */
         if (fb_op == 0x66)
         {
             if (fb_is_vgm) {
@@ -1186,16 +1187,16 @@ next_hl:
             goto next_hl;
         }
 
-        /* ═══════ Data block (0x67) — rare ═══════ */
+        /* ═══════ Data block (0x67) — редко ═══════ */
         if (fb_op == 0x67)
         {
             fb_rp++; PAGE_CHK();  /* 0x66 */
-            fb_rp++; PAGE_CHK();  /* type */
+            fb_rp++; PAGE_CHK();  /* type байт */
             asm_read_2bytes();
             fb_t32 = (uint16_t)fb_b1 | ((uint16_t)fb_b2 << 8);
             asm_read_2bytes();
             fb_t32 |= ((uint32_t)fb_b1 << 16) | ((uint32_t)fb_b2 << 24);
-            /* save → call vgm_skip → reload */
+            /* сохранить → vgm_skip → восстановить */
             vgm_read_ptr = (uint16_t)fb_rp;
             vgm_cur_page = fb_cpg;
             vgm_skip(fb_t32);
@@ -1204,7 +1205,7 @@ next_hl:
             continue;
         }
 
-        /* ═══════ PCM RAM write (0x68) — rare ═══════ */
+        /* ═══════ PCM RAM write (0x68) — редко ═══════ */
         if (fb_op == 0x68)
         {
             vgm_read_ptr = (uint16_t)fb_rp;
@@ -1215,7 +1216,7 @@ next_hl:
             continue;
         }
 
-        /* ═══════ DAC Stream (0x90-0x95) — rare ═══════ */
+        /* ═══════ DAC Stream (0x90-0x95) — редко ═══════ */
         if (fb_op >= 0x90 && fb_op <= 0x95)
         {
             static const uint8_t dac_len[] = {4, 4, 5, 10, 1, 4};
@@ -1224,7 +1225,7 @@ next_hl:
             continue;
         }
 
-        /* ═══════ Generic skip (all other commands) ═══════ */
+        /* ═══════ Общий пропуск (все остальные команды) ═══════ */
         /* Размеры операндов по VGM spec v1.71.
          * Все явно обработанные опкоды (0x5A,0x5B,..,0xA0,0xBD,
          * 0x61-0x63,0x66-0x68,0x7n,0x90-0x95) сюда не попадают.    */
@@ -1244,7 +1245,7 @@ next_hl:
         }
         continue;
 
-    /* ═══════ Wait post-processing (all wait paths set fb_tk and fb_wacc directly) ═══════ */
+    /* ═══════ Обработка задержек (wait paths устанавливают fb_tk и fb_wacc напрямую) ═══════ */
     do_wait:
         /* Компенсация: бюджетные yield-ы уже потратили реальные ISR-тики.
          * Вычитаем их из VGM-задержки, чтобы общий темп не замедлялся. */
@@ -1297,7 +1298,7 @@ finish:
     fb_wp[0] = CMD_END_BUF;
 }
 
-/* ── GD3 metadata buffers ────────────────────────────────────────── */
+/* ── Буферы GD3 metadata ─────────────────────────────────────────── */
 char vgm_gd3_track[VGM_GD3_LEN];
 char vgm_gd3_game[VGM_GD3_LEN];
 char vgm_gd3_system[VGM_GD3_LEN];
