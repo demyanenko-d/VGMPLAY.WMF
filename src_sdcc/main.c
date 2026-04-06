@@ -517,9 +517,9 @@ uint8_t drow_ui(void)
         buf_clear(work_buf);
         buf_append_str(work_buf, "Freq        : ");
         if (vgm_freq_mode == FREQ_MODE_TABLE) {
-            buf_append_str(work_buf, "table");   /* таблица (CP866) */
+            buf_append_str(work_buf, "Table");   /* таблица (CP866) */
         } else {
-            buf_append_str(work_buf, "native");              /* натив (CP866) */
+            buf_append_str(work_buf, "Native");              /* натив (CP866) */
         }
         print_line(&s_wnd, row++, work_buf,
             (vgm_freq_mode == FREQ_MODE_NATIVE)
