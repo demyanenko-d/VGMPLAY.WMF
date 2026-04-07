@@ -102,6 +102,8 @@ ptr_table:
         dw blk_saa_clock_off       ; 8 = CMDBLK_SAA_CLK_OFF
         dw blk_silence_ym2203      ; 9 = CMDBLK_SILENCE_YM2203
         dw blk_silence_ym2203_2    ; 10 = CMDBLK_SILENCE_YM2203_2
+        dw blk_saa_init            ; 11 = CMDBLK_SAA_INIT
+        dw blk_saa2_init           ; 12 = CMDBLK_SAA2_INIT
 
 ; ═══════════════════════════════════════════════════════════════════════
 ; CMDBLK_INIT_OPL3 — OPL3 init (NEW=1, clean state)
@@ -451,6 +453,32 @@ blk_silence_ym2203_2:
         ym2203_2_write #2F, #01      ; VGM: 55 2D 00
         ym2203_2_write #2D, #01      ; VGM: A5 2E 00
 
+        blk_end
+
+; ═══════════════════════════════════════════════════════════════════════
+; CMDBLK_SAA_INIT — SAA1099 chip 1 Sound Enable ON
+;
+; Writes reg 0x1C = 0x01 to chip 0 (Sound Enable ON).
+; Parsed via cmdblk → fb_is_vgm==0 → bypasses saa_mode filter.
+;
+; VGM stream:  BD 1C 01  66
+; ═══════════════════════════════════════════════════════════════════════
+blk_saa_init:
+        saa_write #1C, #01         ; VGM: BD 1C 01 — Sound Enable ON (chip 0)
+        blk_end
+
+; ═══════════════════════════════════════════════════════════════════════
+; CMDBLK_SAA2_INIT — SAA1099 chip 2 Sound Enable ON (+ clock enable)
+;
+; Writes reg 0x1C|0x80 = 0x9C to chip 1 (bit7 selects chip 1).
+; In HDL: address write 0x9C → saa_reg_is_1c=1, then data 0x01 with
+; d[0]=1 triggers saa2_clk_en (one-way clock enable for chip 2).
+; Parsed via cmdblk → fb_is_vgm==0 → bypasses saa_mode filter.
+;
+; VGM stream:  BD 9C 01  66
+; ═══════════════════════════════════════════════════════════════════════
+blk_saa2_init:
+        saa2_write #1C, #01        ; VGM: BD 9C 01 — Sound Enable ON (chip 1 + clk)
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════

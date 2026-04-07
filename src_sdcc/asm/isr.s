@@ -60,7 +60,6 @@ CMD_WRITE_B0  = 0x40
 CMD_SKIP_TICKS= 0x50
 CMD_WRITE_SAA = 0x60
 CMD_WRITE_B1  = 0x80
-CMD_WRITE_SAA2= 0xA0
 CMD_WAIT      = 0xC0
 CMD_END_BUF   = 0xE0
 CMD_ISR_DONE  = 0xF0
@@ -78,9 +77,11 @@ OPL3_DATA1 = 0xC7
 AY_ADDR    = 0xFD       ; C-byte, B=0xFF → #FFFD
 AY_DATA_B  = 0xBF       ; B-byte, C=#FD  → #BFFD
 
-; Порты SAA1099 (MultiSound card)
-;   SAA1:  addr=#00FF  data=#01FF
-;   SAA2:  addr=#02FF  data=#03FF
+; Порты SAA1099 (MultiSound card, dual-chip via bit7 of address)
+;   addr=#01FF  data=#00FF
+;   bit7 of reg byte written to #01FF selects chip (0=chip0, 1=chip1)
+;   chip1 clk on: automatic on first write to chip1 (address with bit7=1)
+;   both clk off: OUT #FFFD, d[3]=1
 
 ISR_FREQ = 683    ; informational only (actual timing from pos_table)
 
@@ -276,8 +277,6 @@ _isr_cmd_loop:
         jp      z, _isr_write_ay2
         cp      #CMD_WRITE_SAA
         jp      z, _isr_write_saa
-        cp      #CMD_WRITE_SAA2
-        jp      z, _isr_write_saa2
         ; Rare commands
         cp      #CMD_END_BUF
         jp      z, _isr_do_end_buf
@@ -399,36 +398,19 @@ _isr_write_ay2:
         inc     de                  ; pad
         jp      _isr_cmd_loop
 
-;--- SAA1099 chip 1 write: [reg, val, pad] --------------------------------
+;--- SAA1099 write: [reg, val, pad] ----------------------------------------
+; reg bit7 = chip select (0=chip0, 1=chip1), passed directly to #01FF.
+; HDL uses bit7 for CS routing; SAA1099 ignores upper address bits.
 _isr_write_saa:
         ld      bc, #PORT_SYSCONF
         ld      a, #TURBO_7MHZ
         out     (c), a              ; → 7 MHz
-        ld      a, (de)             ; reg
-        ld      bc, #0x00FF         ; SAA1 address port
-        out     (c), a
+        ld      a, (de)             ; reg (bit7 = chip select)
+        ld      bc, #0x01FF         ; SAA address port
+        out     (c), a              ; write register address (bit7 → chip CS)
         inc     de
         ld      a, (de)             ; val
-        ld      b, #0x01            ; BC = #01FF  SAA1 data port
-        out     (c), a
-        ld      bc, #PORT_SYSCONF
-        ld      a, #TURBO_14MHZ
-        out     (c), a              ; → 14 MHz
-        inc     de
-        inc     de                  ; pad
-        jp      _isr_cmd_loop
-
-;--- SAA1099 chip 2 write: [reg, val, pad] --------------------------------
-_isr_write_saa2:
-        ld      bc, #PORT_SYSCONF
-        ld      a, #TURBO_7MHZ
-        out     (c), a              ; → 7 MHz
-        ld      a, (de)             ; reg
-        ld      bc, #0x02FF         ; SAA2 address port
-        out     (c), a
-        inc     de
-        ld      a, (de)             ; val
-        ld      b, #0x03            ; BC = #03FF  SAA2 data port
+        ld      b, #0x00            ; BC = #00FF  SAA data port
         out     (c), a
         ld      bc, #PORT_SYSCONF
         ld      a, #TURBO_14MHZ

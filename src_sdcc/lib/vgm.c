@@ -13,7 +13,7 @@
  *                    cmd 0x5F → CMD_WRITE_B1
  *   AY8910 (PSG):   cmd 0xA0 → CMD_WRITE_AY / CMD_WRITE_AY2 (dual)
  *   YM2203 (OPN):   cmd 0x55 → CMD_WRITE_AY (PSG-часть)
- *   SAA1099:        cmd 0xBD → CMD_WRITE_SAA / CMD_WRITE_SAA2 (dual)
+ *   SAA1099:        cmd 0xBD → CMD_WRITE_SAA (bit7 = chip select)
  *
  * Распознавание (parse_header, vgm_chip_list[]):
  *   Все 40 чипов VGM spec, включая dual-chip (бит 30 clock).
@@ -70,7 +70,10 @@ static uint16_t vgm_wait_accum = 0;
 /* Не static: используется ASM-хелперами spectrum (asm/spectrum.s)      */
 uint16_t spec_mask;            /* 16-бит: bit N → полоса N на максимум   */
 uint16_t spec_ay_period[6];    /* AY period shadow: ch0-2(chip1), ch0-2(chip2) */
-uint8_t  spec_saa_oct[6];      /* SAA octave shadow: каналы 0-5          */
+uint8_t  spec_saa_oct[6];      /* SAA octave shadow: chip 0 каналы 0-5  */
+uint8_t  spec_saa_oct2[6];     /* SAA octave shadow: chip 1 каналы 0-5  */
+uint8_t  spec_saa_dual;        /* 1=dual SAA: bars 0-7 / 8-15 split     */
+uint8_t  cfg_saa_mode = 0;     /* 0=chip0 only(default), 1=chip1 on chip0, 2=turbo(both) */
 uint8_t  spec_opl_bd;          /* OPL 0xBD shadow для детекции фронта    */
 uint8_t  spec_fm_block[6];     /* YM2203 FM block shadow: ch0-2(chip1/2)*/
 
@@ -133,6 +136,7 @@ extern void spectrum_opl_b1(uint8_t reg, uint8_t val);
 extern void spectrum_ay(uint8_t reg, uint8_t val);
 extern void spectrum_ay2(uint8_t reg, uint8_t val);
 extern void spectrum_saa(uint8_t reg, uint8_t val);
+extern void spectrum_saa2(uint8_t reg, uint8_t val);
 
 
 /* ── Таблица сканирования чипов (ROM-const) ──────────────────────── */
@@ -826,6 +830,94 @@ static void asm_emit_opl_b1(void) __naked {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * asm_emit_saa — SAA1099 0xBD handler (inline asm)
+ *
+ * Вызывается ПОСЛЕ asm_read_2bytes() (fb_b1 = reg, fb_b2 = val).
+ *
+ * Логика:
+ *   fb_is_vgm==0 (cmdblk) → emit raw CMD_WRITE_SAA, return
+ *   VGM mode:
+ *     bit7=1 (chip1):
+ *       cfg_saa_mode==0 → skip (return)
+ *       cfg_saa_mode==1 → strip bit7, emit, spectrum_saa
+ *       cfg_saa_mode==2 → emit raw, spectrum_saa2
+ *     bit7=0 (chip0):
+ *       cfg_saa_mode==1 → skip (return)
+ *       else → emit raw, spectrum_saa
+ *
+ * CMD_WRITE_SAA = 0x60.  spectrum_saa/saa2: A=reg, L=val.
+ * Clobbers: A, B, C, D, E, H, L.
+ * ───────────────────────────────────────────────────────────────────── */
+static void asm_emit_saa(void) __naked {
+    __asm
+
+    ;; D = reg (fb_b1), E = val (fb_b2)
+    ld   a, (_fb_b1)       ;13
+    ld   d, a              ; 4
+    ld   a, (_fb_b2)       ;13
+    ld   e, a              ; 4
+
+    ;; cmdblk (fb_is_vgm==0) → emit raw, no spectrum
+    ld   a, (_fb_is_vgm)   ;13
+    or   a, a              ; 4
+    jr   nz, 200$          ;12/7
+    call 250$
+    ret
+
+200$:
+    ;; VGM mode — A = cfg_saa_mode
+    ld   a, (_cfg_saa_mode) ;13
+    bit  7, d              ; 8
+    jr   nz, 210$          ;12/7  chip 1
+
+    ;; ── Chip 0: skip if mode==1 ──
+    cp   a, #1             ; 7
+    ret  z                 ; skip chip0 in mode 1
+    jr   230$              ; → emit + spectrum_saa
+
+210$:
+    ;; ── Chip 1: skip if mode==0 ──
+    or   a, a              ; 4
+    ret  z                 ; skip chip1 in mode 0
+    cp   a, #2             ; 7
+    jr   z, 220$           ; → turbo
+
+    ;; mode 1: strip bit7 → play on chip 0
+    res  7, d              ; 8
+    ;; fall through to 230$ (emit + spectrum_saa)
+
+230$:
+    ;; emit D,E → spectrum_saa(A=reg, L=val)
+    call 250$
+    ld   a, d              ; 4
+    ld   l, e              ; 4
+    jp   _spectrum_saa     ;10
+
+220$:
+    ;; turbo: emit raw → spectrum_saa2(A=reg&0x7F, L=val)
+    call 250$
+    ld   a, d              ; 4
+    and  a, #0x7F          ; 7
+    ld   l, e              ; 4
+    jp   _spectrum_saa2    ;10
+
+    ;; ── shared: write [0x60, D, E, pad] to fb_wp ──
+250$:
+    ld   hl, (_fb_wp)      ;16
+    ld   (hl), #0x60       ;10  CMD_WRITE_SAA
+    inc  hl                ; 6
+    ld   (hl), d           ; 7
+    inc  hl                ; 6
+    ld   (hl), e           ; 7
+    inc  hl                ; 6
+    inc  hl                ; 6
+    ld   (_fb_wp), hl      ;16
+    ret                    ;10
+
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * asm_scale_fm — FM F-Number масштабирование: fb_scaled = fb_scaled × fm_mul / 7
  *
  * Все используемые FM ratios сводятся к N/7:
@@ -851,46 +943,46 @@ static void asm_scale_fm(void) __naked {
 
     ld   hl, (_fb_scaled)   ; HL = fnum
 
-    ;; ── Умножение fnum × N (dispatch по fm_mul) ──
+    ;; ── Умножение fnum x N (dispatch по fm_mul) ──
     cp   #3
     jr   z, sfm_mul3
     cp   #5
     jr   z, sfm_mul5
     cp   #6
     jr   z, sfm_mul6
-    ;; fm_mul=8: ×8
-    add  hl, hl             ; ×2
-    add  hl, hl             ; ×4
-    add  hl, hl             ; ×8
+    ;; fm_mul=8: x8
+    add  hl, hl             ; x2
+    add  hl, hl             ; x4
+    add  hl, hl             ; x8
     jr   sfm_div7
 
 sfm_mul3:
     ld   d, h
     ld   e, l               ; DE = fnum
-    add  hl, hl             ; ×2
-    add  hl, de             ; ×3
+    add  hl, hl             ; x2
+    add  hl, de             ; x3
     jr   sfm_div7
 
 sfm_mul5:
     ld   d, h
     ld   e, l               ; DE = fnum
-    add  hl, hl             ; ×2
-    add  hl, hl             ; ×4
-    add  hl, de             ; ×5
+    add  hl, hl             ; x2
+    add  hl, hl             ; x4
+    add  hl, de             ; x5
     jr   sfm_div7
 
 sfm_mul6:
     ld   d, h
     ld   e, l               ; DE = fnum
-    add  hl, hl             ; ×2
-    add  hl, de             ; ×3
-    add  hl, hl             ; ×6
+    add  hl, hl             ; x2
+    add  hl, de             ; x3
+    add  hl, hl             ; x6
     ;; fall through
 
     ;; ── Деление HL на 7, результат в HL ──────────
     ;; Binary long division: 16-bit dividend, 8-bit divisor.
     ;; Остаток в A (всегда 0..6, помещается в 8 бит).
-    ;; Максимум: 2047×8 = 16376; 16376/7 = 2339.
+    ;; Максимум: 2047x8 = 16376; 16376/7 = 2339.
 sfm_div7:
     xor  a                  ; A = remainder = 0
     ld   b, #16             ; 16 бит
@@ -1089,7 +1181,7 @@ next_hl:
 
     /* ═══════════════════════════════════════════════════════════════
      * Горячий цикл — разбор VGM-опкодов → ISR-команды
-     * EOF-проверка удалена (гарантирован 0x66-сентинел в данных).
+     * EOF-проверка удалена (гарантирован 0x66 в данных).
      * ═══════════════════════════════════════════════════════════════ */
     while (fb_wp < fb_end) // зазор 48 байт для emit_wait (макс. 32 байта) + CMD_END_BUF (4 байта) + safety
     {
@@ -1350,18 +1442,13 @@ ym2_fm_passthru:;
         }
 
         /* ═══════ SAA1099 dual (0xBD) ═══════ */
-        /* MultiSound имеет только один физический SAA1099 —
-         * chip 2 (bit7=1) пропускаем, играем только chip 1. */
+        /* Bit7 of reg byte selects chip (0=chip0, 1=chip1).
+         * cfg_saa_mode: 0=chip0 only(default), 1=chip1 on chip0, 2=turbo(both).
+         * cmdblk mode (fb_is_vgm==0): bypass filtering, pass raw. */
         if (fb_op == 0xBD)
         {
             asm_read_2bytes();
-            if (fb_b1 & 0x80)
-                goto do_budget;     /* пропуск chip 2 */
-            fb_wp[0] = CMD_WRITE_SAA;
-            fb_wp[1] = fb_b1;
-            fb_wp[2] = fb_b2;
-            fb_wp += 4;
-            spectrum_saa(fb_b1, fb_b2);
+            asm_emit_saa();
             goto do_budget;
         }
 
@@ -1441,30 +1528,44 @@ ym2_fm_passthru:;
         /* Компенсация: бюджетные yield-ы уже потратили реальные ISR-тики.
          * Вычитаем их из VGM-задержки, чтобы общий темп не замедлялся. */
         if (fb_tk > fb_yield_ticks)
-            fb_tk -= fb_yield_ticks;
+            // реальная пауза меньше заявленной на fb_yield_ticks, компенсируем
+            fb_tk -= fb_yield_ticks; 
         else
+            // пауза полностью съедена накладными расходами, не ждем вообще
             fb_tk = 0;
+        
+        // сбросить счетчик накладных расходов, они уже компенсированы
         fb_yield_ticks = 0;
 
-        if (fb_tk) {
-            if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) {
+        if (fb_tk) { 
+            // есть что ждать
+
+            if (fb_tk <= ISR_TICKS_PER_FRAME && fb_tk < vgm_sec_budget) { 
+                // короткая пауза, помещается в один кадр — пропустить через SKIP
                 asm_emit_skip_spec((uint8_t)(fb_tk - 1));
-                vgm_sec_budget -= fb_tk;
+                vgm_sec_budget -= fb_tk; // учесть в сек. бюджете
             } else {
                 emit_wait(fb_tk);
             }
+
+            // после паузы бюджет обновлен, можно продолжать заполнять буфер
             fb_budget = VGM_FILL_CMD_BUDGET;
         }
         continue;
 
     do_budget:
+        // Бюджет команд: после каждого опкода уменьшаем, при 0 — пауза или yield
         if (--fb_budget == 0)
         {
+            // бюджет исчерпан — сделать паузу, восстановить бюджет
+
             if (vgm_sec_budget > 1) {
+                // Остаток бюджета больше одного кадра — сделать yield (пауза через CMD_INC_SEC)
                 asm_emit_skip_spec(0);
                 vgm_sec_budget--;
                 fb_yield_ticks++;  /* запомнить: этот тик — накладной расход */
             } else {
+                // Остаток бюджета меньше одного кадра — сделать реальную паузу
                 emit_wait(1);
             }
             fb_budget = VGM_FILL_CMD_BUDGET;

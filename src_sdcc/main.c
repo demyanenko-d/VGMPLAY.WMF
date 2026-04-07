@@ -12,8 +12,9 @@
  *
  * Управление:
  *   Q        — выход
- *   N        — следующий файл в каталоге
+ *   SPACE/N  — следующий файл в каталоге
  *   P        — предыдущий файл
+ *   1/2      — SAA режим (chip0 / chip1) для dual музыки
  */
 
 #include "inc/types.h"
@@ -92,6 +93,11 @@ static uint8_t s_has_opl, s_has_ay, s_has_ay2;
 static uint8_t s_has_saa, s_has_saa2;
 static uint8_t s_has_ym2203, s_has_ym2203_2;
 
+/* SAA dual mode config (defined in vgm.c) */
+extern uint8_t cfg_saa_mode;
+static uint8_t s_saa_mode_user;   /* user setting from INI (preserved across tracks) */
+static uint8_t s_board_dual_saa;  /* 0=одночиповая(default), 1=двухчиповая (INI param 4) */
+
 static void detect_active_chips(void)
 {
     s_has_opl = s_has_ay = s_has_ay2 = 0;
@@ -159,11 +165,17 @@ static void build_playback_queue(void)
     if (s_has_ym2203_2)
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_YM2203_2);
 
-    /* Включить SAA clock через MultiSound ctrl перед воспроизведением.
-     * CMDBLK_SAA_CLK_ON пишет 0xF3 в #FFFD через очередь ISR-команд,
-     * гарантируя сохранение SAA clock даже если WC handler трогает #FFFD. */
-    if (s_has_saa)
+    /* SAA: гасим saa2, потом saa1 (даже на одночиповой плате),
+     * затем clock ON, затем Sound Enable по режиму.
+     * cmdblk bypass гарантирует прохождение команд chip2. */
+    if (s_has_saa) {
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_SAA2);
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_SAA);
         hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_ON);
+        hl_push(HLCMD_CMDBLK, CMDBLK_SAA_INIT);
+        if (cfg_saa_mode == 2)
+            hl_push(HLCMD_CMDBLK, CMDBLK_SAA2_INIT);
+    }
 
     /* Основное воспроизведение */
     hl_push(HLCMD_PLAY, 0);
@@ -188,9 +200,11 @@ static void build_playback_queue(void)
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_YM2203_2);
     else if (s_has_ay2)
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_AY2);
-    if (s_has_saa)
+    if (s_has_saa) {
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_SAA2);
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_SAA);
-    /* SAA2 silence не нужен — MultiSound имеет только один SAA1099 */
+        hl_push(HLCMD_CMDBLK, CMDBLK_SAA_CLK_OFF);
+    }
 
     hl_push(HLCMD_ISR_DONE, 0);
 
@@ -559,7 +573,11 @@ uint8_t drow_ui(void)
 
     /* ── Строка подсказок (фиксированная позиция) ─────────────── */
     buf_clear(work_buf);
-    buf_append_str(work_buf, " [N]ext [P]rev [Q] Exit");
+    buf_append_str(work_buf, " [N/Space] Next [P]rev [Q] Exit");
+    if (s_has_saa2 && !s_board_dual_saa) {
+        buf_append_str(work_buf, "  SAA:");
+        buf_append_char(work_buf, '1' + cfg_saa_mode);
+    }
     print_line(&s_wnd, ROW_HELP, work_buf, CLR_TITLE);
 
     return ROW_PROGRESS;
@@ -734,28 +752,21 @@ void start_playback(void)
             out  (c), a
         __endasm;
 
-        // SAA1099: принудительный Sound Enable ON до начала воспроизведения.
+        // SAA1099: effective mode computation.
+        // saa1/saa2 = микросхемы на плате, chip0/chip1 = чипы в VGM.
+        // Двухчиповая (saa_chips=2): single→saa1, dual→saa1+saa2 (turbo).
+        // Одночиповая (saa_chips=1): всегда saa1; dual → chip0 или chip1 по выбору.
+        if (s_board_dual_saa)
+            cfg_saa_mode = s_has_saa2 ? 2 : 0;
+        else
+            cfg_saa_mode = s_has_saa2 ? s_saa_mode_user : 0;
 
-        if (s_has_saa) {
-            __asm
-                ;; TURBO 7 MHz
-                ld   bc, #0x20AF
-                ld   a, #0x01       ; TURBO_7MHZ
-                out  (c), a
-                ;; SAA1: reg 0x1C (Sound Enable)
-                ld   a, #0x1C
-                ld   bc, #0x00FF    ; SAA1 address port
-                out  (c), a
-                ;; SAA1: val 0x01 (Sound Enable ON)
-                ld   a, #0x01
-                ld   b, #0x01      ; BC = #01FF  SAA1 data port
-                out  (c), a
-                ;; TURBO 14 MHz
-                ld   bc, #0x20AF
-                ld   a, #0x02       ; TURBO_14MHZ
-                out  (c), a
-            __endasm;
-        }
+        // Set spectrum dual mode flag (only in turbo mode with dual VGM).
+        extern uint8_t spec_saa_dual;
+        spec_saa_dual = (s_has_saa2 && cfg_saa_mode == 2) ? 1 : 0;
+
+        /* SAA init/deinit is now handled entirely via cmdblocks
+         * in build_playback_queue() — no inline asm needed. */
 
         /* Построить очередь HL-команд для этого трека */
         build_playback_queue();
@@ -989,10 +1000,12 @@ void main(void)
     wc_turbopl(WC_TURBO_CPU, 0x02);  /* 14 МГц */
 
     /* ── Чтение INI-параметров ───────────────────────────────────────
-     * Формат в wc.ini:  VGMPLAY.WMF -min_dur=10 -max_dur=4 -loops=1
+     * Формат в wc.ini:  VGMPLAY.WMF -min_dur=10 -max_dur=4 -loops=1 -saa=1 -saa_chips=1
      *   param 0: min_duration секунд  (default 10)
      *   param 1: max_duration в минутах (default 4 → 240 сек)
      *   param 2: loop_count           (default 1)
+     *   param 3: saa mode  1=chip0(default), 2=chip1 (только 1-чип + dual музыка)
+     *   param 4: saa_chips 1=один SAA(default), 2=два SAA (эксп. плата)
      * wc_prm_pl() возвращает 0xFF если параметр не задан.            */
     {
         uint8_t v;
@@ -1004,6 +1017,13 @@ void main(void)
 
         v = wc_prm_pl(2);
         if (v != 0xFF) cfg_loop_rewinds = v;
+
+        v = wc_prm_pl(3);
+        if (v >= 1 && v <= 2) cfg_saa_mode = v - 1;
+        s_saa_mode_user = cfg_saa_mode;
+
+        v = wc_prm_pl(4);
+        s_board_dual_saa = (v == 2) ? 1 : 0;
     }
 
     wc_strset((char *)&s_wnd, sizeof(s_wnd), 0);
@@ -1179,6 +1199,19 @@ void main(void)
             vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_ESC;
             instant_abort();
+        }
+        else if (key >= KEY_SAA1 && key <= KEY_SAA2 && s_has_saa2 && !s_board_dual_saa)
+        {
+            uint8_t new_mode = key - KEY_SAA1; /* 0 or 1 */
+            s_saa_mode_user = new_mode;
+            cfg_saa_mode = new_mode;
+            extern uint8_t spec_saa_dual;
+            spec_saa_dual = 0;
+            /* Обновить подсказку SAA mode */
+            buf_clear(work_buf);
+            buf_append_str(work_buf, " [N/Space] Next [P]rev [Q] Exit  SAA:");
+            buf_append_char(work_buf, '1' + cfg_saa_mode);
+            print_line(&s_wnd, ROW_HELP, work_buf, CLR_TITLE);
         }
 
         if (isr_play_seconds != s_last_displayed_sec || vgm_loop_count  != s_last_loop_count)

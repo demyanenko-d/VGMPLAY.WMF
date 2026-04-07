@@ -37,9 +37,9 @@
  *   CMD_CALL_WC   │ 0      │ 0      │ 0      │ Вызов WC ISR handler
  *   CMD_WRITE_B0  │ reg    │ val    │ 0      │ OUT OPL3 Bank 0
  *   CMD_SKIP_TICKS│ N      │ smsk_lo│ smsk_hi│ Пропустить N позиций pos_table
- *   CMD_WRITE_SAA │ reg    │ val    │ 0      │ OUT SAA1099 chip 1
+ *   CMD_WRITE_SAA │ reg    │ val    │ 0      │ OUT SAA1099 chip 0
  *   CMD_WRITE_B1  │ reg    │ val    │ 0      │ OUT OPL3 Bank 1
- *   CMD_WRITE_SA2 │ reg    │ val    │ 0      │ OUT SAA1099 chip 2
+ *   CMD_WRITE_SA2 │ reg    │ val    │ 0      │ OUT SAA1099 chip 1
  *   CMD_WAIT      │ lo     │ hi     │ 0      │ Ждать (hi<<8)|lo тиков
  *   CMD_END_BUF   │ 0      │ 0      │ 0      │ Переключить буфер
  *
@@ -83,9 +83,8 @@
 #define CMD_CALL_WC   0x30  /* Вызов WC ISR handler: [0,0,0]        */
 #define CMD_WRITE_B0  0x40  /* OPL3 Bank 0 write: [reg, val, 0]      */
 #define CMD_SKIP_TICKS 0x50 /* Пропустить N pos_table: [N,sml,smh]  */
-#define CMD_WRITE_SAA 0x60  /* SAA1099 chip 1: [reg, val, 0]         */
+#define CMD_WRITE_SAA 0x60  /* SAA1099 write: [reg, val, 0] bit7=chip */
 #define CMD_WRITE_B1  0x80  /* OPL3 Bank 1 write: [reg, val, 0]      */
-#define CMD_WRITE_SAA2 0xA0 /* SAA1099 chip 2: [reg, val, 0]         */
 #define CMD_WAIT      0xC0  /* Ждать N ISR-тиков:  [lo,  hi,  0]      */
 #define CMD_END_BUF   0xE0  /* Переключить буфер: [0,   0,   0]      */
 #define CMD_ISR_DONE  0xF0  /* Заморозить ISR, выставить isr_done: [0,0,0] */

@@ -22,7 +22,7 @@
  *   0x5F rr dd  — YMF262  (OPL3) Bank 1 write  → CMD_WRITE_B1
  *   0x55 rr dd  — YM2203  PSG-часть (AY), reg 0-15 → CMD_WRITE_AY
  *   0xA0 rr dd  — AY8910  (чип 1/2 по [7])  → CMD_WRITE_AY / CMD_WRITE_AY2
- *   0xBD rr dd  — SAA1099 (чип 1/2 по [7])  → CMD_WRITE_SAA / CMD_WRITE_SAA2
+ *   0xBD rr dd  — SAA1099 (чип 1/2 по [7])  → CMD_WRITE_SAA (bit7 = chip select)
  *   0x61 nn nn  — Wait N samples (16-bit LE)
  *   0x62        — Wait 735 samples (1/60 сек)
  *   0x63        — Wait 882 samples (1/50 сек)
@@ -229,7 +229,7 @@ uint8_t vgm_parse_header(void);
  *   0x5F                     → CMD_WRITE_B1 (OPL3 bank 1)
  *   0x55                     → CMD_WRITE_AY (YM2203 PSG-часть, reg 0-15)
  *   0xA0                     → CMD_WRITE_AY / CMD_WRITE_AY2 (AY8910, dual)
- *   0xBD                     → CMD_WRITE_SAA / CMD_WRITE_SAA2 (SAA1099, dual)
+ *   0xBD                     → CMD_WRITE_SAA (SAA1099, bit7 = chip select)
  *   0x61/0x62/0x63/0x70-0x7F → CMD_WAIT
  *   0x66                     → end; 0x67 → data block skip
  *
@@ -278,6 +278,8 @@ const char *vgm_chip_name(uint8_t id);
 #define CMDBLK_SAA_CLK_OFF  8   /* MultiSound: SAA clock disable      */
 #define CMDBLK_SILENCE_YM2203   9 /* YM2203 chip 1: SSG+FM silence      */
 #define CMDBLK_SILENCE_YM2203_2 10 /* YM2203 chip 2 (TS): SSG+FM silence */
+#define CMDBLK_SAA_INIT     11  /* SAA1099 chip 1: Sound Enable ON     */
+#define CMDBLK_SAA2_INIT    12  /* SAA1099 chip 2: Sound Enable ON+clk */
 
 /* ─── Очередь высокоуровневых команд (HL queue) ───────────────── */
 

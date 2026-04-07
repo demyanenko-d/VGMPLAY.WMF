@@ -119,18 +119,21 @@ powershell -NoProfile -Command ^
   "Write-Host '';" ^
   "Write-Host '  Section        Start    End      Size';" ^
   "Write-Host '  -------------- -------- -------- ----------';" ^
-  "$lastEnd=0;" ^
+  "$lastEnd=0;$codeEnd=0;$dataStart=0;" ^
   "foreach($s in $secs){" ^
   "  $st=[Convert]::ToInt32((gs ('s__'+$s)),16);" ^
   "  $ln=[Convert]::ToInt32((gs ('l__'+$s)),16);" ^
   "  if($ln -eq 0){continue};" ^
   "  $en=$st+$ln-1;" ^
   "  if($en -gt $lastEnd){$lastEnd=$en};" ^
+  "  if($s -eq 'CODE'){$codeEnd=$en};" ^
+  "  if($s -eq 'DATA'){$dataStart=$st};" ^
   "  Write-Host ('  _'+$s.PadRight(14)+' 0x'+$st.ToString('X4')+'   0x'+$en.ToString('X4')+'   '+$ln.ToString().PadLeft(5)+' bytes')" ^
   "};" ^
   "$free=0xBFFF-$lastEnd;" ^
   "Write-Host '  -------------- -------- -------- ----------';" ^
   "Write-Host ('  Last byte: 0x'+$lastEnd.ToString('X4')+'   Free before C000: '+$free+' bytes');" ^
+  "if($codeEnd -ge $dataStart -and $dataStart -gt 0){Write-Host ('  *** ERROR: _CODE (end 0x'+$codeEnd.ToString('X4')+') overlaps _DATA (start 0x'+$dataStart.ToString('X4')+')! ***') -ForegroundColor Red; exit 1};" ^
   "if($lastEnd -ge 0xC000){Write-Host '  *** ERROR: sections overflow past 0xBFFF! ***' -ForegroundColor Red; exit 1}"
 if errorlevel 1 goto :err
 

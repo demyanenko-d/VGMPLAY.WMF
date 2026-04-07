@@ -27,6 +27,7 @@
         .globl  _spectrum_ay
         .globl  _spectrum_ay2
         .globl  _spectrum_saa
+        .globl  _spectrum_saa2
         .globl  _spec_period_to_bar
         .globl  _spectrum_font_init
         .globl  _spectrum_font_restore
@@ -39,6 +40,8 @@
         .globl  _spec_mask              ; uint16_t in vgm.c _DATA
         .globl  _spec_ay_period         ; uint16_t[6] in vgm.c _DATA
         .globl  _spec_saa_oct           ; uint8_t[6] in vgm.c _DATA
+        .globl  _spec_saa_oct2          ; uint8_t[6] in vgm.c _DATA (chip 2)
+        .globl  _spec_saa_dual          ; uint8_t    in vgm.c _DATA
         .globl  _spec_opl_bd            ; uint8_t in vgm.c _DATA
         .globl  _spec_fm_block          ; uint8_t[6] in vgm.c _DATA
 
@@ -727,7 +730,8 @@ sptb_p7:
 ;======================================================================
 ; spectrum_saa(reg, val) — A=reg, L=val
 ;
-; SAA1099: shadow octave (regs 0x10-0x12), trigger on amplitude (0-5).
+; SAA1099 chip 0: shadow octave (regs 0x10-0x12), trigger on amplitude (0-5).
+; Bar mapping: if dual → bar=octave (0-7); if single → bar=octave*2 (0-14).
 ;======================================================================
 _spectrum_saa::
         ld      d, a                    ; D = reg
@@ -772,7 +776,7 @@ ssaa_check_amp:
         ld      a, e
         or      a, a
         ret     z
-        ; bar = spec_saa_oct[reg] << 1
+        ; bar = spec_saa_oct[reg]
         ld      a, d                    ; A = reg (0..5)
         ld      hl, #_spec_saa_oct
         add     a, l
@@ -780,8 +784,71 @@ ssaa_check_amp:
         jr      nc, ssaa_nc2
         inc     h
 ssaa_nc2:
-        ld      a, (hl)                 ; A = octave
-        add     a, a                    ; A = octave * 2 = bar
+        ld      a, (hl)                 ; A = octave (0..7)
+        ; if dual: bar = octave; if single: bar = octave * 2
+        ld      hl, #_spec_saa_dual
+        bit     0, (hl)
+        jr      nz, ssaa_bar_done
+        add     a, a                    ; A = octave * 2
+ssaa_bar_done:
+        jp      _set_spec_bit           ; tail-call
+
+;======================================================================
+; spectrum_saa2(reg, val) — A=reg, L=val
+;
+; SAA1099 chip 1: shadow octave to spec_saa_oct2[],
+; trigger on amplitude with bar = octave + 8 (bars 8-15).
+;======================================================================
+_spectrum_saa2::
+        ld      d, a                    ; D = reg
+        ld      e, l                    ; E = val
+
+        ; ── Check octave shadow (regs 0x10-0x12) ──
+        cp      a, #0x10
+        jr      c, ssaa2_check_amp
+        cp      a, #0x13
+        jr      nc, ssaa2_check_amp
+
+        ; ch = (reg - 0x10) * 2
+        sub     a, #0x10
+        add     a, a
+        ld      hl, #_spec_saa_oct2
+        add     a, l
+        ld      l, a
+        jr      nc, ssaa2_nc1
+        inc     h
+ssaa2_nc1:
+        ld      a, e
+        and     a, #0x07
+        ld      (hl), a
+        inc     hl
+        ld      a, e
+        rrca
+        rrca
+        rrca
+        rrca
+        and     a, #0x07
+        ld      (hl), a
+        ret
+
+        ; ── Check amplitude (regs 0x00-0x05) ──
+ssaa2_check_amp:
+        ld      a, d
+        cp      a, #0x06
+        ret     nc
+        ld      a, e
+        or      a, a
+        ret     z
+        ; bar = spec_saa_oct2[reg] + 8
+        ld      a, d
+        ld      hl, #_spec_saa_oct2
+        add     a, l
+        ld      l, a
+        jr      nc, ssaa2_nc2
+        inc     h
+ssaa2_nc2:
+        ld      a, (hl)                 ; A = octave (0..7)
+        add     a, #8                   ; bars 8-15 for chip 2
         jp      _set_spec_bit           ; tail-call
 
 ;======================================================================
