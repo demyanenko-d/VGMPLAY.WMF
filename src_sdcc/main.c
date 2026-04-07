@@ -10,9 +10,9 @@
  *   - Воспроизведение с двойной буферизацией (ISR 1367 Гц)
  *   - OPL3: NEW=1 (L/R через C0-C8); OPL1/OPL2: NEW=0 (compat mode)
  *
- * Управление:
- *   Q        — выход
- *   SPACE/N  — следующий файл в каталоге
+ * Управление (PS/2 клавиатура):
+ *   ESC      — выход
+ *   SPACE    — следующий файл в каталоге
  *   P        — предыдущий файл
  *   1/2      — SAA режим (chip0 / chip1) для dual музыки
  */
@@ -293,69 +293,6 @@ void spectrum_font_init(void);
 void spectrum_font_restore(void);
 
 
-/* ── FSM-клавиатура (дебаунс без сжигания CPU) ───────────────────────
- * Состояния:
- *   WAIT_RELEASE — ждём отпускания ВСЕХ клавиш (защита от «залипания»
- *                  при перезапуске плагина с зажатой N/P/Q)
- *   IDLE         — ничего не нажато, ждём нажатия
- *   CONFIRM      — нажатие обнаружено, подтверждаем через
- *                  KBD_DEBOUNCE_TICKS (~3 мс) стабильного удержания
- * После подтверждения → WAIT_RELEASE (нет авто-повтора).             */
-#define KBD_ST_WAIT_RELEASE 0
-#define KBD_ST_IDLE         1
-#define KBD_ST_CONFIRM      2
-#define KBD_DEBOUNCE_TICKS  4u  /* ~3 мс при ISR_FREQ=1367             */
-
-static uint8_t kbd_state;
-static uint8_t kbd_raw;      /* кандидат-клавиша в CONFIRM             */
-static uint8_t kbd_tick;     /* isr_tick_ctr при входе в CONFIRM       */
-
-static void kbd_init(void)
-{
-    kbd_state = KBD_ST_WAIT_RELEASE;
-    kbd_raw   = KEY_NONE;
-}
-
-static uint8_t kbd_poll(void)
-{
-    uint8_t k = read_keys();
-
-    switch (kbd_state) {
-    case KBD_ST_WAIT_RELEASE:
-        if (k == KEY_NONE)
-            kbd_state = KBD_ST_IDLE;
-        return KEY_NONE;
-
-    case KBD_ST_IDLE:
-        if (k != KEY_NONE) {
-            kbd_raw  = k;
-            kbd_tick = isr_tick_ctr;
-            kbd_state = KBD_ST_CONFIRM;
-        }
-        return KEY_NONE;
-
-    case KBD_ST_CONFIRM:
-        if (k == KEY_NONE) {
-            /* Отпущена до подтверждения — глюк/дребезг */
-            kbd_state = KBD_ST_IDLE;
-            return KEY_NONE;
-        }
-        if (k != kbd_raw) {
-            /* Другая клавиша — начать подтверждение заново */
-            kbd_raw  = k;
-            kbd_tick = isr_tick_ctr;
-            return KEY_NONE;
-        }
-        /* Та же клавиша — проверяем интервал */
-        if ((uint8_t)(isr_tick_ctr - kbd_tick) >= KBD_DEBOUNCE_TICKS) {
-            kbd_state = KBD_ST_WAIT_RELEASE;
-            return kbd_raw;
-        }
-        return KEY_NONE;
-    }
-    return KEY_NONE;
-}
-
 /* Информация VGZ для отображения */
 static uint8_t  s_is_vgz;
 static uint32_t s_vgm_unpacked_size;
@@ -573,7 +510,7 @@ uint8_t drow_ui(void)
 
     /* ── Строка подсказок (фиксированная позиция) ─────────────── */
     buf_clear(work_buf);
-    buf_append_str(work_buf, " [N/Space] Next [P]rev [Q] Exit");
+    buf_append_str(work_buf, " [Space] Next [P]rev [Esc] Exit");
     if (s_has_saa2 && !s_board_dual_saa) {
         buf_append_str(work_buf, "  SAA:");
         buf_append_char(work_buf, '1' + cfg_saa_mode);
@@ -1161,9 +1098,9 @@ void main(void)
     uint8_t key = 0;
     wc_exit_code = (wc_file_idx == wc_file_count) ? WC_EXIT_ESC : WC_EXIT_NEXT;
 
-    /* FSM клавиатуры: стартуем в WAIT_RELEASE, чтобы дождаться
-     * отпускания кнопки, оставшейся от предыдущего трека.     */
-    kbd_init();
+    /* PS/2 FSM: init выполняется один раз в main(), здесь
+     * только ре-drain для слива событий от предыдущего трека.  */
+    ps2_init();
 
     /* Главный цикл: приоритет — update_buffer (буфер не должен голодать),
        клавиатура + UI — по остаточному принципу.                           */
@@ -1176,8 +1113,8 @@ void main(void)
         if (isr_done)
             break;
 
-        /* ── 2. Клавиатура: FSM дебаунс (~3 мс) ───────────── */
-        key = kbd_poll();
+        /* ── 2. Клавиатура: PS/2 FIFO (~1 раз в кадр) ────── */
+        key = ps2_poll();
 
         if (key == KEY_NEXT)
         {
@@ -1209,7 +1146,7 @@ void main(void)
             spec_saa_dual = 0;
             /* Обновить подсказку SAA mode */
             buf_clear(work_buf);
-            buf_append_str(work_buf, " [N/Space] Next [P]rev [Q] Exit  SAA:");
+            buf_append_str(work_buf, " [Space] Next [P]rev [Esc] Exit  SAA:");
             buf_append_char(work_buf, '1' + cfg_saa_mode);
             print_line(&s_wnd, ROW_HELP, work_buf, CLR_TITLE);
         }
