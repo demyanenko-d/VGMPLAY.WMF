@@ -298,32 +298,16 @@ static uint8_t  s_is_vgz;
 static uint32_t s_vgm_unpacked_size;
 static uint8_t  s_vgz_compressed_pages;
 
-static void ints_disable(void)
+static inline void ints_disable(void)
 {
     __asm di
         __endasm;
 }
 
-static void ints_enable(void)
+static inline void ints_enable(void)
 {
     __asm ei
         __endasm;
-}
-
-/* Формат MM:SS в буфер (5 символов, без '\0') */
-static void fmt_mmss(char *out, uint16_t sec)
-{
-    uint16_t min = sec / 60U;
-    uint8_t s = (uint8_t)(sec % 60U);
-    /* Минуты: макс 2 цифры (до 99) */
-    if (min >= 10)
-        *out++ = (char)('0' + (uint8_t)(min / 10U));
-    else
-        *out++ = '0';
-    *out++ = (char)('0' + (uint8_t)(min % 10U));
-    *out++ = ':';
-    *out++ = (char)('0' + (s / 10U));
-    *out++ = (char)('0' + (s % 10U));
 }
 
 /* ── Имя OPL-типа ────────────────────────────────────────────────────── */
@@ -468,9 +452,9 @@ uint8_t drow_ui(void)
         buf_clear(work_buf);
         buf_append_str(work_buf, "Freq        : ");
         if (vgm_freq_mode == FREQ_MODE_TABLE) {
-            buf_append_str(work_buf, "Table");   /* таблица (CP866) */
+            buf_append_str(work_buf, "Table");  
         } else {
-            buf_append_str(work_buf, "Native");              /* натив (CP866) */
+            buf_append_str(work_buf, "Native");
         }
         print_line(&s_wnd, row++, work_buf,
             (vgm_freq_mode == FREQ_MODE_NATIVE)
@@ -1083,11 +1067,9 @@ void main(void)
      * "Playing  00:00 / MM:SS  Loop 1" + чёрный фон/белый текст.
      * В главном цикле обновляются только 5 символов + атрибуты. */
     {
-        char tb[5];
         buf_clear(work_buf);
         buf_append_str(work_buf, "Playing  00:00 / ");
-        fmt_mmss(tb, vgm_total_seconds);
-        for (uint8_t i = 0; i < 5; i++) buf_append_char(work_buf, tb[i]);
+        buf_append_mmss(work_buf, vgm_total_seconds);
         buf_append_str(work_buf, "  Loop 1");
         print_line(&s_wnd, ROW_PROGRESS, work_buf, WC_COLOR(WC_BRIGHT_WHITE, WC_BLACK));
     }
@@ -1159,6 +1141,7 @@ void main(void)
         spectrum_render();
     }
 
+    ps2_deinit();
     stop_playback();
     spectrum_font_restore();
     wc_rresb(&s_wnd);

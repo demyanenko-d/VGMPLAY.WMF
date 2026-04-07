@@ -94,6 +94,12 @@ uint8_t buf_append_u16_dec(char *buf, uint16_t val);
  */
 uint8_t buf_append_u32_dec(char *buf, uint32_t val);
 
+/**
+ * Добавить "MM:SS" (5 символов) в буфер. Без деления — вычитание.
+ * @param sec  секунды (0..5999)
+ */
+void buf_append_mmss(char *buf, uint16_t sec);
+
 
 /* ================================================================== */
 /* ВЫВОД                                                              */

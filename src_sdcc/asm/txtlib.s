@@ -21,6 +21,7 @@
         .globl  _buf_append_u8_hex
         .globl  _buf_append_u16_dec
         .globl  _buf_append_u32_dec
+        .globl  _buf_append_mmss
         .globl  _print_line
 
         .globl  _wc_prsrw_attr          ; from wc_api.s
@@ -482,3 +483,75 @@ pl_done:
         pop     af
         pop     af                      ; callee-clean 4
         jp      (hl)
+
+;----------------------------------------------------------------------
+; buf_append_mmss(buf, sec) — append "MM:SS" (5 chars) to buffer
+;
+; sdcccall(1):  HL = buf,  DE = sec (uint16_t, 0..5999)
+; No division — subtraction loops only (~30 bytes code).
+;----------------------------------------------------------------------
+_buf_append_mmss:
+        push    hl
+        pop     ix              ; IX = buf
+        ; DE = total seconds.  Divide by 60 via subtraction → B=min, E=sec
+        ld      b, #0
+mmss_d60:
+        ld      a, e
+        sub     a, #60
+        ld      c, a
+        ld      a, d
+        sbc     a, #0
+        jr      c, mmss_d60_done
+        ld      d, a
+        ld      e, c
+        inc     b
+        jr      mmss_d60
+mmss_d60_done:
+        ; B = minutes, E = seconds
+        ; Convert min → two ASCII digits via sub-10 loop
+        ld      a, b
+        call    mmss_2dig       ; appends 2 digits of A
+        ; Append ':'
+        ld      a, 1 (ix)
+        ld      c, a
+        ld      b, #0
+        inc     a
+        ld      1 (ix), a
+        push    ix
+        pop     hl
+        add     hl, bc
+        ld      (hl), #0x3A     ; ':'
+        inc     hl
+        ; Append seconds
+        ld      a, e
+        ; fall through to mmss_2dig — but IX is still buf
+        ; call mmss_2dig
+        call    mmss_2dig
+        ret
+
+; Subroutine: append 2 ASCII digits of A (0..99) to buf at IX
+; Destroys A, C, B, HL
+mmss_2dig:
+        ld      c, #0x30        ; tens digit = '0'
+mmss_t10:
+        sub     a, #10
+        jr      c, mmss_t10_done
+        inc     c
+        jr      mmss_t10
+mmss_t10_done:
+        add     a, #10          ; undo last sub
+        add     a, #0x30        ; units → ASCII
+        ld      b, a            ; save units
+        ; Append tens (C) then units (B)
+        ld      a, 1 (ix)       ; len
+        ld      l, a
+        ld      h, #0
+        add     a, #2
+        ld      1 (ix), a       ; len += 2
+        push    ix
+        pop     de              ; DE = buf base
+        add     hl, de
+        ld      (hl), c         ; tens
+        inc     hl
+        ld      (hl), b         ; units
+        ret
