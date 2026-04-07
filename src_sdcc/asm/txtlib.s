@@ -508,7 +508,7 @@ mmss_d60:
         jr      mmss_d60
 mmss_d60_done:
         ; B = minutes, E = seconds
-        ; Convert min → two ASCII digits via sub-10 loop
+        push    de              ; save seconds (mmss_2dig clobbers DE)
         ld      a, b
         call    mmss_2dig       ; appends 2 digits of A
         ; Append ':'
@@ -521,8 +521,8 @@ mmss_d60_done:
         pop     hl
         add     hl, bc
         ld      (hl), #0x3A     ; ':'
-        inc     hl
         ; Append seconds
+        pop     de              ; restore E = seconds
         ld      a, e
         ; fall through to mmss_2dig — but IX is still buf
         ; call mmss_2dig
