@@ -968,6 +968,14 @@ void main(void)
     s_wnd.divider1 = DIV1_FROM_BOTTOM;
     s_wnd.divider2 = DIV2_FROM_BOTTOM;
 
+    /* Дождаться отпускания всех клавиш с точки зрения WC.
+     * WC ISR ещё работает штатно (PSD2 обновляет TAB нормально),
+     * поэтому wc_key_wait_release даст WC привести TAB в чистое
+     * состояние.  Только после этого отключаем WC PS/2 handler —
+     * FIFO переходит под наш контроль без артефактов.  */
+    wc_key_wait_release();
+    wc_int_pl(WC_INT_NO_PS2);
+
     // Восстановить дисплей WC и нарисовать окно
     wc_gedpl();
     wc_prwow(&s_wnd);

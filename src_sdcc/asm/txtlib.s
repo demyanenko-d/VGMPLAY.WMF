@@ -520,6 +520,8 @@ mmss_d60_done:
         push    ix
         pop     hl
         add     hl, bc
+        inc     hl              ; skip buf[0] (max)
+        inc     hl              ; skip buf[1] (len)
         ld      (hl), #0x3A     ; ':'
         ; Append seconds
         pop     de              ; restore E = seconds
@@ -551,6 +553,8 @@ mmss_t10_done:
         push    ix
         pop     de              ; DE = buf base
         add     hl, de
+        inc     hl              ; skip buf[0] (max)
+        inc     hl              ; skip buf[1] (len)
         ld      (hl), c         ; tens
         inc     hl
         ld      (hl), b         ; units
