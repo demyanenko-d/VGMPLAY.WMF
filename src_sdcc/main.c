@@ -2,13 +2,16 @@
  * main.c — VGM Player Plugin для Wild Commander (SDCC/Z80)
  *
  * Поддерживаемые форматы:
- *   VGM (Raw)   — OPL1/OPL2/OPL3, AY-3-8910/YM2149/YM2203, SAA1099
+ *   VGM (Raw)   — OPL1/OPL2/OPL3/OPL4(YMF278B, cmd 0xD0), AY-3-8910/YM2149/YM2203, SAA1099
  *   VGZ (gzip)  — автораспаковка через inflate
  *
  * Функции:
  *   - Отображение метаданных (GD3: автор, игра, трек, система)
  *   - Воспроизведение с двойной буферизацией (ISR 1367 Гц)
- *   - OPL3: NEW=1 (L/R через C0-C8); OPL1/OPL2: NEW=0 (compat mode)
+ *   - OPL3/OPL4: NEW=1 (L/R через C0-C8); OPL1/OPL2: NEW=0 (compat mode)
+ *   - OPL4 (ZXM-MoonSound): NEW2=1 дополнительно разблокирует wave-часть
+ *     (порты #7E/#7F); FM-часть (порты 0/1 команды 0xD0) идёт через те же
+ *     регистры/порты #C4-#C7, что и OPL3
  *
  * Управление (PS/2 клавиатура):
  *   ESC      — выход
@@ -148,6 +151,19 @@ static void hl_push(uint8_t cmd, uint8_t param)
     }
 }
 
+/* CMDBLK_SILENCE_OPL (+ CMDBLK_SILENCE_WAVE для OPL4) — общий кусок,
+ * нужен и в начале трека, и в abort-последовательности выхода. */
+static void hl_push_opl_silence(void)
+{
+    hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_OPL);
+    if (vgm_chip_type == VGM_CHIP_OPL4) {
+        /* Два блока по 24 записи: вместе с OPL silence они не помещаются
+         * в один ISR-буфер, а cmdblock нельзя продолжать с середины. */
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_WAVE_OFF);
+        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_WAVE_TL);
+    }
+}
+
 /* ── Построение очереди воспроизведения по обнаруженным чипам / loop info ─ */
 static void build_playback_queue(void)
 {
@@ -155,9 +171,10 @@ static void build_playback_queue(void)
 
     /* Фаза инициализации: silence (очистка остаточного состояния) + init */
     if (s_has_opl) {
-        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_OPL);
+        hl_push_opl_silence();
         hl_push(HLCMD_CMDBLK,
-                (vgm_chip_type == VGM_CHIP_OPL3) ? CMDBLK_INIT_OPL3
+                (vgm_chip_type == VGM_CHIP_OPL4) ? CMDBLK_INIT_OPL4
+              : (vgm_chip_type == VGM_CHIP_OPL3) ? CMDBLK_INIT_OPL3
                                                   : CMDBLK_INIT_OPL2);
     }
     if (s_has_ym2203)
@@ -191,7 +208,7 @@ static void build_playback_queue(void)
     vgm_hl_abort_pos = vgm_hl_len;
 
     if (s_has_opl)
-        hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_OPL);
+        hl_push_opl_silence();
     if (s_has_ym2203)
         hl_push(HLCMD_CMDBLK, CMDBLK_SILENCE_YM2203);
     else if (s_has_ay)
@@ -319,6 +336,8 @@ static const char *opl_name(void)
         return "OPL2  YM3812";
     if (vgm_chip_type == VGM_CHIP_OPL3)
         return "OPL3  YMF262";
+    if (vgm_chip_type == VGM_CHIP_OPL4)
+        return "OPL4  YMF278B";
     return "---  (no OPL)";
 }
 
@@ -656,6 +675,7 @@ void start_playback(void)
         isr_active_buf = 0;
         isr_wait_ctr = 0;
         isr_done = 0;
+        isr_final_pending = 0;
 
         /* MultiSound ctrl: включить FM/SAA только для присутствующих чипов.
          * 0xF2 = FM ON + SAA ON + normal read + chip1 (base).
@@ -744,6 +764,7 @@ void stop_playback(void)
     s_buf_ready[1] = 0;
     s_last_active_buf = 0;
     isr_done = 0;
+    isr_final_pending = 0;
 
     ints_enable();
 }
@@ -1099,6 +1120,15 @@ void main(void)
         /* ── 1. Буфер: максимальный приоритет ──────────────── */
         update_buffer();
 
+        /* ISR исполнил весь музыкальный хвост и замер на FINALIZE.
+         * Пересобрать shutdown с начала чистого буфера — тот же путь,
+         * который используется для надёжного выхода по ESC. */
+        if (isr_final_pending) {
+            isr_final_pending = 0;
+            vgm_hl_pos = vgm_hl_abort_pos;
+            instant_abort();
+        }
+
         /* ISR замер на CMD_ISR_DONE → чистый выход */
         if (isr_done)
             break;
@@ -1109,21 +1139,18 @@ void main(void)
         if (key == KEY_NEXT)
         {
             vgm_hl_pos = vgm_hl_abort_pos;
-            vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_NEXT;
             instant_abort();
         }
         else if (key == KEY_PREV)
         {
             vgm_hl_pos = vgm_hl_abort_pos;
-            vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_PREV;
             instant_abort();
         }
         else if (key == KEY_ESC)
         {
             vgm_hl_pos = vgm_hl_abort_pos;
-            vgm_song_ended = 0;
             wc_exit_code = WC_EXIT_ESC;
             instant_abort();
         }

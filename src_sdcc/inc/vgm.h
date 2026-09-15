@@ -14,12 +14,16 @@
  * CMD_END_BUF). VGM данные хранятся в VPL-страницах WC, доступных
  * через окно #C000.
  *
- * Поддерживаемые VGM-команды (OPL1 / OPL2 / OPL3 / AY / SAA):
+ * Поддерживаемые VGM-команды (OPL1 / OPL2 / OPL3 / OPL4 / AY / SAA):
  *   0x5A rr dd  — YM3812  (OPL2) write         → CMD_WRITE_B0
  *   0x5B rr dd  — YM3526  (OPL1) write         → CMD_WRITE_B0
  *   0x5C rr dd  — Y8950   (OPL)  write         → CMD_WRITE_B0
  *   0x5E rr dd  — YMF262  (OPL3) Bank 0 write  → CMD_WRITE_B0
  *   0x5F rr dd  — YMF262  (OPL3) Bank 1 write  → CMD_WRITE_B1
+ *   0xD0 pp aa dd — YMF278B (OPL4) write, port pp (бит7 = chip select, игн.):
+ *                   pp&0x7F==0 → Bank 0 (как 0x5E)     → CMD_WRITE_B0
+ *                   pp&0x7F==1 → Bank 1 (как 0x5F)     → CMD_WRITE_B1
+ *                   pp&0x7F==2 → Wave-часть (#7E/#7F)  → CMD_WRITE_WAVE
  *   0x55 rr dd  — YM2203  PSG-часть (AY), reg 0-15 → CMD_WRITE_AY
  *   0xA0 rr dd  — AY8910  (чип 1/2 по [7])  → CMD_WRITE_AY / CMD_WRITE_AY2
  *   0xBD rr dd  — SAA1099 (чип 1/2 по [7])  → CMD_WRITE_SAA (bit7 = chip select)
@@ -130,11 +134,15 @@ extern uint16_t vgm_freq_lut_khz;
 #define VGM_CHIP_OPL   1     /* YM3526 (OPL1) + Y8950: cmd 0x5B/0x5C  */
 #define VGM_CHIP_OPL2  2     /* YM3812  (OPL2): cmd 0x5A              */
 #define VGM_CHIP_OPL3  3     /* YMF262  (OPL3): cmd 0x5E/5F           */
+#define VGM_CHIP_OPL4  4     /* YMF278B (OPL4): cmd 0xD0 (FM порты 0/1 —
+                               * те же регистры, что и OPL3; порт 2 —
+                               * wave-часть через #7E/#7F, ZXM-MoonSound) */
 
-/* Приоритет определения типа: YMF262 > YM3812 > YM3526/Y8950
- * Используется в start_playback() для выбора NEW=0/1 режима OPL3:
- *   VGM_CHIP_OPL3  → opl3_init() остаётся (NEW=1, L/R через C0-C8)
- *   не OPL3      → opl3_write_b1(OPL3_REG_OPL3EN, 0x00) (NEW=0, L+R авто) */
+/* Приоритет определения типа: YMF278B > YMF262 > YM3812 > YM3526/Y8950
+ * Используется в build_playback_queue() (main.c) для выбора cmdblock init:
+ *   VGM_CHIP_OPL4  → CMDBLK_INIT_OPL4 (NEW=1 + NEW2=1, разблокирует wave-часть)
+ *   VGM_CHIP_OPL3  → CMDBLK_INIT_OPL3 (NEW=1, L/R через C0-C8)
+ *   иначе          → CMDBLK_INIT_OPL2 (NEW=0, L+R авто, OPL2-compat) */
 
 /* ── Коды результата ─────────────────────────────────────────────── */
 #define VGM_OK         0
@@ -156,9 +164,6 @@ typedef struct {
 #define VGM_MAX_CHIPS  8     /* макс. чипов в vgm_chip_list[]          */
 
 /* ── Состояние парсера (глобальные переменные) ───────────────────── */
-
-/** 1 = достигнут конец VGM-данных (команда 0x66 или конец файла) */
-extern volatile uint8_t  vgm_song_ended;
 
 /** 1 = пауза (буферы заполняются тишиной) */
 extern uint8_t  vgm_paused;
@@ -227,6 +232,7 @@ uint8_t vgm_parse_header(void);
  * Поддерживаемые VGM-команды:
  *   0x5A/0x5B/0x5C/0x5E      → CMD_WRITE_B0 (OPL1/OPL2/Y8950/OPL3 bank 0)
  *   0x5F                     → CMD_WRITE_B1 (OPL3 bank 1)
+ *   0xD0 (port 0/1/2)        → CMD_WRITE_B0 / CMD_WRITE_B1 / CMD_WRITE_WAVE (YMF278B/OPL4)
  *   0x55                     → CMD_WRITE_AY (YM2203 PSG-часть, reg 0-15)
  *   0xA0                     → CMD_WRITE_AY / CMD_WRITE_AY2 (AY8910, dual)
  *   0xBD                     → CMD_WRITE_SAA (SAA1099, bit7 = chip select)
@@ -240,7 +246,6 @@ void vgm_fill_buffer(uint8_t buf_idx);
 
 /**
  * Перемотать VGM на точку петли (если установлена).
- * Сбрасывает vgm_song_ended = 0 при успехе.
  * @return 1 = петля есть (перемотано), 0 = нет петли
  */
 uint8_t vgm_rewind_to_loop(void);
@@ -280,6 +285,9 @@ const char *vgm_chip_name(uint8_t id);
 #define CMDBLK_SILENCE_YM2203_2 10 /* YM2203 chip 2 (TS): SSG+FM silence */
 #define CMDBLK_SAA_INIT     11  /* SAA1099 chip 1: Sound Enable ON     */
 #define CMDBLK_SAA2_INIT    12  /* SAA1099 chip 2: Sound Enable ON+clk */
+#define CMDBLK_INIT_OPL4    13  /* OPL4 init: NEW=1 + NEW2=1 (wave unlock) */
+#define CMDBLK_SILENCE_WAVE_OFF 14 /* OPL4 wave: 24x KeyOff+Damp */
+#define CMDBLK_SILENCE_WAVE_TL  15 /* OPL4 wave: 24x TL max */
 
 /* ─── Очередь высокоуровневых команд (HL queue) ───────────────── */
 

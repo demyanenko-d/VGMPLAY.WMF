@@ -29,12 +29,14 @@
         .globl  _isr_play_seconds
         .globl  _isr_read_ptr
         .globl  _isr_done
+        .globl  _isr_final_pending
         .globl  _cmd_buf_a
         .globl  _cmd_buf_b
         .globl  _isr_init
         .globl  _isr_deinit
         .globl  _call_wc_handler
         .globl  _spectrum_levels
+        .globl  _vgm_chip_type
 
 ; Импорт таблицы позиций из pos_table.s
         .globl  pos_table
@@ -55,11 +57,12 @@ WC_IM2_VEC = 0x5BFF
 CMD_WRITE_AY  = 0x00
 CMD_INC_SEC   = 0x10
 CMD_WRITE_AY2 = 0x20
-CMD_CALL_WC   = 0x30
+CMD_FINALIZE  = 0x30
 CMD_WRITE_B0  = 0x40
 CMD_SKIP_TICKS= 0x50
 CMD_WRITE_SAA = 0x60
 CMD_WRITE_B1  = 0x80
+CMD_WRITE_WAVE= 0x70
 CMD_WAIT      = 0xC0
 CMD_END_BUF   = 0xE0
 CMD_ISR_DONE  = 0xF0
@@ -72,6 +75,10 @@ OPL3_ADDR0 = 0xC4
 OPL3_DATA0 = 0xC5
 OPL3_ADDR1 = 0xC6
 OPL3_DATA1 = 0xC7
+
+; Порты OPL4 Wave-часть (ZXM-MoonSound: MOON_WREG/MOON_WDAT в moon_driver.asm)
+OPL4_WREG  = 0x7E
+OPL4_WDAT  = 0x7F
 
 ; Порты AY-3-8910 / YM2149
 AY_ADDR    = 0xFD       ; C-byte, B=0xFF → #FFFD
@@ -142,6 +149,14 @@ _isr_init::
         ;--- Счётчик секунд ---
         ld      hl, #0
         ld      (_isr_play_seconds), hl
+
+        ;--- Reset analyzer previous mask + levels (adjacent) ---
+        xor     a
+        ld      hl, #_spectrum_prev_mask
+        ld      (hl), a
+        ld      de, #(_spectrum_prev_mask + 1)
+        ld      bc, #17
+        ldir
 
         ;--- Начальная позиция: строка 0, hpos 0 ---
         ld      bc, #PORT_HSINT
@@ -277,6 +292,9 @@ _isr_cmd_loop:
         jp      z, _isr_write_ay2
         cp      #CMD_WRITE_SAA
         jp      z, _isr_write_saa
+        ; OPL4 Wave-часть (ZXM-MoonSound), редко используется
+        cp      #CMD_WRITE_WAVE
+        jp      z, _isr_write_wave
         ; Rare commands
         cp      #CMD_END_BUF
         jp      z, _isr_do_end_buf
@@ -284,8 +302,8 @@ _isr_cmd_loop:
         jp      z, _isr_cmd_done
         cp      #CMD_INC_SEC
         jp      z, _isr_inc_sec
-        cp      #CMD_CALL_WC
-        jp      z, _isr_call_wc
+        cp      #CMD_FINALIZE
+        jp      z, _isr_cmd_finalize
         ; Unknown command: skip 3 bytes, continue
         inc     de
         inc     de
@@ -419,6 +437,43 @@ _isr_write_saa:
         inc     de                  ; pad
         jp      _isr_cmd_loop
 
+;--- OPL4 Wave-часть write (ZXM-MoonSound): [reg, val, pad] --------------
+; Порты #7E (addr) / #7F (data) — как MOON_WREG/MOON_WDAT в оригинальном
+; Z80-драйвере карты (moon_driver.asm). B don't-care (карта декодирует
+; только младший байт адреса), как и для OPL3_ADDR0..OPL3_DATA1.
+;
+; ВАЖНО: в отличие от FM-банков (isr_write_b0/b1), референсный NedoOS-
+; драйвер (common/moonsound.asm: opl4_wait) ждёт busy-флаг (бит0 порта
+; #C4) перед КАЖДОЙ записью в порты #7E/#7F, включая обычные регистры
+; wave-канала (не только memory-access режим) — без этого запись может
+; быть потеряна чипом. См. chip_wait()/wave_out_reg()/wave_out_dat() в
+; lib/vgm.c (та же логика для синхронной заливки сэмплов).
+_isr_write_wave:
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_7MHZ
+        out     (c), a              ; → 7 MHz
+        ld      c, #OPL4_WREG       ; B=#20, don't-care (как MOON_WREG)
+wwave_wait1:
+        in      a, (0xC4)           ; busy-флаг (бит0)
+        rrca
+        jr      c, wwave_wait1
+        ld      a, (de)             ; reg
+        out     (c), a
+        inc     de
+        inc     c                   ; C=#7F = data port (MOON_WDAT)
+wwave_wait2:
+        in      a, (0xC4)
+        rrca
+        jr      c, wwave_wait2
+        ld      a, (de)             ; val
+        out     (c), a
+        ld      bc, #PORT_SYSCONF
+        ld      a, #TURBO_14MHZ
+        out     (c), a              ; → 14 MHz
+        inc     de
+        inc     de                  ; pad
+        jp      _isr_cmd_loop
+
 ;--- CMD_INC_SEC: инкремент счётчика секунд [0,0,0] ---------------------
 _isr_inc_sec:
         inc     de
@@ -437,7 +492,7 @@ _isr_inc_sec:
 _isr_skip_ticks:
         ld      a, (de)             ; N = skip count (0..55)
         inc     de
-        ;--- Spectrum: unpack 16-bit bitmask → set bars to max ---
+        ;--- Spectrum: KeyOn attack + sustained activity floor ---
         push    af                  ; save N
         ld      a, (de)             ; mask_lo
         inc     de
@@ -445,35 +500,29 @@ _isr_skip_ticks:
         ld      a, (de)             ; mask_hi
         inc     de
         ld      h, a                ; H = mask_hi
-        or      l                   ; quick zero check
-        jr      z, _skip_spec_done
         push    de                  ; save read_ptr
-        ld      b, h                ; B = mask_hi
-        ld      c, l                ; C = mask_lo
+
+        ; OPL4 gets edge/sustain processing. Other chips keep the old
+        ; event-analyzer behaviour by comparing every mask with zero.
+        ld      a, (_vgm_chip_type)
+        cp      #4                       ; VGM_CHIP_OPL4
+        jr      z, _skip_spec_opl4
+        ld      de, #0
+        jr      _skip_spec_masks_ready
+_skip_spec_opl4:
+        ld      de, (_spectrum_prev_mask)
+        ld      (_spectrum_prev_mask), hl
+_skip_spec_masks_ready:
+        ; E/D are previous low/high, L/H are current low/high.
+        ld      c, e                ; previous low byte
+        ld      e, h                ; preserve current high byte
+        ld      a, l                ; current low byte
         ld      hl, #_spectrum_levels
-        ld      d, #8               ; SPECTRUM_MAX_LEVEL
-        ld      a, c                ; mask_lo (bars 0-7)
-        ld      e, #8
-_skip_spec_lo:
-        rra
-        jr      nc, _skip_spec_lo_n
-        ld      (hl), d
-_skip_spec_lo_n:
-        inc     hl
-        dec     e
-        jr      nz, _skip_spec_lo
-        ld      a, b                ; mask_hi (bars 8-15)
-        ld      e, #8
-_skip_spec_hi:
-        rra
-        jr      nc, _skip_spec_hi_n
-        ld      (hl), d
-_skip_spec_hi_n:
-        inc     hl
-        dec     e
-        jr      nz, _skip_spec_hi
+        call    _skip_spec_byte
+        ld      c, d                ; previous high byte
+        ld      a, e                ; current high byte
+        call    _skip_spec_byte
         pop     de                  ; restore read_ptr
-_skip_spec_done:
         pop     af                  ; restore N
         ; Сохранить read_ptr
         ex      de, hl
@@ -510,32 +559,53 @@ _skip_program:
         ld      (_pos_ptr), hl
         jp      _isr_exit
 
+; Unpack one activity byte into eight spectrum bars.
+; A=current bits, C=previous bits, HL=first level; advances HL by 8.
+; Rising edge: peak 8. Sustained KeyOn: decay is allowed down to floor 3.
+_skip_spec_byte:
+        ld      b, #8
+_skip_spec_bit:
+        rr      c                       ; carry = previous activity bit
+        jr      c, _skip_spec_was_on
+        rra                              ; carry = current activity bit
+        jr      nc, _skip_spec_next
+        ld      (hl), #8                 ; new KeyOn attack
+        jr      _skip_spec_next
+_skip_spec_was_on:
+        rra                              ; carry = current activity bit
+        jr      nc, _skip_spec_next      ; KeyOff: ordinary decay
+        push    af                       ; preserve remaining current bits
+        ld      a, (hl)
+        cp      #3
+        jr      nc, _skip_spec_floor_ok
+        ld      (hl), #3                 ; sustained activity floor
+_skip_spec_floor_ok:
+        pop     af
+_skip_spec_next:
+        inc     hl
+        djnz    _skip_spec_bit
+        ret
+
 ;--- CMD_ISR_DONE: заморозить ISR, выставить флаг [0,0,0] ------------------
 ; ISR зацикливается на этой команде, не переключает буферы.
 ; Main loop ждёт isr_done == 1 перед завершением.
 _isr_cmd_done:
-        inc     de
-        inc     de
-        inc     de                  ; пропустить 3 байта параметров
-        ; Выставить флаг готовности к завершению
         ld      a, #1
         ld      (_isr_done), a
-        ; Перемотать read_ptr на начало CMD_ISR_DONE (DE - 4)
+        jr      _isr_cmd_freeze
+
+;--- CMD_FINALIZE: музыкальный поток полностью исполнен -----------------
+; Замереть на маркере и попросить main собрать shutdown как при ESC.
+_isr_cmd_finalize:
+        ld      a, #1
+        ld      (_isr_final_pending), a
+
+_isr_cmd_freeze:
+        ; DE уже указывает на первый параметр: вернуть read_ptr на opcode.
         ex      de, hl
-        dec     hl
-        dec     hl
-        dec     hl
         dec     hl
         ld      (_isr_read_ptr), hl
         jp      _isr_exit
-
-;--- CMD_CALL_WC: вызов оригинального WC handler [0,0,0] ------------------
-; Внутренняя команда ISR (не используется buffer filler, зарезервировано)
-_isr_call_wc:
-        inc     de
-        inc     de
-        inc     de                  ; пропустить 3 байта параметров
-        jp      _isr_cmd_loop       ; просто пропустить
 
 ;==============================================================================
 ; call_wc_handler() — Вызов WC ISR из main loop (C-callable)
@@ -566,12 +636,15 @@ _isr_play_seconds:: .dw 0          ; инкрементируется CMD_INC_SE
 _isr_read_ptr::     .dw 0
 _isr_wait_ctr::     .dw 0
 _isr_done::         .db 0          ; 1 = ISR замер на CMD_ISR_DONE, готов к завершению
+_isr_final_pending:: .db 0         ; 1 = последний VGM 0x66 уже исполнен
 _pos_ptr:           .dw 0          ; инициализируется в isr_init()
 _isr_saved_vec:     .dw 0          ; сохранённый вектор WC (#5BFF)
 
 ;==============================================================================
 ; Spectrum analyzer levels (16 bars, updated by 16-bit bitmask in CMD_SKIP_TICKS)
 ;==============================================================================
+_spectrum_prev_mask:
+        .ds 2                       ; previous CMD_SKIP activity bits
 _spectrum_levels::
         .ds 16                      ; 16 bytes, one per bar (0-8)
 

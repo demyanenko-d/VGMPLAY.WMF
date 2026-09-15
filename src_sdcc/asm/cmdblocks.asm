@@ -47,6 +47,7 @@ VGM_YM2203   EQU #55    ; YM2203 SSG+FM chip 1: 55 rr vv
 VGM_YM2203_2 EQU #A5    ; YM2203 SSG+FM chip 2: A5 rr vv
 VGM_AY       EQU #A0    ; AY8910: A0 rr vv (bit7 = chip 2)
 VGM_SAA      EQU #BD    ; SAA1099: BD rr vv (bit7 = chip 2)
+VGM_OPL4     EQU #D0    ; YMF278B (OPL4): D0 pp rr vv (pp = port 0/1/2)
 VGM_END      EQU #66    ; End of data
 
 ; ── Macros (each emits standard VGM bytes, 3 bytes per command) ─────
@@ -83,6 +84,10 @@ VGM_END      EQU #66    ; End of data
         db VGM_SAA, reg | #80, val
     ENDM
 
+    MACRO opl4_wave_write reg, val
+        db VGM_OPL4, #02, reg, val
+    ENDM
+
     MACRO blk_end
         db VGM_END
     ENDM
@@ -104,6 +109,9 @@ ptr_table:
         dw blk_silence_ym2203_2    ; 10 = CMDBLK_SILENCE_YM2203_2
         dw blk_saa_init            ; 11 = CMDBLK_SAA_INIT
         dw blk_saa2_init           ; 12 = CMDBLK_SAA2_INIT
+        dw blk_init_opl4           ; 13 = CMDBLK_INIT_OPL4
+        dw blk_silence_wave_off    ; 14 = CMDBLK_SILENCE_WAVE_OFF
+        dw blk_silence_wave_tl     ; 15 = CMDBLK_SILENCE_WAVE_TL
 
 ; ═══════════════════════════════════════════════════════════════════════
 ; CMDBLK_INIT_OPL3 — OPL3 init (NEW=1, clean state)
@@ -119,6 +127,24 @@ blk_init_opl3:
         opl3_bank1 #05, #01        ; VGM: 5F 05 01 — OPL3 NEW=1
         opl3_bank1 #04, #00        ; VGM: 5F 04 00 — 4-op OFF (clean)
         opl3_bank0 #01, #00        ; VGM: 5E 01 00 — Test/WSE=0
+        blk_end
+
+; ═══════════════════════════════════════════════════════════════════════
+; CMDBLK_INIT_OPL4 — YMF278B (OPL4, ZXM-MoonSound) init: NEW=1 + NEW2=1
+;
+; Как CMDBLK_INIT_OPL3 (NEW=1, L/R через C0-C8), но дополнительно взводит
+; бит NEW2 (бит 1 регистра Bank1 #05). На реальном чипе YMF278B этот бит
+; обязателен — без него чип игнорирует любые записи в wave-часть (порты
+; #7E/#7F), т.е. VGM-команды 0xD0 с портом 2 останутся немы.
+;
+; VGM stream:  5F 05 03  5F 04 00  5E 01 00  66
+; ═══════════════════════════════════════════════════════════════════════
+blk_init_opl4:
+        opl3_bank1 #05, #03        ; VGM: 5F 05 03 — NEW=1 + NEW2=1 (разблокировать wave)
+        opl3_bank1 #04, #00        ; VGM: 5F 04 00 — 4-op OFF (clean)
+        opl3_bank0 #01, #00        ; VGM: 5E 01 00 — Test/WSE=0
+        opl4_wave_write #02, #10   ; WT headers 384-511 from 0x200000,
+                                    ; memory access OFF (sound generation mode)
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════
@@ -248,6 +274,77 @@ blk_silence_opl:
         opl3_bank1 #F5, #00
         ; ── Percussion Off — VGM: 5E BD 00 ──
         opl3_bank0 #BD, #00
+        blk_end
+
+; ═══════════════════════════════════════════════════════════════════════
+; CMDBLK_SILENCE_WAVE — YMF278B (OPL4) wave-часть silence, 24 канала
+;
+; CMDBLK_SILENCE_OPL глушит только FM-банки (0x5E/0x5F) — wave-каналы
+; (табличный синтез, до 24 голосов) им не затрагиваются и продолжают
+; звучать после выхода из плеера. Для каждого канала N (0-23):
+;   рег. (0x68+N), data=0x40 — Key Off + Damp (бит7:6=01, форсированный
+;                               быстрый спад огибающей, EG_DMP)
+;   рег. (0x50+N), data=0xFF — TL=0x7F (макс. затухание) + LD=1
+;                               (мгновенно, без интерполяции громкости)
+; Оба варианта дублируют друг друга (как KeyOff+TL max у FM-банков) —
+; гарантия тишины независимо от состояния огибающей канала.
+;
+; VGM stream: D0 02 68 40 ... D0 02 7F 40 (Key Off+Damp, 24 канала)
+;             D0 02 50 FF ... D0 02 67 FF (TL max, 24 канала)
+;             66
+; ═══════════════════════════════════════════════════════════════════════
+blk_silence_wave_off:
+        opl4_wave_write #68, #40
+        opl4_wave_write #69, #40
+        opl4_wave_write #6A, #40
+        opl4_wave_write #6B, #40
+        opl4_wave_write #6C, #40
+        opl4_wave_write #6D, #40
+        opl4_wave_write #6E, #40
+        opl4_wave_write #6F, #40
+        opl4_wave_write #70, #40
+        opl4_wave_write #71, #40
+        opl4_wave_write #72, #40
+        opl4_wave_write #73, #40
+        opl4_wave_write #74, #40
+        opl4_wave_write #75, #40
+        opl4_wave_write #76, #40
+        opl4_wave_write #77, #40
+        opl4_wave_write #78, #40
+        opl4_wave_write #79, #40
+        opl4_wave_write #7A, #40
+        opl4_wave_write #7B, #40
+        opl4_wave_write #7C, #40
+        opl4_wave_write #7D, #40
+        opl4_wave_write #7E, #40
+        opl4_wave_write #7F, #40
+        blk_end
+
+blk_silence_wave_tl:
+        opl4_wave_write #50, #FF
+        opl4_wave_write #51, #FF
+        opl4_wave_write #52, #FF
+        opl4_wave_write #53, #FF
+        opl4_wave_write #54, #FF
+        opl4_wave_write #55, #FF
+        opl4_wave_write #56, #FF
+        opl4_wave_write #57, #FF
+        opl4_wave_write #58, #FF
+        opl4_wave_write #59, #FF
+        opl4_wave_write #5A, #FF
+        opl4_wave_write #5B, #FF
+        opl4_wave_write #5C, #FF
+        opl4_wave_write #5D, #FF
+        opl4_wave_write #5E, #FF
+        opl4_wave_write #5F, #FF
+        opl4_wave_write #60, #FF
+        opl4_wave_write #61, #FF
+        opl4_wave_write #62, #FF
+        opl4_wave_write #63, #FF
+        opl4_wave_write #64, #FF
+        opl4_wave_write #65, #FF
+        opl4_wave_write #66, #FF
+        opl4_wave_write #67, #FF
         blk_end
 
 ; ═══════════════════════════════════════════════════════════════════════

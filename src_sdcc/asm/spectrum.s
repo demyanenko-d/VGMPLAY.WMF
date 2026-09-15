@@ -28,6 +28,7 @@
         .globl  _spectrum_ay2
         .globl  _spectrum_saa
         .globl  _spectrum_saa2
+        .globl  _spectrum_wave
         .globl  _spec_period_to_bar
         .globl  _spectrum_font_init
         .globl  _spectrum_font_restore
@@ -44,6 +45,7 @@
         .globl  _spec_saa_dual          ; uint8_t    in vgm.c _DATA
         .globl  _spec_opl_bd            ; uint8_t in vgm.c _DATA
         .globl  _spec_fm_block          ; uint8_t[6] in vgm.c _DATA
+        .globl  _spec_wave_active       ; uint8_t[3]: 24-bit KeyOn mask
 
 ; ── Constants ────────────────────────────────────────────────────────
 PORT_PAGE3   = 0x13AF
@@ -53,8 +55,8 @@ SPEC_BAR_W   = 3        ; 2 filled + 1 space
 CHAR_FULL    = 0x02      ; custom glyph: full-height striped bar
 CHAR_HALF    = 0x01      ; custom glyph: half-height striped bar
 CLR_WIN      = 0x70      ; WC_COLOR(WC_WHITE, WC_BLACK)
-WC_PAGE_FONT0 = 0x01     ; font page (TSConf page number)
-FONT_BASE     = 0xC000   ; page3 window base address
+WC_PAGE_FONT0 = 0x01
+FONT_BASE     = 0xC000
 ; ── Timing: must match variant_cfg.h ────────────────────────────────
 ISR_TICKS_PER_FRAME = 14  ; = ISR_TICKS_PER_FRAME in variant_cfg.h
 ; ── Decay: must match DECAY_FRAMES_* in variant_cfg.h ────────────────
@@ -75,15 +77,8 @@ sd_fast_ctr:    .db DECAY_FAST          ; countdown: decay levels >= 6
 sd_med_ctr:     .db DECAY_MED           ; countdown: decay levels 3-5
 sd_slow_ctr:    .db DECAY_SLOW          ; countdown: decay levels 1-2
 sr_prev_hash:   .db 0                   ; XOR-rotate hash of spectrum_levels from previous render
-sfont_save:     .ds 16                  ; backup of original font glyphs 0x01-0x02
 
         .area   _CODE
-
-; Custom glyph bitmaps (8 bytes each) — stored in CODE, copied to font page.
-glyph_half:                             ; char 0x01: half-height striped bar
-        .db     0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00
-glyph_full:                             ; char 0x02: full-height striped bar
-        .db     0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00
 
 ; Row parameter table: [thresh_full, thresh_half, color] × 4 rows
 ; Row 0 (top=peak): thresholds 8,7  color=BRIGHT_RED
@@ -338,7 +333,6 @@ sd_ns:
 
         ld      hl, #_spectrum_levels
         ld      b, #SPEC_BARS
-
 sd_bar_loop:
         ld      a, (hl)
         or      a
@@ -463,32 +457,84 @@ _spectrum_opl_b1::
         ld      a, l
         srl     a
         and     a, #0x0F
-        jr      _set_spec_bit          ; tail-call
+        jp      _set_spec_bit          ; tail-call
 
-; 16-bit mask table — direct 16-bit OR into spec_mask, no byte split.
-; 32 bytes ROM, but eliminates push/pop bc + bit3 branch in hot path.
-ssb_mask_table:
-        .dw     0x0001, 0x0002, 0x0004, 0x0008
-        .dw     0x0010, 0x0020, 0x0040, 0x0080
-        .dw     0x0100, 0x0200, 0x0400, 0x0800
-        .dw     0x1000, 0x2000, 0x4000, 0x8000
+;======================================================================
+; spectrum_wave(reg, val) — A=reg, L=val
+;
+; YMF278B wave activity tracker. Key registers 0x68-0x7F maintain a
+; 24-bit KeyOn mask. asm_emit_skip_spec folds channels 16-23 onto bars
+; 0-7 and transports the current activity together with every wait.
+;======================================================================
+_spectrum_wave::
+        ld      e, l                    ; E = key register value
+        cp      #0x68
+        ret     c
+        cp      #0x80
+        ret     nc
+        sub     #0x68                   ; A = channel 0..23
+        ld      d, a
+        and     #0x07
+        ld      hl, #sw_bit_mask
+        add     a, l
+        ld      l, a
+        jr      nc, sw_mask_nc
+        inc     h
+sw_mask_nc:
+        ld      c, (hl)                 ; C = bit within mask byte
+
+        ld      a, d
+        rrca
+        rrca
+        rrca
+        and     #0x03                   ; byte index 0..2
+        ld      hl, #_spec_wave_active
+        add     a, l
+        ld      l, a
+        jr      nc, sw_ptr_nc
+        inc     h
+sw_ptr_nc:
+        bit     7, e
+        jr      z, sw_key_off
+        ld      a, (hl)
+        or      c
+        ld      (hl), a
+        ret
+sw_key_off:
+        ld      a, c
+        cpl
+        and     (hl)
+        ld      (hl), a
+        ret
+
+sw_bit_mask:
+        .db     0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80
 
 ;======================================================================
 ; _set_spec_bit — set bit A (0..15) in spec_mask
 ; Input: A = bit number (0..15)
 ; Trashes: A, D, E, HL
 ; Preserves: B, C (no push/pop needed)
-; Cost: ~122 T-states flat.
+; Reuses the 8-byte wave-channel bit table; bit3 selects low/high byte.
 ;======================================================================
 _set_spec_bit:
-        add     a, a                    ; A = bit * 2 (index into word table)
-        ld      e, a
-        ld      d, #0
-        ld      hl, #ssb_mask_table
-        add     hl, de                  ; HL → mask entry
-        ld      e, (hl)                 ; E = mask lo
-        inc     hl
-        ld      d, (hl)                 ; D = mask hi
+        ld      d, a                    ; preserve bar number
+        and     #0x07
+        ld      hl, #sw_bit_mask
+        add     a, l
+        ld      l, a
+        jr      nc, ssb_ptr_ok
+        inc     h
+ssb_ptr_ok:
+        ld      e, (hl)                 ; E = 8-bit mask
+        bit     3, d
+        jr      z, ssb_low_byte
+        ld      d, e                    ; bars 8..15: mask in high byte
+        ld      e, #0
+        jr      ssb_merge
+ssb_low_byte:
+        ld      d, #0                   ; bars 0..7: mask in low byte
+ssb_merge:
         ld      hl, (_spec_mask)
         ld      a, l
         or      e
@@ -863,32 +909,19 @@ _spectrum_font_init::
         in      a, (c)
         push    af
         push    bc
-
-        ; Map font page
         ld      a, #WC_PAGE_FONT0
         out     (c), a
-
-        ; Save original glyphs 0x01-0x02 (16 bytes at FONT_BASE+8)
-        ld      hl, #(FONT_BASE + 8)   ; glyph 0x01 starts at char*8
-        ld      de, #sfont_save
+        ld      hl, #(FONT_BASE + 8)
+        ld      de, #sf_font_save
         ld      bc, #16
         ldir
-
-        ; Write custom glyph 0x01 (half-height striped bar)
-        ld      hl, #glyph_half
+        ld      hl, #sf_glyph_half
         ld      de, #(FONT_BASE + 8)
-        ld      bc, #8
+        ld      bc, #16
         ldir
-
-        ; Write custom glyph 0x02 (full-height striped bar)
-        ld      hl, #glyph_full
-        ld      de, #(FONT_BASE + 16)
-        ld      bc, #8
-        ldir
-
         pop     bc
         pop     af
-        out     (c), a                  ; restore page3
+        out     (c), a
         ret
 
 ;======================================================================
@@ -901,17 +934,20 @@ _spectrum_font_restore::
         in      a, (c)
         push    af
         push    bc
-
         ld      a, #WC_PAGE_FONT0
         out     (c), a
-
-        ; Restore original 16 bytes
-        ld      hl, #sfont_save
+        ld      hl, #sf_font_save
         ld      de, #(FONT_BASE + 8)
         ld      bc, #16
         ldir
-
         pop     bc
         pop     af
-        out     (c), a                  ; restore page3
+        out     (c), a
         ret
+
+sf_glyph_half:
+        .db     0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00
+sf_glyph_full:
+        .db     0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00
+sf_font_save:
+        .ds     16
