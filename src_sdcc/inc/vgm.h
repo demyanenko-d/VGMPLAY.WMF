@@ -188,6 +188,7 @@ extern uint8_t  vgm_chip_type;
 
 /** Массив обнаруженных чипов (для вывода информации о файле) */
 extern uint8_t          vgm_chip_count;
+extern uint8_t          vgm_opl4_preloaded_rom;
 extern vgm_chip_entry_t vgm_chip_list[VGM_MAX_CHIPS];
 
 /** Адрес точки петли (#C000–#FFFF); 0 = нет петли */

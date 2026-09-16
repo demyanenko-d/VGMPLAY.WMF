@@ -101,38 +101,79 @@ extern uint8_t cfg_saa_mode;
 static uint8_t s_saa_mode_user;   /* user setting from INI (preserved across tracks) */
 static uint8_t s_board_dual_saa;  /* 0=одночиповая(default), 1=двухчиповая (INI param 4) */
 
-static void detect_active_chips(void)
+static void detect_active_chips(void) __naked
 {
-    s_has_opl = s_has_ay = s_has_ay2 = 0;
-    s_has_saa = s_has_saa2 = 0;
-    s_has_ym2203 = s_has_ym2203_2 = 0;
-    for (uint8_t i = 0; i < vgm_chip_count; i++) {
-        uint8_t id = vgm_chip_list[i].id;
-        uint8_t dual = vgm_chip_list[i].flags & VGM_CF_DUAL;
-        switch (id) {
-        case VGM_OFF_YM2203:
-            s_has_ym2203 = 1;
-            if (dual) s_has_ym2203_2 = 1;
-            /* fallthrough (проваливаемся) */
-        case VGM_OFF_AY8910:
-            s_has_ay = 1;
-            if (dual) s_has_ay2 = 1;
-            break;
-        case VGM_OFF_YM3526:
-        case VGM_OFF_YM3812:
-        case VGM_OFF_Y8950:
-        case VGM_OFF_YMF262:
-        case VGM_OFF_YMF278B:
-            s_has_opl = 1;
-            break;
-        case VGM_OFF_SAA1099:
-            s_has_saa = 1;
-            if (dual) s_has_saa2 = 1;
-            break;
-        default:
-            break;
-        }
-    }
+    __asm
+    ; The seven cache bytes are declared consecutively above.
+    xor  a
+    ld   hl, #_s_has_opl
+    ld   b, #7
+dac_clear:
+    ld   (hl), a
+    inc  hl
+    djnz dac_clear
+
+    ld   a, (_vgm_chip_count)
+    or   a
+    ret  z
+    ld   b, a
+    ld   de, #_vgm_chip_list
+
+dac_loop:
+    ld   a, (de)                 ; id
+    ld   l, a
+    inc  de
+    ld   a, (de)                 ; flags (bit 0 = dual)
+    ld   c, a
+    inc  de                      ; skip flags + clock_khz (2 bytes)
+    inc  de
+    inc  de
+
+    ld   a, l
+    cp   a, #0x44                ; YM2203
+    jr   z, dac_ym2203
+    cp   a, #0x74                ; AY8910
+    jr   z, dac_ay
+    cp   a, #0xC8                ; SAA1099
+    jr   z, dac_saa
+
+    ; OPL ids are 50h,54h,58h,5Ch,60h: one aligned range check.
+    cp   a, #0x50
+    jr   c, dac_next
+    cp   a, #0x61
+    jr   nc, dac_next
+    and  a, #0x03
+    jr   nz, dac_next
+    ld   a, #1
+    ld   (_s_has_opl), a
+    jr   dac_next
+
+dac_ym2203:
+    ld   a, #1
+    ld   (_s_has_ym2203), a
+    bit  0, c
+    jr   z, dac_ay
+    ld   (_s_has_ym2203_2), a
+    ; YM2203 also contains an AY-compatible PSG, so fall through.
+dac_ay:
+    ld   a, #1
+    ld   (_s_has_ay), a
+    bit  0, c
+    jr   z, dac_next
+    ld   (_s_has_ay2), a
+    jr   dac_next
+
+dac_saa:
+    ld   a, #1
+    ld   (_s_has_saa), a
+    bit  0, c
+    jr   z, dac_next
+    ld   (_s_has_saa2), a
+
+dac_next:
+    djnz dac_loop
+    ret
+    __endasm;
 }
 
 /* cfg_loop_rewinds, cfg_min_duration, cfg_max_duration определены в vgm.c */
@@ -526,27 +567,144 @@ uint8_t drow_ui(void)
 /* render_static_info() удалена — заменена на drow_ui() */
 
 /* Проверить расширение файла: .vgz / .VGZ */
-static uint8_t is_vgz_filename(void)
+static uint8_t is_vgz_filename(void) __naked
 {
-    const char *p = wc_file_name;
-    const char *dot = 0;
-    while (*p) {
-        if (*p == '.') dot = p;
-        p++;
-    }
-    if (!dot) return 0;
-    dot++;
-    if ((dot[0]=='v'||dot[0]=='V') &&
-        (dot[1]=='g'||dot[1]=='G') &&
-        (dot[2]=='z'||dot[2]=='Z') &&
-        dot[3]==0)
-        return 1;
-    return 0;
+    __asm
+    ld   hl, (_wc_file_name)
+    ld   de, #0                  ; address of the last dot
+ivf_scan:
+    ld   a, (hl)
+    or   a
+    jr   z, ivf_check
+    cp   a, #'.'
+    jr   nz, ivf_next
+    ld   d, h
+    ld   e, l
+ivf_next:
+    inc  hl
+    jr   ivf_scan
+
+ivf_check:
+    ld   a, d
+    or   a, e
+    jr   z, ivf_no
+    inc  de
+    ex   de, hl
+
+    ; ASCII upper/lower case differ by bit 5.
+    ld   a, (hl)
+    or   a, #0x20
+    cp   a, #'v'
+    jr   nz, ivf_no
+    inc  hl
+    ld   a, (hl)
+    or   a, #0x20
+    cp   a, #'g'
+    jr   nz, ivf_no
+    inc  hl
+    ld   a, (hl)
+    or   a, #0x20
+    cp   a, #'z'
+    jr   nz, ivf_no
+    inc  hl
+    ld   a, (hl)
+    or   a
+    jr   nz, ivf_no
+    inc  a                       ; return 1
+    ret
+ivf_no:
+    xor  a                       ; return 0
+    ret
+    __endasm;
+}
+
+/* The unused tail of plugin-relative page 5 (not WC physical page #05)
+ * contains the one-shot large OPL4 loader at logical address 9800h.
+ * Offset 1800h is also above WC's 1000h..1447h screen scratch range. */
+static uint8_t load_large_opl4(void) __naked
+{
+    __asm
+    ld   a, i
+    push af                         ; P/V remembers incoming IFF2
+    di                              ; page 5 does not contain the resident ISR
+    ld   a, #5
+    ld   hl, #0x9800
+    ld   de, #ll4_after_cold
+    push de                         ; #6020 is a jump, provide its return address
+    jp   0x6020                     ; WC #6028 is position-dependent in some builds
+ll4_after_cold:
+    ld   c, a                       ; bit 7 = ROM, bits 0..6 = final pages
+    ld   d, h                       ; keep cold-loader return across POP AF
+    ld   e, l
+    pop  af
+    jp   po, ll4_irq_was_off
+    ei                              ; safe now: #6028 has restored page 0
+ll4_irq_was_off:
+    ld   a, c
+    and  a, #0x7f
+    jr   z, ll4_fail
+    ld   a, c
+    and  a, #0x80
+    ld   (_vgm_opl4_preloaded_rom), a
+    ld   a, c
+    and  a, #0x7f
+    ld   c, a                       ; final page count
+                                    ; D/E already hold page/address high byte
+
+ll4_tail_loop:
+    ld   a, d
+    cp   a, #64
+    jr   nc, ll4_success
+
+    push bc
+    push de
+    ld   a, d
+    call _wc_mngcvpl
+    pop  de
+    pop  bc
+
+    xor  a                          ; blocks up to next 16K boundary
+    sub  a, e
+    srl  a
+    ld   b, a
+    push bc
+    push de
+    push af                         ; one-byte stack argument for wc_load512
+    inc  sp
+    ld   h, e
+    ld   l, #0
+    call _wc_load512
+    pop  de
+    pop  bc
+    cp   a, #0x0f                  ; EOF: compacted stream is complete
+    jr   z, ll4_success
+    or   a
+    jr   nz, ll4_fail
+
+    inc  d
+    ld   e, #0xc0
+    jr   ll4_tail_loop
+
+ll4_success:
+    push bc
+    xor  a
+    call _wc_mngcvpl
+    pop  bc
+    ld   a, c
+    ret
+
+ll4_fail:
+    xor  a
+    call _wc_mngcvpl                ; leave Win3 in a known state on reject
+    xor  a
+    ret
+    __endasm;
 }
 
 uint8_t load_vgm(void)
 {
     uint8_t i;
+    uint8_t large_file = 0;
     uint32_t fsize = wc_file_size;
 
     /* Минимальный размер — хотя бы 256 байт */
@@ -556,6 +714,10 @@ uint8_t load_vgm(void)
     s_pages = (uint8_t)((fsize + 16383UL) >> 14);
     if (!s_pages)
         s_pages = 1;
+    if (s_pages > 64) {
+        s_pages = 64;
+        large_file = 1;
+    }
 
     /* vgm_end_page / vgm_end_addr устанавливаются в vgm_parse_header()
        из поля EOF offset заголовка VGM — здесь задавать не нужно. */
@@ -640,6 +802,12 @@ uint8_t load_vgm(void)
 
         /* DBG: 0xA5 = VGZ done, final pages */
         dbg_trace2(0xA5, s_pages, 0);
+    }
+
+    if (large_file) {
+        s_pages = load_large_opl4();
+        if (!s_pages)
+            return 0;
     }
 
     return s_pages;
@@ -805,15 +973,30 @@ static void instant_abort(void)
     /* ── 3. Обнулить wait_ctr (отменить CMD_WAIT) ─────────── */
     isr_wait_ctr = 0;
 
-    /* ── 4. Заполнить НЕАКТИВНЫЙ буфер shutdown-цепочкой ───── *
-     * vgm_hl_pos уже установлен на vgm_hl_abort_pos →         *
-     * vgm_fill_buffer выдаст silence + CMD_ISR_DONE.           */
+    /* ── 4. Заполнить ОБА буфера shutdown-цепочкой ────────── *
+     * vgm_hl_pos уже установлен на vgm_hl_abort_pos.          *
+     * Цепочка (SILENCE_OPL ≈ 384 байта + WAVE_OFF + WAVE_TL   *
+     * + CMD_ISR_DONE) НЕ помещается в один буфер: лимит на     *
+     * заполнение — CMD_BUF_SIZE-48 = 464 байта, а cmdblock     *
+     * нельзя продолжить с середины — при переполнении он       *
+     * начинается заново со следующего вызова.  Поэтому         *
+     * заполняем сразу оба буфера, пока ISR заморожен: иначе    *
+     * после первого CMD_END_BUF он уйдёт во второй буфер со    *
+     * СТАРЫМ содержимым и никогда не дойдёт до CMD_ISR_DONE    *
+     * (трек зависает на месте вместо перехода к следующему).   */
     free_idx = (isr_active_buf & 1) ^ 1;
-    vgm_fill_buffer(free_idx);
+    vgm_fill_buffer(free_idx);          /* часть 1: SILENCE_OPL + ...   */
+    vgm_fill_buffer(free_idx ^ 1);      /* часть 2: ... + CMD_ISR_DONE  */
 
-    /* ── 5. Переключить ISR на заполненный буфер ─────────── */
+    /* ── 5. Переключить ISR на первый из них ─────────────── */
     isr_active_buf = free_idx;
     isr_read_ptr = (uint16_t)(free_idx ? cmd_buf_b : cmd_buf_a);
+
+    /* Синхронизировать учёт update_buffer(): оба буфера только что
+     * заполнены здесь, напрямую, минуя его собственный механизм. */
+    s_last_active_buf = free_idx;
+    s_buf_ready[0] = 1;
+    s_buf_ready[1] = 1;
 
     /* ── 6. Разморозить → ISR обработает shutdown ───────── */
     isr_enabled = 1;
@@ -824,7 +1007,14 @@ void update_buffer(void)
     uint8_t active;
     uint8_t free_idx;
 
-    if (!s_playback_inited || !isr_enabled || isr_done)
+    /* isr_final_pending: ISR замер на CMD_FINALIZE, ждёт instant_abort()
+     * из главного цикла. Продолжать обычное упреждающее заполнение буфера
+     * здесь нельзя: vgm_hl_pos уже не совпадает с тем, что предполагает
+     * instant_abort() при вызове vgm_fill_buffer() для shutdown-цепочки,
+     * и повторное/параллельное заполнение может затереть буфер до того,
+     * как ISR доберётся до настоящего CMD_ISR_DONE — трек тогда никогда
+     * не завершается (зависает на последних тактах без перехода дальше). */
+    if (!s_playback_inited || !isr_enabled || isr_done || isr_final_pending)
         return;
 
     active = (uint8_t)(isr_active_buf & 1U);
@@ -1012,12 +1202,14 @@ void main(void)
     s_vgz_compressed_pages = 0;
     draw_pre_load_info();
 
-    /* Если файл .vgz — показать "Unpacking..." ДО начала загрузки.     *
-     * Это последний WC API вызов перед inflate — после него load_vgm   *
-     * работает только через порты, без обращений к WC.                 */
-    if (is_vgz_filename()) {
+    /* Показать "Loading..." ДО начала загрузки — для .vgz (распаковка)
+     * и для файлов >= 1 МБ (синхронная заливка сэмплов OPL4 в SRAM
+     * карты идёт байт за байтом с busy-wait и занимает секунды; без
+     * надписи выглядит как зависание).  Для .vgz это последний WC API
+     * вызов перед inflate — дальше load_vgm работает только портами. */
+    if (is_vgz_filename() || ((const uint8_t *)&wc_file_size)[2] >= 0x10) {
         buf_clear(work_buf);
-        buf_append_str(work_buf, "             Unpacking...");
+        buf_append_str(work_buf, "              Loading...");
         print_line(&s_wnd, ROW_VGM_START, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
 
         /* Настройка progress bar: получить адрес текст. экрана для VGM секции col 2 */

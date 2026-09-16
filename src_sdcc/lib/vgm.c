@@ -41,6 +41,7 @@ uint16_t vgm_end_addr;           // смещение в окне #C000, на к�
 uint16_t vgm_version;            // версия VGM в BCD (например, 0x0151 для v1.51)
 uint8_t vgm_chip_type;           // битовая маска типа чипов (VGM_CHIP_xxx), например VGM_CHIP_OPL2 | VGM_CHIP_AY
 uint8_t vgm_chip_count;          // количество обнаруженных чипов (для вывода информации о файле)
+uint8_t vgm_opl4_preloaded_rom;  // cold loader already moved a 0x84 image
 
 vgm_chip_entry_t vgm_chip_list[VGM_MAX_CHIPS];
 
@@ -185,26 +186,63 @@ static const chip_scan_t chip_scan[] = {
 
 /* Пропустить n байт в VGM-потоке (арифметически, без чтения).
  * Используется для data block 0x67, PCM RAM write 0x68 и др. */
-static void vgm_skip(uint32_t n)
+static void vgm_skip(uint32_t n) __naked
 {
-    uint16_t ptr = vgm_read_ptr;
-    uint32_t avail = 0x10000UL - (uint32_t)ptr;
+    (void)n;
+    __asm
+    ; sdcccall(1): n = HL:DE (HL high word, DE low word).
+    ; Convert the mapped address C000h..FFFFh to a 14-bit page offset,
+    ; add it to n, then split the result back into page and address.
+    ld   bc, (_vgm_read_ptr)
+    ld   a, b
+    and  a, #0x3F
+    ld   b, a
 
-    if (n < avail) {
-        vgm_read_ptr = ptr + (uint16_t)n;
-        return;
-    }
+    ex   de, hl                  ; HL = n.low, DE = n.high
+    add  hl, bc
+    ex   de, hl                  ; DE = total.low, HL = total.high
+    jr   nc, vsk_no_carry
+    inc  hl
+vsk_no_carry:
 
-    n -= avail;
-    vgm_cur_page++;
+    ; Remember whether at least one 16K boundary was crossed.
+    ld   a, d
+    and  a, #0xC0
+    or   a, l
+    or   a, h
+    ld   b, a
 
-    while (n >= 0x4000UL) {
-        n -= 0x4000UL;
-        vgm_cur_page++;
-    }
+    ; page_delta = (total >> 14) & 0xFF.
+    ld   a, d
+    rlca
+    rlca
+    and  a, #0x03
+    ld   c, a
+    ld   a, l
+    add  a, a
+    add  a, a
+    or   a, c
+    ld   c, a
 
-    vgm_read_ptr = 0xC000 + (uint16_t)n;
-    wc_mngcvpl(vgm_cur_page);
+    ; Address within the selected page remains in total.low bits 0..13.
+    ld   a, d
+    and  a, #0x3F
+    or   a, #0xC0
+    ld   d, a
+    ld   (_vgm_read_ptr), de
+
+    ld   a, (_vgm_cur_page)
+    add  a, c
+    ld   (_vgm_cur_page), a
+
+    ; The old C implementation remapped only after crossing a boundary.
+    ld   a, b
+    or   a
+    ret  z
+    ld   a, (_vgm_cur_page)
+    call _wc_mngcvpl
+    ret
+    __endasm;
 }
 
 /* Деление числа VGM-сэмплов на 44100 вызывается только при разборе
@@ -251,7 +289,8 @@ uint8_t vgm_parse_header(void)
     vgm_paused = 0;
     vgm_chip_count = 0;
     vgm_chip_type = VGM_CHIP_NONE;
-    opl4_rom_loaded = 0;
+    opl4_rom_loaded = vgm_opl4_preloaded_rom;
+    vgm_opl4_preloaded_rom = 0;
     for (i = 0; i < 3; i++)
         spec_wave_active[i] = 0;
     vgm_loop_addr = 0;
@@ -884,106 +923,209 @@ wuf_loop:
  * len = полный размер data-block (4-байтовое поле "size" из потока),
  * включает 8-байтовый под-заголовок выше.
  * ───────────────────────────────────────────────────────────────────── */
-static void wave_upload_block(void)
+static void wave_upload_block(void) __naked
 {
-    /* Длина payload — прямо через fb_t32 (уже посчитан вызывающим кодом),
-     * без промежуточной локальной переменной — короче код (без спилла
-     * в стек-фрейм IX; ничто другое fb_t32 в течение этой функции не
-     * трогает). */
-    /* Порядок записи регистров адреса — high, mid, low (как в референсном
-     * NedoOS-драйвере, opl4setmemoryaddress) — на реальном чипе порядок,
-     * похоже, важен, в отличие от того, что можно было бы предположить
-     * по документации эмулятора. Граница SRAM 0x200000 имеет нулевые
-     * младшие 2 байта, поэтому "+0x200000" — это "+0x20" к старшему
-     * байту адреса (предполагает startAddr < 0xE00000 — с большим
-     * запасом для реальных VGM). */
-    asm_read_2bytes(); asm_read_2bytes(); /* ROM/RAM Size (4 байта) — не используется */
-
-    /* Синхронно (не через cmd-buffer) включить NEW2 в FM Bank1 (рег.#05=3):
-     * без этого чип игнорирует ЛЮБЫЕ обращения к wave-части, включая
-     * доступ к памяти. CMDBLK_INIT_OPL4 делает то же самое через ISR-
-     * буфер — но применится только когда реально запустится ISR, а эта
-     * заливка идёт синхронно ДО этого момента. Заинлайнено — вызывается
-     * только отсюда. Регистр #02 переключается ниже непосредственно
-     * перед заливкой и сразу возвращается в sound-generation mode. */
     __asm
+    ; ROM/RAM Size (4 bytes) is informational only.
+    call _asm_read_2bytes
+    call _asm_read_2bytes
+
+    ; NEW2: FM bank 1, register 05h = 03h.  Wave registers ignore writes
+    ; until this bit is enabled, and the command ISR has not started yet.
     call _chip_wait
     ld   a, #0x05
     out  (0xC6), a
     call _chip_wait
     ld   a, #0x03
     out  (0xC7), a
+
+    ; VGM start address is little-endian; YMF278B wants high/mid/low.
+    call _asm_read_byte
+    ld   (_fb_b2), a
+    call _asm_read_byte
+    ld   (_fb_b1), a
+    call _asm_read_byte
+    ld   (_fb_ch), a
+    call _asm_read_byte             ; unused top byte of the 32-bit address
+
+    ; Patch 128 twelve-byte headers only for a ROM image beginning at 0.
+    xor  a
+    ld   (_hdr_recs), a
+    ld   (_hdr_sub), a
+    ld   a, (_fb_reg)
+    cp   a, #0x84
+    jr   nz, wub_header_ready
+    ld   a, (_fb_ch)
+    ld   hl, #_fb_b1
+    or   a, (hl)
+    inc  hl
+    or   a, (hl)
+    jr   nz, wub_header_ready
+    ld   a, #0x80
+    ld   (_hdr_recs), a
+wub_header_ready:
+
+    ; Memory address = 200000h + start address.  Register order matters.
+    ld   a, #0x03
+    call _wave_out_reg
+    ld   a, (_fb_ch)
+    add  a, #0x20
+    call _wave_out_dat
+    ld   a, #0x04
+    call _wave_out_reg
+    ld   a, (_fb_b1)
+    call _wave_out_dat
+    ld   a, #0x05
+    call _wave_out_reg
+    ld   a, (_fb_b2)
+    call _wave_out_dat
+
+    ; 11h = memory access mode, WT header base 200000h; 06h = data port.
+    ld   a, #0x02
+    call _wave_out_reg
+    ld   a, #0x11
+    call _wave_out_dat
+    ld   a, #0x06
+    call _wave_out_reg
+
+    ; fb_t32 contains the whole block payload, including its 8-byte header.
+    ld   hl, (_fb_t32)
+    ld   de, #0x0008
+    or   a
+    sbc  hl, de
+    ld   (_fb_t32), hl
+    jr   nc, wub_len_ready
+    ld   hl, (_fb_t32 + 2)
+    dec  hl
+    ld   (_fb_t32 + 2), hl
+wub_len_ready:
+
+    ld   a, (_hdr_recs)
+    or   a
+    jr   z, wub_fast_test
+    ld   a, #0x01
+    ld   (_opl4_rom_loaded), a
+
+    ; Patch address bit 21 in byte 0 of each of the first 128 headers.
+wub_patch_test:
+    ld   a, (_hdr_recs)
+    or   a
+    jr   z, wub_fast_test
+    ld   hl, #_fb_t32
+    ld   a, (hl)
+    inc  hl
+    or   a, (hl)
+    inc  hl
+    or   a, (hl)
+    inc  hl
+    or   a, (hl)
+    jp   z, wub_finish
+
+    call _asm_read_byte
+    ld   e, a
+    ld   a, (_hdr_sub)
+    or   a
+    jr   nz, wub_patch_count
+    ld   a, e
+    or   a, #0x20
+    ld   e, a
+wub_patch_count:
+    ld   a, (_hdr_sub)
+    inc  a
+    cp   a, #0x0C
+    jr   nz, wub_store_sub
+    xor  a
+    ld   (_hdr_sub), a
+    ld   hl, #_hdr_recs
+    dec  (hl)
+    jr   wub_patch_write
+wub_store_sub:
+    ld   (_hdr_sub), a
+wub_patch_write:
+    ld   a, e
+    call _wave_out_dat
+
+    ; --fb_t32.  The high word changes only when the low word wraps.
+    ld   hl, (_fb_t32)
+    dec  hl
+    ld   (_fb_t32), hl
+    ld   a, h
+    and  a, l
+    inc  a
+    jr   nz, wub_patch_test
+    ld   hl, (_fb_t32 + 2)
+    dec  hl
+    ld   (_fb_t32 + 2), hl
+    jr   wub_patch_test
+
+    ; Upload the rest in chunks that never cross a mapped 16K page.
+wub_fast_test:
+    ld   hl, #_fb_t32
+    ld   a, (hl)
+    inc  hl
+    or   a, (hl)
+    inc  hl
+    or   a, (hl)
+    inc  hl
+    or   a, (hl)
+    jr   z, wub_finish
+
+    ; fb_w = 0 - fb_rp: number of bytes through FFFFh inclusive.
+    ld   hl, (_fb_rp)
+    xor  a
+    sub  a, l
+    ld   e, a
+    ld   a, #0x00
+    sbc  a, h
+    ld   d, a
+    ld   (_fb_w), de
+
+    ; If the remaining 32-bit length is smaller, use its low word.
+    ld   hl, (_fb_t32 + 2)
+    ld   a, h
+    or   a, l
+    jr   nz, wub_fast_upload
+    ld   hl, (_fb_t32)
+    or   a
+    sbc  hl, de
+    jr   nc, wub_fast_upload
+    ld   hl, (_fb_t32)
+    ld   (_fb_w), hl
+wub_fast_upload:
+    call _wave_upload_fast
+
+    ; fb_t32 -= fb_w, propagating carry into the high word.
+    ld   hl, (_fb_t32)
+    ld   de, (_fb_w)
+    or   a
+    sbc  hl, de
+    ld   (_fb_t32), hl
+    jr   nc, wub_after_subtract
+    ld   hl, (_fb_t32 + 2)
+    dec  hl
+    ld   (_fb_t32 + 2), hl
+wub_after_subtract:
+
+    ; wave_upload_fast leaves fb_rp at zero exactly on a page boundary.
+    ld   hl, (_fb_rp)
+    ld   a, h
+    or   a, l
+    jr   nz, wub_fast_test
+    ld   hl, #_fb_cpg
+    inc  (hl)
+    ld   a, (hl)
+    call _wc_mngcvpl
+    ld   hl, #0xC000
+    ld   (_fb_rp), hl
+    jr   wub_fast_test
+
+wub_finish:
+    ld   a, #0x02
+    call _wave_out_reg
+    ld   a, #0x10                 ; sound generation, WT base 200000h
+    call _wave_out_dat
+    ret
     __endasm;
-
-    /* Переиспользуем существующие static (fb_ch/fb_b1/fb_b2) вместо
-     * локальных переменных — короче код (без спилла в стек-фрейм IX),
-     * ветки, где они обычно используются (AY/YM2203, чтение 2 байт),
-     * с этой не пересекаются. */
-    /* Start Address в VGM записан в Intel byte order (little-endian).
-     * Регистры YMF278B #03/#04/#05, наоборот, принимают адрес как
-     * high/mid/low.  Поэтому читаем младший байт в fb_b2, а старший из
-     * используемых 24 бит — в fb_ch.  Прежний порядок случайно работал
-     * для адресов вида 0x00xx00 (например, 0x001800), но перемешивал
-     * почти все последующие куски ROM/RAM image. */
-    fb_b2 = asm_read_byte();       /* младший байт адреса */
-    fb_b1 = asm_read_byte();       /* средний байт адреса */
-    fb_ch = asm_read_byte();       /* старший байт (до добавления базы SRAM) */
-    asm_read_byte();               /* старший байт 32-битного поля (>16 МБ) */
-
-    /* Блок покрывает таблицу заголовков, только если это 0x84 (ROM Image)
-     * И его начало — самый старт RAM-региона (адрес 0). Именно так
-     * выглядят все реальные файлы этого типа (заголовки всегда идут
-     * первыми). Более общий случай (старт не с нуля) не поддерживаем —
-     * не встречался ни в одном реальном VGM. */
-    hdr_recs = (fb_reg == 0x84 && (fb_ch | fb_b1 | fb_b2) == 0) ? 128 : 0;
-    hdr_sub = 0;
-
-    /* Порядок записи регистров #03/#04/#05 (hi/mid/lo) — как в референсном
-     * NedoOS-драйвере (opl4setmemoryaddress): high, mid, low. */
-    wave_out_reg(0x03); wave_out_dat(fb_ch + 0x20);   /* + база SRAM (0x200000) */
-    wave_out_reg(0x04); wave_out_dat(fb_b1);
-    wave_out_reg(0x05); wave_out_dat(fb_b2);
-
-    /* Регистр #02: 0x11 = WT header base 0x200000 + memory access mode.
-     * Ранее адрес и значение были перепутаны (#11 <- #02), поэтому SRAM
-     * фактически не переходила в режим записи. */
-    wave_out_reg(0x02); wave_out_dat(0x11);
-
-    wave_out_reg(0x06);   /* регистр данных памяти — дальше только данные,
-                             * memaddr авто-инкрементируется самим чипом    */
-    fb_t32 -= 8;
-
-    if (hdr_recs)
-        opl4_rom_loaded = 1;
-
-    /* Первые 128 заголовков ROM image требуют побайтного патча адреса. */
-    while (hdr_recs && fb_t32) {
-        uint8_t b = asm_read_byte();
-        if (hdr_sub == 0)
-            b |= 0x20;                  /* взвести адресный бит 0x200000 */
-        if (++hdr_sub == 12) {
-            hdr_sub = 0;
-            hdr_recs--;
-        }
-        wave_out_dat(b);
-        fb_t32--;
-    }
-
-    /* Остаток блока — быстрыми кусками до границы VPL-страницы. */
-    while (fb_t32) {
-        fb_w = (uint16_t)(0u - (uint16_t)fb_rp); /* байт до wrap #FFFF->#0000 */
-        if (fb_t32 < fb_w)
-            fb_w = (uint16_t)fb_t32;
-        wave_upload_fast();
-        fb_t32 -= fb_w;
-        if (!(uint16_t)fb_rp) {
-            fb_cpg++;
-            wc_mngcvpl(fb_cpg);
-            fb_rp = (uint8_t *)0xC000;
-        }
-    }
-
-    wave_out_reg(0x02); wave_out_dat(0x10);    /* sound generation, WT base 0x200000 */
 }
 
 /* ─────────────────────────────────────────────────────────────────────

@@ -52,9 +52,15 @@ REM Паддинг inflate.bin до 16KB (чтобы cmdblocks.bin начина�
 powershell -NoProfile -Command "$f=[IO.File]::ReadAllBytes('build\inflate.bin'); if($f.Length -lt 16384){$pad=New-Object byte[] (16384-$f.Length); [IO.File]::WriteAllBytes('build\inflate.bin',$f+$pad); Write-Host ('  inflate.bin padded: '+$f.Length+' -> 16384')}"
 if errorlevel 1 ( echo FAIL pad inflate && goto :err )
 
+echo [3a/9] Сборка cold OPL4 loader...
+..\tools\sjasm\sjasmplus.exe asm\opl4_loader.asm >nul 2>&1
+if errorlevel 1 ( echo FAIL opl4_loader.asm && goto :err )
+
 echo [3b/9] Сборка cmdblocks.asm (sjasmplus)...
 ..\tools\sjasm\sjasmplus.exe asm\cmdblocks.asm >nul 2>&1
 if errorlevel 1 ( echo FAIL cmdblocks.asm && goto :err )
+node scripts\overlay_bin.js build\cmdblocks.bin build\opl4_loader.bin 0x1800
+if errorlevel 1 ( echo FAIL overlay OPL4 loader && goto :err )
 REM cmdblocks.asm имеет SAVEBIN "build/cmdblocks.bin" внутри
 
 echo [4/9] Компиляция C файлов...
@@ -91,6 +97,9 @@ if errorlevel 1 ( echo FAIL inflate_call.s && goto :err )
 sdasz80 %ASFLAGS% build\spectrum.rel asm\spectrum.s >nul
 if errorlevel 1 ( echo FAIL spectrum.s && goto :err )
 
+sdasz80 %ASFLAGS% build\cold_return.rel asm\cold_return.s >nul
+if errorlevel 1 ( echo FAIL cold_return.s && goto :err )
+
 echo [6/9] Линковка...
 REM Порядок важен: crt0 первым (entry point), затем модули
 REM Layout: CODE #8000–#B8CF, DATA #B8D0–#BFFF
@@ -108,6 +117,7 @@ sdcc -mz80 --no-std-crt0 --out-fmt-ihx --code-loc 0x8000 --data-loc %DATA_LOC% ^
     build\txtlib.rel ^
     build\inflate_call.rel ^
     build\spectrum.rel ^
+    build\cold_return.rel ^
     -o build\vgmplay.ihx >nul
 if errorlevel 1 ( echo FAIL link && goto :err )
 
