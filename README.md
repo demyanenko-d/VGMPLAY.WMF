@@ -5,6 +5,9 @@ VGM/VGZ player plugin for **Wild Commander** (WC) on **ZX Spectrum TSConfig** wi
 
 **Version:** v0.9-beta
 
+Исходный проект плагина: [demyanenko-d/VGMPLAY.WMF](https://github.com/demyanenko-d/VGMPLAY.WMF).
+Автор исходного кода — GitHub-пользователь [demyanenko-d](https://github.com/demyanenko-d).
+
 ## Supported Sound Chips
 
 | Chip | VGM cmd | Notes |
@@ -12,8 +15,8 @@ VGM/VGZ player plugin for **Wild Commander** (WC) on **ZX Spectrum TSConfig** wi
 | **OPL1** (YM3526) | `0x5A`/`0x5B` | Через MultiSound OPL3 (compat mode) |
 | **OPL2** (YM3812) | `0x5A`/`0x5B` | Через MultiSound OPL3 (compat mode) |
 | **OPL3** (YMF262) | `0x5E`/`0x5F` | NEW=1, стерео L/R через C0-C8 |
-| **YMF278B** (OPL4 FM) | `0xD0` | FM-часть через OPL3 |
-| **AY-3-8910 / YM2149** | `0xA0` | Single + dual chip |Та
+| **YMF278B** (OPL4) | `0xD0` | FM (порты 0/1) через OPL3 #C4-#C7; wave-часть (порт 2) через #7E/#7F (ZXM-MoonSound) |
+| **AY-3-8910 / YM2149** | `0xA0` | Single + dual chip |
 | **YM2203** (OPN) | `0x55`/`0xA0` | SSG-часть через AY |
 | **SAA1099** | `0xBD` | Single + dual chip (bit7 chip select) |
 
@@ -24,6 +27,7 @@ VGM/VGZ player plugin for **Wild Commander** (WC) on **ZX Spectrum TSConfig** wi
 - **GD3 metadata** — отображение названия трека, игры, автора, системы
 - **Двойная буферизация** — ISR 683 Hz проигрывает команды, main loop наполняет буферы
 - **Спектроанализатор** — 16-полосный в реальном времени с плавным затуханием
+- **OPL4** — воспроизведение FM- и wave-частей YMF278B на ZXM-MoonSound
 - **Progress bar** — текущее время / общая длительность + счётчик loop
 - **VGZ inflate** — распаковка gzip прямо в память с progress bar
 - **Dual chip** — поддержка двухчиповых VGM (AY×2, SAA×2, YM2203×2)
@@ -31,6 +35,14 @@ VGM/VGZ player plugin for **Wild Commander** (WC) on **ZX Spectrum TSConfig** wi
 - **Cmdblocks** — предрассчитанные блоки инициализации/silence в SRAM
 - **PS/2 клавиатура** — прямой доступ через CMOS FIFO TSConfig (без WC API)
 - **Варианты сборки** — build_variants.ps1 генерирует множество WMF с разными ISR freq / budget
+
+### OPL4 и спектроанализатор
+
+Для OPL4 анализатор отслеживает `KeyOn`/`KeyOff` 24 wave-каналов. Каналы 0–15
+соответствуют 16 полосам, а каналы 16–23 объединяются с полосами 0–7. При новом
+KeyOn полоса поднимается до максимума, затем плавно опускается до уровня 3, пока
+канал активен; после KeyOff она затухает до нуля. Это индикатор активности
+каналов, а не измеритель фактической амплитуды PCM-сэмплов.
 
 ## Управление (PS/2 клавиатура)
 
@@ -132,6 +144,7 @@ tools/              sjasm, Unreal emulator
 - **ZX Spectrum TSConfig** (ZX Evolution с TSConf FPGA)
 - **Wild Commander** (ОС/файловый менеджер)
 - **MultiSound FPGA** — звуковая карта (OPL3 + AY + SAA1099)
+- **ZXM-MoonSound** (YMF278B) — требуется для воспроизведения OPL4 wave-части
 - CPU 14 MHz (turbo mode, автоматически включается плагином)
 - PS/2 клавиатура
 

@@ -33,7 +33,6 @@
 #include "../inc/freq_lut_map.h"
 
 /* ── Состояние парсера ──────────────────────────────────────────────── */
-volatile uint8_t vgm_song_ended; // 1 = достигнут конец (0x66), main loop может остановить воспроизведение
 uint8_t vgm_paused;              // 1 = пауза (остановить таймер, не обнулять vgm_sec_budget)
 uint8_t vgm_cur_page;            // текущая VPL-страница для чтения данных (0..N)
 uint16_t vgm_read_ptr;           // смещение в окне #C000 для чтения следующего байта VGM-потока
@@ -76,6 +75,7 @@ uint8_t  spec_saa_dual;        /* 1=dual SAA: bars 0-7 / 8-15 split     */
 uint8_t  cfg_saa_mode = 0;     /* 0=chip0 only(default), 1=chip1 on chip0, 2=turbo(both) */
 uint8_t  spec_opl_bd;          /* OPL 0xBD shadow для детекции фронта    */
 uint8_t  spec_fm_block[6];     /* YM2203 FM block shadow: ch0-2(chip1/2)*/
+uint8_t  spec_wave_active[3];  /* 24-bit KeyOn mask, wave ch0..23       */
 
 /* ── Масштабирование частот PSG/FM (LUT + asm) ──────────────────────── */
 uint8_t vgm_freq_mode;
@@ -124,7 +124,20 @@ static uint8_t *fb_end;    /* предвычисленный fb_buf + (CMD_BUF_S
 static hl_entry_t *fb_e;   /* temp: указатель на запись HL queue         */
 static uint8_t  fb_ch;     /* temp: индекс канала PSG/FM                */
 static uint16_t fb_scaled; /* temp: масштабированная частота             */
-static uint8_t  fb_reg;    /* temp: AY регистр (обработчик 0xA0)        */
+static uint8_t  fb_reg;    /* temp: AY рег. (0xA0) / YMF278B port (0xD0) /
+                             * тип data-block (0x67) — ветки взаимоисключающие */
+
+/* ── Патч заголовков wave-таблицы после загрузки блока 0x84 (ROM Image) ──
+ * См. wave_upload_block(): референсный NedoOS-драйвер (vgm/opl4.asm,
+ * opl4loadromdatablock) после заливки ROM-блока, чей адрес попадает в
+ * первые 64КБ RAM-региона (где живёт таблица заголовков сэмплов, 128
+ * записей по 12 байт), принудительно взводит бит RAM-адресации (#20) в
+ * первом байте КАЖДОЙ записи — иначе встроенные в заголовки адреса
+ * сэмплов остаются ROM-относительными, и чип читает не тот PCM-семпл. */
+static uint8_t  hdr_recs;  /* оставшиеся записи таблицы (0-128); 0=не патчим */
+static uint8_t  hdr_sub;   /* позиция внутри 12-байтной записи (0-11)       */
+static uint8_t  opl4_rom_loaded; /* 0x84 ROM image перенесён в SRAM; номера
+                                  * волн надо отображать в диапазон 384-511 */
 
 /* VGM_FILL_CMD_BUDGET определён в variant_cfg.h (через isr.h) */
 
@@ -137,6 +150,7 @@ extern void spectrum_ay(uint8_t reg, uint8_t val);
 extern void spectrum_ay2(uint8_t reg, uint8_t val);
 extern void spectrum_saa(uint8_t reg, uint8_t val);
 extern void spectrum_saa2(uint8_t reg, uint8_t val);
+extern void spectrum_wave(uint8_t reg, uint8_t val);
 
 
 /* ── Таблица сканирования чипов (ROM-const) ──────────────────────── */
@@ -193,6 +207,30 @@ static void vgm_skip(uint32_t n)
     wc_mngcvpl(vgm_cur_page);
 }
 
+/* Деление числа VGM-сэмплов на 44100 вызывается только при разборе
+ * заголовка. Небольшой цикл вычитания заметно компактнее универсальных
+ * 32-битных __divulong/__mullong SDCC (358 байт резидентного кода). */
+static uint16_t samples_to_seconds(uint32_t samples)
+{
+    uint16_t seconds = 0;
+
+    while (samples >= 44100UL) {
+        samples -= 44100UL;
+        if (++seconds == 0xFFFF)
+            break;
+    }
+    return seconds;
+}
+
+/* clock/1000 с ошибкой менее 0.2% для типичных звуковых частот:
+ * 1/1024 + 1/65536 + 1/131072 = 0.00099945. Для выбора LUT допуск
+ * равен 2%, зато не нужна 131-байтная библиотечная 32-битная делилка. */
+static uint16_t clock_to_khz(uint32_t clock)
+{
+    uint16_t hi = (uint16_t)(clock >> 16);
+    return (uint16_t)(clock >> 10) + hi + (hi >> 1);
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * vgm_parse_header
  * ───────────────────────────────────────────────────────────────────── */
@@ -210,10 +248,12 @@ uint8_t vgm_parse_header(void)
     uint32_t  clk;
     vgm_chip_entry_t *e;
 
-    vgm_song_ended = 0;
     vgm_paused = 0;
     vgm_chip_count = 0;
     vgm_chip_type = VGM_CHIP_NONE;
+    opl4_rom_loaded = 0;
+    for (i = 0; i < 3; i++)
+        spec_wave_active[i] = 0;
     vgm_loop_addr = 0;
     vgm_loop_page = 0;
     vgm_wait_accum = 0;
@@ -285,12 +325,17 @@ uint8_t vgm_parse_header(void)
             e->id = off_hdr;
             e->flags = (clk & 0x40000000UL) ? VGM_CF_DUAL : 0;
             clk &= 0x3FFFFFFFUL;
-            e->clock_khz = (uint16_t)(clk / 1000UL);
+            e->clock_khz = clock_to_khz(clk);
             vgm_chip_count++;
         }
 
-        /* Определяем тип OPL для fill_buffer */
-        if (off_hdr == VGM_OFF_YMF262)
+        /* Определяем тип OPL для fill_buffer.
+         * chip_scan[] идёт по возрастанию offset, поэтому YMF278B (0x60)
+         * всегда проверяется после YMF262 (0x5C) и корректно перекрывает
+         * его результат — приоритет YMF278B > YMF262 соблюдён. */
+        if (off_hdr == VGM_OFF_YMF278B)
+            vgm_chip_type = VGM_CHIP_OPL4;
+        else if (off_hdr == VGM_OFF_YMF262)
             vgm_chip_type = VGM_CHIP_OPL3;
         else if ((off_hdr == VGM_OFF_YM3812 || off_hdr == VGM_OFF_Y8950) && vgm_chip_type < VGM_CHIP_OPL2)
             vgm_chip_type = VGM_CHIP_OPL2;
@@ -416,7 +461,7 @@ uint8_t vgm_parse_header(void)
                     | ((uint32_t)base[0x19] << 8)
                     | ((uint32_t)base[0x1A] << 16)
                     | ((uint32_t)base[0x1B] << 24);
-        uint16_t base_sec = (uint16_t)(ts / 44100UL);
+        uint16_t base_sec = samples_to_seconds(ts);
 
         vgm_loop_enabled = 0;
 
@@ -429,8 +474,11 @@ uint8_t vgm_parse_header(void)
                         | ((uint32_t)base[0x21] << 8)
                         | ((uint32_t)base[0x22] << 16)
                         | ((uint32_t)base[0x23] << 24);
-            uint32_t total_with_loop = ts + ls * cfg_loop_rewinds;
-            uint16_t total_sec = (uint16_t)(total_with_loop / 44100UL);
+            uint32_t total_with_loop = ts;
+            uint8_t repeats = cfg_loop_rewinds;
+            while (repeats--)
+                total_with_loop += ls;
+            uint16_t total_sec = samples_to_seconds(total_with_loop);
 
             if (total_sec <= cfg_max_duration) {
                 vgm_loop_enabled = 1;
@@ -741,9 +789,209 @@ static void asm_read_2bytes(void) __naked
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * OPL4 (ZXM-MoonSound) — прямая (не через cmd-buffer) запись в wave-порты
+ * #7E (выбор регистра) / #7F (данные), плюс переключение turbo-режима.
+ * Используются ТОЛЬКО в wave_upload_block() — разовая синхронная заливка
+ * PCM-сэмплов при загрузке трека, до старта ISR-плейбека (не hot-path).
+ * ───────────────────────────────────────────────────────────────────── */
+/* out (n),a — короткая форма (2 байта). Старший байт адреса (A15-A8)
+ * при этом равен A (значению-аргументу), но плата его не видит: линия
+ * CA[7..0] у CPLD DD2 — единственный адресный вход декодера портов
+ * #7E/#7F/#C4-#C7 (8 бит), верхняя половина шины к нему не подключена
+ * (см. схему ZXM-MoonSound, dd2.tdf) — как и в родном moon_driver.asm.
+ *
+ * Перед каждой записью — опрос busy-флага (бит0 порта #C4 — тот же
+ * порт, что и FM Bank1 addr-select, но на чтение отдаёт статус чипа).
+ * Без этого ожидания запись может быть потеряна чипом (особенно в
+ * режиме прямого доступа к памяти) — подтверждено рабочим NedoOS-
+ * драйвером (common/moonsound.asm: opl4_wait), а не только datasheet. */
+static void chip_wait(void) __naked {
+    __asm
+    push af
+cw_loop:
+    in   a, (0xC4)
+    rrca
+    jr   c, cw_loop
+    pop  af
+    ret
+    __endasm;
+}
+
+static void wave_out_reg(uint8_t reg) __naked {
+    __asm
+    call _chip_wait
+    out  (0x7E), a
+    ret
+    __endasm;
+    (void)reg;
+}
+
+static void wave_out_dat(uint8_t val) __naked {
+    __asm
+    call _chip_wait
+    out  (0x7F), a
+    ret
+    __endasm;
+    (void)val;
+}
+
+/* Быстрая заливка fb_w байт из текущей VPL-страницы.  В отличие от
+ * asm_read_byte()+wave_out_dat() указатели и счётчик держатся в регистрах;
+ * обязательный busy-wait перед каждым байтом сохранён.  Вызывающий код не
+ * даёт циклу пересечь границу страницы. */
+static void wave_upload_fast(void) __naked {
+    __asm
+    ld   hl, (_fb_rp)
+    ld   bc, (_fb_w)
+wuf_loop:
+    in   a, (0xC4)
+    rrca
+    jr   c, wuf_loop
+    ld   a, (hl)
+    out  (0x7F), a
+    inc  hl
+    dec  bc
+    ld   a, b
+    or   a, c
+    jr   nz, wuf_loop
+    ld   (_fb_rp), hl
+    ret
+    __endasm;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * wave_upload_block — залить payload VGM data-block 0x67 типа 0x84
+ * (YMF278B ROM Image) / 0x87 (RAM Image) в SRAM карты ZXM-MoonSound.
+ *
+ * Вызывается из обработчика 0x67 в vgm_fill_buffer() ДО начала реальной
+ * ISR-подачи звука (все такие блоки в реальных файлах идут одним пакетом
+ * в самом начале потока) — поэтому синхронная блокирующая заливка здесь
+ * безопасна: играть ещё нечему.
+ *
+ * Формат payload (VGM spec, "ROM/RAM Image" data block, offset от начала
+ * data-payload, т.е. после opcode+0x66+type+4-байт общего размера):
+ *   [0..3]  ROM/RAM Size (информационное, не используется)
+ *   [4..7]  Start Address — смещение внутри SRAM карты (0-based)
+ *   [8..]   сами байты сэмпла/инструмент-заголовков
+ *
+ * Адресация чипа YMF278B: 2МБ встроенный ROM (General MIDI) + 1МБ SRAM,
+ * физически идущие в чипе одним адресным пространством — SRAM начинается
+ * сразу по границе 0x200000 (аппаратный CS чипа по адресному биту A21,
+ * см. datasheet, от платы не зависит). wavetblhdr=4 (4×0x80000=0x200000)
+ * выставлен так, чтобы номер сэмпла (wave) 384 указывал ровно на начало
+ * этой SRAM — тем самым абсолютный адрес = 0x200000 + Start Address.
+ *
+ * len = полный размер data-block (4-байтовое поле "size" из потока),
+ * включает 8-байтовый под-заголовок выше.
+ * ───────────────────────────────────────────────────────────────────── */
+static void wave_upload_block(void)
+{
+    /* Длина payload — прямо через fb_t32 (уже посчитан вызывающим кодом),
+     * без промежуточной локальной переменной — короче код (без спилла
+     * в стек-фрейм IX; ничто другое fb_t32 в течение этой функции не
+     * трогает). */
+    /* Порядок записи регистров адреса — high, mid, low (как в референсном
+     * NedoOS-драйвере, opl4setmemoryaddress) — на реальном чипе порядок,
+     * похоже, важен, в отличие от того, что можно было бы предположить
+     * по документации эмулятора. Граница SRAM 0x200000 имеет нулевые
+     * младшие 2 байта, поэтому "+0x200000" — это "+0x20" к старшему
+     * байту адреса (предполагает startAddr < 0xE00000 — с большим
+     * запасом для реальных VGM). */
+    asm_read_2bytes(); asm_read_2bytes(); /* ROM/RAM Size (4 байта) — не используется */
+
+    /* Синхронно (не через cmd-buffer) включить NEW2 в FM Bank1 (рег.#05=3):
+     * без этого чип игнорирует ЛЮБЫЕ обращения к wave-части, включая
+     * доступ к памяти. CMDBLK_INIT_OPL4 делает то же самое через ISR-
+     * буфер — но применится только когда реально запустится ISR, а эта
+     * заливка идёт синхронно ДО этого момента. Заинлайнено — вызывается
+     * только отсюда. Регистр #02 переключается ниже непосредственно
+     * перед заливкой и сразу возвращается в sound-generation mode. */
+    __asm
+    call _chip_wait
+    ld   a, #0x05
+    out  (0xC6), a
+    call _chip_wait
+    ld   a, #0x03
+    out  (0xC7), a
+    __endasm;
+
+    /* Переиспользуем существующие static (fb_ch/fb_b1/fb_b2) вместо
+     * локальных переменных — короче код (без спилла в стек-фрейм IX),
+     * ветки, где они обычно используются (AY/YM2203, чтение 2 байт),
+     * с этой не пересекаются. */
+    /* Start Address в VGM записан в Intel byte order (little-endian).
+     * Регистры YMF278B #03/#04/#05, наоборот, принимают адрес как
+     * high/mid/low.  Поэтому читаем младший байт в fb_b2, а старший из
+     * используемых 24 бит — в fb_ch.  Прежний порядок случайно работал
+     * для адресов вида 0x00xx00 (например, 0x001800), но перемешивал
+     * почти все последующие куски ROM/RAM image. */
+    fb_b2 = asm_read_byte();       /* младший байт адреса */
+    fb_b1 = asm_read_byte();       /* средний байт адреса */
+    fb_ch = asm_read_byte();       /* старший байт (до добавления базы SRAM) */
+    asm_read_byte();               /* старший байт 32-битного поля (>16 МБ) */
+
+    /* Блок покрывает таблицу заголовков, только если это 0x84 (ROM Image)
+     * И его начало — самый старт RAM-региона (адрес 0). Именно так
+     * выглядят все реальные файлы этого типа (заголовки всегда идут
+     * первыми). Более общий случай (старт не с нуля) не поддерживаем —
+     * не встречался ни в одном реальном VGM. */
+    hdr_recs = (fb_reg == 0x84 && (fb_ch | fb_b1 | fb_b2) == 0) ? 128 : 0;
+    hdr_sub = 0;
+
+    /* Порядок записи регистров #03/#04/#05 (hi/mid/lo) — как в референсном
+     * NedoOS-драйвере (opl4setmemoryaddress): high, mid, low. */
+    wave_out_reg(0x03); wave_out_dat(fb_ch + 0x20);   /* + база SRAM (0x200000) */
+    wave_out_reg(0x04); wave_out_dat(fb_b1);
+    wave_out_reg(0x05); wave_out_dat(fb_b2);
+
+    /* Регистр #02: 0x11 = WT header base 0x200000 + memory access mode.
+     * Ранее адрес и значение были перепутаны (#11 <- #02), поэтому SRAM
+     * фактически не переходила в режим записи. */
+    wave_out_reg(0x02); wave_out_dat(0x11);
+
+    wave_out_reg(0x06);   /* регистр данных памяти — дальше только данные,
+                             * memaddr авто-инкрементируется самим чипом    */
+    fb_t32 -= 8;
+
+    if (hdr_recs)
+        opl4_rom_loaded = 1;
+
+    /* Первые 128 заголовков ROM image требуют побайтного патча адреса. */
+    while (hdr_recs && fb_t32) {
+        uint8_t b = asm_read_byte();
+        if (hdr_sub == 0)
+            b |= 0x20;                  /* взвести адресный бит 0x200000 */
+        if (++hdr_sub == 12) {
+            hdr_sub = 0;
+            hdr_recs--;
+        }
+        wave_out_dat(b);
+        fb_t32--;
+    }
+
+    /* Остаток блока — быстрыми кусками до границы VPL-страницы. */
+    while (fb_t32) {
+        fb_w = (uint16_t)(0u - (uint16_t)fb_rp); /* байт до wrap #FFFF->#0000 */
+        if (fb_t32 < fb_w)
+            fb_w = (uint16_t)fb_t32;
+        wave_upload_fast();
+        fb_t32 -= fb_w;
+        if (!(uint16_t)fb_rp) {
+            fb_cpg++;
+            wc_mngcvpl(fb_cpg);
+            fb_rp = (uint8_t *)0xC000;
+        }
+    }
+
+    wave_out_reg(0x02); wave_out_dat(0x10);    /* sound generation, WT base 0x200000 */
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * asm_emit_skip_spec — запись CMD_SKIP_TICKS + spec_mask в cmd buffer
  *
- * Пишет: [CMD_SKIP_TICKS, val, spec_mask_lo, spec_mask_hi].
+ * Пишет: [CMD_SKIP_TICKS, val, activity_lo, activity_hi].
+ * OPL4 KeyOn mask складывается с обычным spec_mask: каналы 16..23
+ * сворачиваются на полосы 0..7, каналы 8..15 остаются на 8..15.
  * Обнуляет spec_mask, продвигает fb_wp на 4.
  * Заменяет 6-строчный C-паттерн, встречающийся 9× в fill_buffer/emit_wait.
  *
@@ -759,11 +1007,20 @@ static void asm_emit_skip_spec(uint8_t val) __naked {
     inc  hl                 ; 6
     ld   (hl), c            ; 7  val
     inc  hl                 ; 6
-    ld   a, (_spec_mask)    ;13
-    ld   (hl), a            ; 7  spec_mask lo
+    ld   a, (_spec_wave_active)
+    ld   c, a
+    ld   a, (_spec_wave_active+2)
+    or   c                  ; wave ch0..7 | ch16..23
+    ld   c, a
+    ld   a, (_spec_mask)
+    or   c
+    ld   (hl), a            ; activity bits 0..7
     inc  hl                 ; 6
-    ld   a, (_spec_mask+1)  ;13
-    ld   (hl), a            ; 7  spec_mask hi
+    ld   a, (_spec_mask+1)
+    ld   c, a
+    ld   a, (_spec_wave_active+1)
+    or   c
+    ld   (hl), a            ; activity bits 8..15
     inc  hl                 ; 6
     ld   (_fb_wp), hl       ;16  advance write pointer
     ;; spec_mask = 0
@@ -1214,6 +1471,43 @@ next_hl:
             goto do_budget;
         }
 
+        /* ═══════ YMF278B / OPL4 (0xD0) — port pp, reg aa, data dd ═══════
+         * pp bit7 = chip select (dual-chip; на ZXM-MoonSound один чип — игн.)
+         * pp & 0x7F: 0 = FM Bank0 (те же регистры, что 0x5E) → CMD_WRITE_B0
+         *            1 = FM Bank1 (те же регистры, что 0x5F) → CMD_WRITE_B1
+         *            2 = Wave-часть (порты #7E/#7F)          → CMD_WRITE_WAVE
+         *            прочее — зарезервировано, молча пропускается */
+        if (fb_op == 0xD0)
+        {
+            fb_reg = asm_read_byte();
+            asm_read_2bytes();
+            fb_reg &= 0x7F;
+            if (fb_reg == 0)
+                asm_emit_opl_b0();
+            else if (fb_reg == 1)
+                asm_emit_opl_b1();
+            else if (fb_reg == 2) {
+                /* Управляющие регистры #00-#07 не отдаём из VGM на карту:
+                 * загрузчик сам держит #02=0x10.  После переноса ROM image
+                 * отображаем исходные номера волн на 128 SRAM-заголовков
+                 * (точно как opl4writewavemusiconly в NedoOS). */
+                if (fb_b1 < 0x08)
+                    goto do_budget;
+                if (opl4_rom_loaded) {
+                    if (fb_b1 < 0x20)
+                        fb_b2 |= 0x80;  /* low byte: 0x80..0xFF */
+                    else if (fb_b1 < 0x38)
+                        fb_b2 |= 0x01;  /* high bit: wave 384..511 */
+                }
+                fb_wp[0] = CMD_WRITE_WAVE;
+                fb_wp[1] = fb_b1;
+                fb_wp[2] = fb_b2;
+                fb_wp += 4;
+                spectrum_wave(fb_b1, fb_b2);
+            }
+            goto do_budget;
+        }
+
         /* ═══════ Frame wait 1/60 (0x62) ═══════ */
         if (fb_op == 0x62)
         { asm_wait_62(); goto do_wait; }
@@ -1456,30 +1750,45 @@ ym2_fm_passthru:;
         if (fb_op == 0x66)
         {
             if (fb_is_vgm) {
-                vgm_song_ended = 1;
                 vgm_cur_page   = fb_cpg;
                 vgm_read_ptr   = (uint16_t)fb_rp;
                 vgm_wait_accum = fb_wacc;
             }
             vgm_hl_pos++;
+            /* Финальная silence-цепочка должна начинаться с пустого
+             * ISR-буфера. Иначе большой cmdblock может быть разрезан
+             * границей буфера и при следующем fill стартует сначала. */
+            if (fb_is_vgm && vgm_hl_pos == vgm_hl_abort_pos) {
+                /* ISR замрёт здесь после исполнения всего музыкального
+                 * хвоста. Main затем запустит shutdown как при ESC. */
+                fb_wp[0] = CMD_FINALIZE;
+                fb_wp += 4;
+                goto finish;
+            }
             goto next_hl;
         }
 
         /* ═══════ Data block (0x67) — редко ═══════ */
         if (fb_op == 0x67)
         {
-            fb_rp++; PAGE_CHK();  /* 0x66 */
-            fb_rp++; PAGE_CHK();  /* type байт */
+            fb_rp++; PAGE_CHK();              /* 0x66 (compat байт) */
+            fb_reg = asm_read_byte();          /* тип блока */
             asm_read_2bytes();
             fb_t32 = (uint16_t)fb_b1 | ((uint16_t)fb_b2 << 8);
             asm_read_2bytes();
             fb_t32 |= ((uint32_t)fb_b1 << 16) | ((uint32_t)fb_b2 << 24);
-            /* сохранить → vgm_skip → восстановить */
-            vgm_read_ptr = (uint16_t)fb_rp;
-            vgm_cur_page = fb_cpg;
-            vgm_skip(fb_t32);
-            fb_rp  = (uint8_t *)vgm_read_ptr;
-            fb_cpg = vgm_cur_page;
+
+            if (fb_reg == 0x84 || fb_reg == 0x87) {
+                /* YMF278B ROM/RAM Image — залить payload в SRAM карты */
+                wave_upload_block();
+            } else {
+                /* сохранить → vgm_skip → восстановить */
+                vgm_read_ptr = (uint16_t)fb_rp;
+                vgm_cur_page = fb_cpg;
+                vgm_skip(fb_t32);
+                fb_rp  = (uint8_t *)vgm_read_ptr;
+                fb_cpg = vgm_cur_page;
+            }
             continue;
         }
 
@@ -1707,7 +2016,6 @@ uint8_t vgm_rewind_to_loop(void)
 
     vgm_cur_page = vgm_loop_page;
     vgm_read_ptr = vgm_loop_addr;
-    vgm_song_ended = 0;
     vgm_wait_accum = 0;
     vgm_sec_budget = ISR_FREQ;
     wc_mngcvpl(vgm_cur_page);

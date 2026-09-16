@@ -93,7 +93,7 @@ if errorlevel 1 ( echo FAIL spectrum.s && goto :err )
 
 echo [6/9] Линковка...
 REM Порядок важен: crt0 первым (entry point), затем модули
-REM Layout: CODE #8000–#B83F, DATA #B8A0–#BFFF
+REM Layout: CODE #8000–#B8CF, DATA #B8D0–#BFFF
 REM   Все секции (DATA + GSINIT + HOME + INITIALIZER) должны
 REM   уместиться до #BFFF (Win2).  Если CODE вырастет →
 REM   понизить --data-loc или оптимизировать код.
@@ -138,7 +138,7 @@ powershell -NoProfile -Command ^
 if errorlevel 1 goto :err
 
 echo [7/9] Генерация WMF (multi-page)...
-REM Склеить freq_tables.bin + inflate.bin + cmdblocks.bin в один extra blob
+REM Склеить freq_tables.bin + inflate page + cmdblocks.bin
 copy /b build\freq_tables.bin+build\inflate.bin+build\cmdblocks.bin build\extra_combined.bin >nul
 if errorlevel 1 ( echo FAIL combine extra && goto :err )
 node scripts\ihx2wmf.js build\vgmplay.ihx ..\DiskRef\WC\VGMPLAY.WMF --extra build\extra_combined.bin

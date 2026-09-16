@@ -34,12 +34,13 @@
  *   CMD_WRITE_AY  │ reg    │ val    │ 0      │ OUT AY8910 chip 1
  *   CMD_INC_SEC   │ 0      │ 0      │ 0      │ Инкр. isr_play_seconds
  *   CMD_WRITE_AY2 │ reg    │ val    │ 0      │ OUT AY8910 chip 2 (TS)
- *   CMD_CALL_WC   │ 0      │ 0      │ 0      │ Вызов WC ISR handler
+ *   CMD_FINALIZE  │ 0      │ 0      │ 0      │ Конец VGM → shutdown в main
  *   CMD_WRITE_B0  │ reg    │ val    │ 0      │ OUT OPL3 Bank 0
  *   CMD_SKIP_TICKS│ N      │ smsk_lo│ smsk_hi│ Пропустить N позиций pos_table
  *   CMD_WRITE_SAA │ reg    │ val    │ 0      │ OUT SAA1099 chip 0
  *   CMD_WRITE_B1  │ reg    │ val    │ 0      │ OUT OPL3 Bank 1
  *   CMD_WRITE_SA2 │ reg    │ val    │ 0      │ OUT SAA1099 chip 1
+ *   CMD_WRITE_WAVE│ reg    │ val    │ 0      │ OUT OPL4 Wave-часть (#7E/#7F)
  *   CMD_WAIT      │ lo     │ hi     │ 0      │ Ждать (hi<<8)|lo тиков
  *   CMD_END_BUF   │ 0      │ 0      │ 0      │ Переключить буфер
  *
@@ -80,11 +81,12 @@
 #define CMD_WRITE_AY  0x00  /* AY8910 chip 1: [reg, val, 0]          */
 #define CMD_INC_SEC   0x10  /* Инкрементировать счётчик секунд: [0,0,0]    */
 #define CMD_WRITE_AY2 0x20  /* AY8910 chip 2 (TurboSound): [reg,val,0]*/
-#define CMD_CALL_WC   0x30  /* Вызов WC ISR handler: [0,0,0]        */
+#define CMD_FINALIZE  0x30  /* Конец VGM: остановить ISR и уведомить main */
 #define CMD_WRITE_B0  0x40  /* OPL3 Bank 0 write: [reg, val, 0]      */
 #define CMD_SKIP_TICKS 0x50 /* Пропустить N pos_table: [N,sml,smh]  */
 #define CMD_WRITE_SAA 0x60  /* SAA1099 write: [reg, val, 0] bit7=chip */
 #define CMD_WRITE_B1  0x80  /* OPL3 Bank 1 write: [reg, val, 0]      */
+#define CMD_WRITE_WAVE 0x70 /* OPL4 Wave-часть write (ZXM-MoonSound, порты #7E/#7F): [reg, val, 0] */
 #define CMD_WAIT      0xC0  /* Ждать N ISR-тиков:  [lo,  hi,  0]      */
 #define CMD_END_BUF   0xE0  /* Переключить буфер: [0,   0,   0]      */
 #define CMD_ISR_DONE  0xF0  /* Заморозить ISR, выставить isr_done: [0,0,0] */
@@ -133,6 +135,9 @@ extern volatile uint16_t isr_play_seconds;
  *  Записывается ISR, читается main loop.
  *  Main loop очищает при старте воспроизведения. */
 extern volatile uint8_t  isr_done;
+
+/** ISR дошёл до последнего 0x66; main должен запустить shutdown. */
+extern volatile uint8_t  isr_final_pending;
 
 /** Командные буферы A и B. Заполняются main loop, читаются ISR. */
 extern uint8_t cmd_buf_a[CMD_BUF_SIZE];
