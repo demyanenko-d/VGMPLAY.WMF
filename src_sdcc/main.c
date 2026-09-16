@@ -867,6 +867,18 @@ void update_playback_info(void)
 
     sec = isr_play_seconds;
 
+    /* Страховка для VGM без разрешённого loop. Нормальный путь
+     * заканчивается на opcode 0x66; если нестандартный хвост до него не
+     * дошёл, не оставляем OPL4 удерживать последнюю ноту бесконечно.
+     * Две секунды запаса покрывают округление total_samples и уже
+     * поставленные в ISR команды. */
+    if (!vgm_loop_enabled && vgm_total_seconds &&
+        sec >= (uint16_t)(vgm_total_seconds + 2u))
+    {
+        vgm_hl_pos = vgm_hl_abort_pos;
+        instant_abort();
+    }
+
     sec_changed  = (sec != s_last_displayed_sec);
     loop_changed = (vgm_loop_count != s_last_loop_count);
 
