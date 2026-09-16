@@ -1202,14 +1202,16 @@ void main(void)
     s_vgz_compressed_pages = 0;
     draw_pre_load_info();
 
-    /* Показать "Loading..." ДО начала загрузки — для .vgz (распаковка)
-     * и для файлов >= 1 МБ (синхронная заливка сэмплов OPL4 в SRAM
-     * карты идёт байт за байтом с busy-wait и занимает секунды; без
-     * надписи выглядит как зависание).  Для .vgz это последний WC API
-     * вызов перед inflate — дальше load_vgm работает только портами. */
-    if (is_vgz_filename() || ((const uint8_t *)&wc_file_size)[2] >= 0x10) {
+    /* Показать статус ДО начала загрузки — "Unpacking..." для .vgz
+     * (распаковка), "Loading..." для файлов >= 1 МБ (синхронная заливка
+     * сэмплов OPL4 в SRAM карты идёт байт за байтом с busy-wait и
+     * занимает секунды; без надписи выглядит как зависание).  Для .vgz
+     * это последний WC API вызов перед inflate — дальше load_vgm
+     * работает только портами. */
+    s_is_vgz = is_vgz_filename();
+    if (s_is_vgz || ((const uint8_t *)&wc_file_size)[2] >= 0x10) {
         buf_clear(work_buf);
-        buf_append_str(work_buf, "              Loading...");
+        buf_append_str(work_buf, s_is_vgz ? "Unpacking.." : "Loading..");
         print_line(&s_wnd, ROW_VGM_START, work_buf, WC_COLOR(WC_YELLOW, WC_BLACK));
 
         /* Настройка progress bar: получить адрес текст. экрана для VGM секции col 2 */
