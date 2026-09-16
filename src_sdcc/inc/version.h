@@ -10,6 +10,6 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define APP_VERSION "v0.9.03-beta"
+#define APP_VERSION "v0.9.04-RC1"
 
 #endif /* VERSION_H */

@@ -5,3 +5,4 @@ Debuger/*.vgz
 Debuger/*.vgm
 Debuger/dumps
 **/*.img
+VgmParserREF/*.txt

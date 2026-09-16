@@ -3,10 +3,33 @@
 VGM/VGZ player plugin for **Wild Commander** (WC) on **ZX Spectrum TSConfig** with
 **MultiSound FPGA** sound card.  Written in C (SDCC) + Z80 assembly.
 
-**Version:** v0.9-beta
+**Version:** v0.9.04-RC1
 
 Исходный проект плагина: [demyanenko-d/VGMPLAY.WMF](https://github.com/demyanenko-d/VGMPLAY.WMF).
 Автор исходного кода — GitHub-пользователь [demyanenko-d](https://github.com/demyanenko-d).
+
+## Новости
+
+### v0.9.04-RC1 — поддержка OPL4 (YMF278B)
+
+Добавлено воспроизведение **OPL4** на звуковой карте **ZXM-MoonSound**.
+Автор — **Alex Korochinskiy** ([@AlexKorochinskiy](https://github.com/AlexKorochinskiy)),
+[pull request #1](https://github.com/demyanenko-d/VGMPLAY.WMF/pull/1). Спасибо!
+
+- Воспроизведение VGM для YMF278B (команда `0xD0`): FM-часть через OPL3,
+  wave-часть — запись регистров, загрузка сэмплов в ROM/RAM MoonSound.
+- 16-полосный анализатор для OPL4 по состоянию KeyOn/KeyOff 24 wave-каналов
+  с анимацией атаки, удержания и затухания (подробнее — [OPL4 и спектроанализатор](#opl4-и-спектроанализатор)).
+- Синхронизировано завершение трека: корректный переход на следующий трек и выход по Esc.
+- Воспроизведение OPL3 и более ранних чипов не изменилось.
+- Проверено на железе ZXM-MoonSound.
+
+### Предыдущие версии
+
+- **v0.9.03-beta** — исправление работы клавиатуры.
+- **v0.9.02-beta** — исправление вывода времени.
+- **v0.9.01-beta** — очистка PS/2 FIFO после нажатия клавиши, до выхода из плагина.
+- **v0.9-beta** — управление с PS/2 клавиатуры вместо матрицы ZX.
 
 ## Supported Sound Chips
 
