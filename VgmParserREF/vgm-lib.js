@@ -359,6 +359,157 @@ const VGM_COMMANDS = {
 };
 
 /**
+ * Декодер регистров чипов семейства OPL (YM3812/YM3526/Y8950/YMF262).
+ *
+ * Все эти чипы используют одинаковую раскладку регистров FM-части:
+ * 0x01/0x02/0x03/0x04/0x08 - глобальные регистры (test/timers/CSM/NTS)
+ * 0x20-0x35 - AM/VIB/EG-TYP/KSR/MULT для 18 "слотов" (9 каналов x 2 оператора)
+ * 0x40-0x55 - KSL/Total Level
+ * 0x60-0x75 - Attack Rate/Decay Rate
+ * 0x80-0x95 - Sustain Level/Release Rate
+ * 0xA0-0xA8 - F-Number (младшие 8 бит), один регистр на канал
+ * 0xB0-0xB8 - Key On/Block/F-Number (старшие 2 бита), один регистр на канал
+ * 0xC0-0xC8 - Feedback/Algorithm (connection)
+ * 0xE0-0xF5 - Waveform Select (только слоты 0x00-0x15)
+ * 0xBD      - AM/Vib depth, Rhythm mode
+ *
+ * Таблица "слот -> (канал, оператор)" - стандартная раскладка OPL2/OPL3 (2-op режим).
+ */
+const OPL_SLOT_TO_CHANNEL_OP = {
+    0x00: [0, 1], 0x01: [1, 1], 0x02: [2, 1],
+    0x03: [0, 2], 0x04: [1, 2], 0x05: [2, 2],
+    0x08: [3, 1], 0x09: [4, 1], 0x0A: [5, 1],
+    0x0B: [3, 2], 0x0C: [4, 2], 0x0D: [5, 2],
+    0x10: [6, 1], 0x11: [7, 1], 0x12: [8, 1],
+    0x13: [6, 2], 0x14: [7, 2], 0x15: [8, 2]
+};
+
+const OPL_WAVEFORMS = ['Sine', 'Half-sine', 'Abs-sine', 'Quarter-sine', 'Alt-sine', 'Camel-sine', 'Square', 'Log-sawtooth'];
+
+// Опкоды VGM, пишущие в чипы семейства OPL (используют общую раскладку регистров выше)
+const OPL_OPCODES = {
+    0x5A: 'YM3812',
+    0x5B: 'YM3526',
+    0x5C: 'Y8950',
+    0x5E: 'YMF262/0',
+    0x5F: 'YMF262/1'
+};
+
+/**
+ * Частота ноты OPL по F-Number и Block (стандартная формула из документации Adlib/OPL2):
+ * Freq(Hz) = F-Number * (Clock / 72) / 2^(20 - Block)
+ */
+function oplFrequencyHz(fnum, block, clockHz) {
+    const clock = clockHz > 0 ? clockHz : 3579545; // типовое значение, если частота чипа в заголовке не указана
+    return fnum * (clock / 72) / Math.pow(2, 20 - block);
+}
+
+/**
+ * Создаёт пустой кеш регистров для одного экземпляра OPL-чипа (по одному на каждый opcode/порт).
+ */
+function createOPLState() {
+    return new Array(256).fill(0);
+}
+
+/**
+ * Декодирует запись в регистр OPL-чипа в человекочитаемое описание.
+ * Обновляет regState (кеш последних записанных значений), что позволяет восстанавливать
+ * полное значение F-Number/Block по паре соседних регистров 0xA0-0xA8 / 0xB0-0xB8.
+ *
+ * @returns {{text: string|null, group: {kind: string, channel: number, part: string}|null}}
+ */
+function decodeOPLRegister(reg, data, regState, clockHz) {
+    regState[reg] = data;
+
+    if (reg === 0x01) {
+        return { text: `Test/Waveform-Select-Enable: WSE=${(data >> 5) & 1}`, group: null };
+    }
+    if (reg === 0x02) {
+        return { text: `Timer 1 data = ${data}`, group: null };
+    }
+    if (reg === 0x03) {
+        return { text: `Timer 2 data = ${data}`, group: null };
+    }
+    if (reg === 0x04) {
+        return {
+            text: `Timer control: IRQ-Reset=${(data >> 7) & 1} T1-Mask=${(data >> 6) & 1} T2-Mask=${(data >> 5) & 1} T2-Start=${(data >> 1) & 1} T1-Start=${data & 1}`,
+            group: null
+        };
+    }
+    if (reg === 0x08) {
+        return { text: `CSM=${(data >> 7) & 1} NOTE-SEL(NTS)=${(data >> 6) & 1}`, group: null };
+    }
+    if (reg === 0xBD) {
+        const rhythm = (data >> 5) & 1;
+        const rhythmText = rhythm
+            ? ` [BassDrum=${(data >> 4) & 1} Snare=${(data >> 3) & 1} Tom=${(data >> 2) & 1} TopCymbal=${(data >> 1) & 1} HiHat=${data & 1}]`
+            : '';
+        return { text: `AM-Depth=${(data >> 7) & 1} Vib-Depth=${(data >> 6) & 1} Rhythm=${rhythm}${rhythmText}`, group: null };
+    }
+
+    // Операторные регистры: база определяет группу параметров, младшие 5 бит - номер "слота"
+    const opBase = reg & 0xE0;
+    const slot = reg & 0x1F;
+    if ((opBase === 0x20 || opBase === 0x40 || opBase === 0x60 || opBase === 0x80 || (reg >= 0xE0 && reg <= 0xF5)) &&
+        OPL_SLOT_TO_CHANNEL_OP[slot]) {
+        const [ch, op] = OPL_SLOT_TO_CHANNEL_OP[slot];
+        const chDisp = ch + 1;
+
+        if (opBase === 0x20) {
+            const am = (data >> 7) & 1, vib = (data >> 6) & 1, egt = (data >> 5) & 1, ksr = (data >> 4) & 1, mult = data & 0x0F;
+            return { text: `Ch${chDisp}/Op${op}: AM=${am} VIB=${vib} EG-Sustain=${egt} KSR=${ksr} MULT=${mult}`, group: null };
+        }
+        if (opBase === 0x40) {
+            const ksl = (data >> 6) & 3, tl = data & 0x3F;
+            return { text: `Ch${chDisp}/Op${op}: KSL=${ksl} TotalLevel=${tl} (attenuation ~${(tl * 0.75).toFixed(2)}dB)`, group: null };
+        }
+        if (opBase === 0x60) {
+            const ar = (data >> 4) & 0x0F, dr = data & 0x0F;
+            return { text: `Ch${chDisp}/Op${op}: Attack=${ar} Decay=${dr}`, group: null };
+        }
+        if (opBase === 0x80) {
+            const sl = (data >> 4) & 0x0F, rr = data & 0x0F;
+            return { text: `Ch${chDisp}/Op${op}: SustainLevel=${sl} Release=${rr}`, group: null };
+        }
+        // 0xE0-0xF5: Waveform Select (только младшие биты значимы; на OPL2 - 1 бит, на OPL3 - 3 бита)
+        const ws = data & 0x07;
+        return { text: `Ch${chDisp}/Op${op}: Waveform=${OPL_WAVEFORMS[ws] || ws}`, group: null };
+    }
+
+    // Регистры каналов: частота (F-Number/Block), key-on, feedback/algorithm
+    if (reg >= 0xA0 && reg <= 0xA8) {
+        // Здесь пишутся только младшие 8 бит F-Number; Block/KeyOn лежат в парном регистре
+        // 0xB0+ch и на момент этой записи могут быть ещё не обновлены (или относиться к
+        // предыдущей ноте). Поэтому частоту не считаем - только куда и что записано,
+        // расчёт полной частоты делается в момент записи 0xB0-0xB8 (см. ниже).
+        const ch = reg - 0xA0;
+        return {
+            text: `Ch${ch + 1}: F-Num-Low = 0x${data.toString(16).toUpperCase().padStart(2, '0')} (${data})`,
+            group: { kind: 'freq', channel: ch, part: 'lo' }
+        };
+    }
+    if (reg >= 0xB0 && reg <= 0xB8) {
+        const ch = reg - 0xB0;
+        const aReg = regState[0xA0 + ch];
+        const block = (data >> 2) & 0x07;
+        const keyOn = (data >> 5) & 0x01;
+        const fnum = ((data & 0x03) << 8) | aReg;
+        const freq = oplFrequencyHz(fnum, block, clockHz);
+        return {
+            text: `Ch${ch + 1}: KeyOn=${keyOn} Block=${block} -> F-Num=${fnum} Freq~=${freq.toFixed(2)}Hz`,
+            group: { kind: 'freq', channel: ch, part: 'hi' }
+        };
+    }
+    if (reg >= 0xC0 && reg <= 0xC8) {
+        const ch = reg - 0xC0;
+        const fb = (data >> 1) & 0x07, cnt = data & 0x01;
+        return { text: `Ch${ch + 1}: Feedback=${fb} Algorithm=${cnt ? 'Additive (parallel)' : 'FM (serial)'}`, group: null };
+    }
+
+    return { text: null, group: null };
+}
+
+/**
  * Анализирует gzip заголовок VGZ файла согласно RFC 1952
  * 
  * \"The normal file extension is .vgm but files can also be GZip compressed into
@@ -540,9 +691,16 @@ function parseVGMHeader(vgm) {
     const minor = minorHigh * 10 + minorLow;
     
     header.version = `${major}.${minor.toString().padStart(2, '0')}`;
+    header.versionString = header.version;
     header.versionHex = versionRaw;
     header.versionRaw = versionRaw; // Для отладки
-    
+
+    // "0x04: Eof offset (32 bits)
+    //         Relative offset to end of file (i.e. file length - 4).
+    //         This is mainly used to find out if the file is truncated."
+    const eofOffsetRaw = vgm.readUInt32LE(0x04);
+    header.eofOffset = eofOffsetRaw + 0x04;
+
     // \"VGM files use a sample rate of 44100 Hz. All wait times are given as a
     //  number of samples to wait at this rate.\"
     // \"VGMs run with a rate of 44100 samples per second. All sample values use
@@ -1178,7 +1336,23 @@ function decompileVGM(vgmBuffer, options = {}) {
         decompilation.statistics.loopSample = loopSample;
         decompilation.statistics.loopFound = true;
     }
-    
+
+    // Кеш регистров для декодирования записей в чипы семейства OPL (YM3812/YM3526/Y8950/YMF262).
+    // Один кеш на каждый opcode/порт, чтобы восстанавливать полное F-Number/Block по паре
+    // соседних регистров 0xA0-0xA8 (F-Num low) / 0xB0-0xB8 (KeyOn+Block+F-Num high).
+    const oplStates = {};
+    for (const op of Object.keys(OPL_OPCODES)) {
+        oplStates[op] = createOPLState();
+    }
+    // Тактовая частота чипа для расчёта реальной частоты ноты (берём из заголовка VGM, если есть)
+    const oplClockByOpcode = {
+        0x5A: header.chips.find(c => c.type === 'YM3812'),
+        0x5B: header.chips.find(c => c.type === 'YM3526'),
+        0x5C: header.chips.find(c => c.type === 'Y8950'),
+        0x5E: header.chips.find(c => c.type === 'YMF262'),
+        0x5F: header.chips.find(c => c.type === 'YMF262')
+    };
+
     /**
      * Добавляет команду в декомпилированный VGM вывод
      * 
@@ -1190,21 +1364,44 @@ function decompileVGM(vgmBuffer, options = {}) {
      */
     function addCommand(cmd) {
         if (maxCommands === 0 || showAllCommands || decompilation.commands.length < maxCommands) {
-            // Специальная обработка для временных меток и меток петли
-            if (cmd.type === 'TIME_MARK' || cmd.type === 'LOOP_MARK') {
-                cmd.command = cmd.command; // Используем готовый форматированный текст
-            } else {
-                // Форматируем обычные команды согласно новому формату
-                cmd.command = formatCommand(commandNumber, cmd.raw || [cmd.opcode || 0], cmd.mnemonic || cmd.description, cmd.dataBytes);
-                commandNumber++; // Увеличиваем номер команды только для обычных команд
-            }
+            // Временные метки и метки петли уже содержат готовый текст, форматирование
+            // обычных команд (нумерация, слияние пар частоты OPL) выполняется отдельным
+            // проходом в finalizeCommands() после того, как собран весь список команд.
             decompilation.commands.push(cmd);
         }
-        
+
         // Статистика для всех команд, кроме временных меток
         if (cmd.type !== 'TIME_MARK' && cmd.type !== 'LOOP_MARK') {
             decompilation.statistics.totalCommands++;
         }
+    }
+
+    /**
+     * Финальный проход по собранным командам: нумерует их и генерирует итоговый текст
+     * (cmd.command) для каждой записи, с выровненным по колонке комментарием.
+     *
+     * Записи F-Number/Block (0xA0-0xA8 / 0xB0-0xB8) остаются отдельными строками -
+     * каждая уже содержит полностью восстановленную частоту/блок/key-on, посчитанную
+     * по кешу регистров (decodeOPLRegister), независимо от того, в каком порядке чип
+     * пишет пару регистров. Склеивать две строки в одну не нужно: реальный порядок
+     * записи не всегда "сначала Ax, потом Bx", и попытка слить их в одну инструкцию
+     * даёт нечитаемый результат, когда порядок обратный.
+     */
+    function finalizeCommands() {
+        const result = [];
+        let num = 1;
+        for (let i = 0; i < decompilation.commands.length; i++) {
+            const cmd = decompilation.commands[i];
+            if (cmd.type === 'TIME_MARK' || cmd.type === 'LOOP_MARK') {
+                result.push(cmd);
+                continue;
+            }
+
+            cmd.command = formatCommand(num, cmd.raw || [cmd.opcode || 0], cmd.mnemonic || cmd.description, cmd.chipDecodeText || null, cmd.dataBytes);
+            result.push(cmd);
+            num++;
+        }
+        decompilation.commands = result;
     }
     
     /**
@@ -1284,25 +1481,41 @@ function decompileVGM(vgmBuffer, options = {}) {
         };
     }
     
+    // Ширина поля мнемоники, к которой всё выравнивается перед началом комментария "; ..."
+    // (так, чтобы комментарии в подавляющем большинстве строк начинались с одной колонки).
+    const COMMENT_COLUMN = 32;
+
+    /**
+     * Дописывает к мнемонике комментарий, выравнивая начало "; ..." по фиксированной колонке.
+     * Если мнемоника длиннее COMMENT_COLUMN (например, объединённая пара регистров частоты),
+     * колонка для этой конкретной строки просто съезжает - это редкое исключение.
+     */
+    function appendComment(mnemonic, comment) {
+        if (!comment) return mnemonic;
+        const padded = mnemonic.length < COMMENT_COLUMN ? mnemonic.padEnd(COMMENT_COLUMN, ' ') : `${mnemonic}  `;
+        return `${padded}; ${comment}`;
+    }
+
     /**
      * Форматирует команду VGM в декомпилированный вид
-     * 
-     * Формат: 0000001:  62 00 10          WAIT (31)
-     *         ^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
-     *         номер     hex байты + мнемоника
-     * 
+     *
+     * Формат: 0000001:  62 00 10          WAIT (31)             ; 0.70ms
+     *         ^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^
+     *         номер     hex байты + мнемоника (выровнена)        комментарий
+     *
      * @param {number} commandNumber - Номер команды (начиная с 1)
      * @param {Array<number>} rawBytes - Байты команды
      * @param {string} mnemonic - Мнемоника команды
+     * @param {string|null} comment - Расшифровка регистра/тайминга (необязательно)
      * @param {Array<number>} dataBytes - Дополнительные данные (для массивов)
      * @returns {string} Отформатированная строка команды
      */
-    function formatCommand(commandNumber, rawBytes, mnemonic, dataBytes = null) {
+    function formatCommand(commandNumber, rawBytes, mnemonic, comment = null, dataBytes = null) {
         const number = commandNumber.toString().padStart(7, '0');
         const hexBytes = rawBytes.map(b => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
         const hex = hexBytes.padEnd(24, ' '); // Выравнивание для hex части
-        let result = `${number}:  ${hex}${mnemonic}`;
-        
+        let result = `${number}:  ${hex}${appendComment(mnemonic, comment)}`;
+
         // Если есть дополнительные данные, выводим их отдельными строками по 16 байт
         if (dataBytes && dataBytes.length > 0) {
             result += '\n'; // Пустая строка перед данными
@@ -1415,6 +1628,7 @@ function decompileVGM(vgmBuffer, options = {}) {
             cmd.raw = [opcode];
             cmd.mnemonic = `WAIT (${waitSamples})`;
             cmd.description = `Wait ${waitSamples} ticks (${(waitSamples / SAMPLE_RATE * 1000).toFixed(1)}ms)`;
+            cmd.chipDecodeText = `${(waitSamples / SAMPLE_RATE * 1000).toFixed(2)}ms`;
             currentSamples += waitSamples;
             decompilation.statistics.waitCommands++;
             addCommand(cmd);
@@ -1427,6 +1641,7 @@ function decompileVGM(vgmBuffer, options = {}) {
                 cmd.raw = [opcode, vgmBuffer[position + 1], vgmBuffer[position + 2]];
                 cmd.mnemonic = `WAIT (${waitSamples})`;
                 cmd.description = `Wait ${waitSamples} ticks (${(waitSamples / SAMPLE_RATE * 1000).toFixed(1)}ms)`;
+                cmd.chipDecodeText = `${(waitSamples / SAMPLE_RATE * 1000).toFixed(2)}ms`;
                 currentSamples += waitSamples;
                 decompilation.statistics.waitCommands++;
                 addCommand(cmd);
@@ -1440,6 +1655,7 @@ function decompileVGM(vgmBuffer, options = {}) {
             cmd.raw = [opcode];
             cmd.mnemonic = `WAIT60 (${waitSamples})`;
             cmd.description = `Wait ${waitSamples} ticks (16.7ms, 60Hz)`;
+            cmd.chipDecodeText = `${(waitSamples / SAMPLE_RATE * 1000).toFixed(2)}ms`;
             currentSamples += waitSamples;
             decompilation.statistics.waitCommands++;
             addCommand(cmd);
@@ -1451,6 +1667,7 @@ function decompileVGM(vgmBuffer, options = {}) {
             cmd.raw = [opcode];
             cmd.mnemonic = `WAIT50 (${waitSamples})`;
             cmd.description = `Wait ${waitSamples} ticks (20.0ms, 50Hz)`;
+            cmd.chipDecodeText = `${(waitSamples / SAMPLE_RATE * 1000).toFixed(2)}ms`;
             currentSamples += waitSamples;
             addCommand(cmd);
             position++;
@@ -1461,6 +1678,9 @@ function decompileVGM(vgmBuffer, options = {}) {
             cmd.raw = [opcode];
             cmd.mnemonic = `YM2612DAC_WAIT (${waitSamples})`;
             cmd.description = `YM2612 DAC write then wait ${waitSamples} samples`;
+            if (waitSamples > 0) {
+                cmd.chipDecodeText = `${(waitSamples / SAMPLE_RATE * 1000).toFixed(2)}ms`;
+            }
             currentSamples += waitSamples;
             decompilation.statistics.writeCommands++;
             addCommand(cmd);
@@ -1490,6 +1710,19 @@ function decompileVGM(vgmBuffer, options = {}) {
                 const chipName = chipCommands[opcode] || 'Unknown';
                 cmd.mnemonic = `${chipName} (0x${reg.toString(16).toUpperCase().padStart(2, '0')}, 0x${data.toString(16).toUpperCase().padStart(2, '0')})`;
                 cmd.description = `${chipName} write: reg=0x${reg.toString(16).toUpperCase()}, data=0x${data.toString(16).toUpperCase()}`;
+
+                // Для чипов семейства OPL (YM3812/YM3526/Y8950/YMF262) добавляем расшифровку
+                // регистра (какой параметр синтеза он задаёт) и восстанавливаем полную частоту
+                // ноты по паре соседних регистров F-Number/Block.
+                if (OPL_OPCODES[opcode]) {
+                    const chipInfo = oplClockByOpcode[opcode];
+                    const decoded = decodeOPLRegister(reg, data, oplStates[opcode], chipInfo ? chipInfo.clock : 0);
+                    if (decoded.text) {
+                        cmd.chipDecodeText = decoded.text;
+                    }
+                    cmd.chipGroup = decoded.group;
+                }
+
                 decompilation.statistics.writeCommands++;
                 addCommand(cmd);
                 position += 3;
@@ -1508,7 +1741,9 @@ function decompileVGM(vgmBuffer, options = {}) {
     // Финальные статистики
     decompilation.statistics.totalSamples = currentSamples;
     decompilation.statistics.totalSeconds = (currentSamples / SAMPLE_RATE).toFixed(3);
-    
+
+    finalizeCommands();
+
     return decompilation;
 }
 
@@ -1665,7 +1900,7 @@ function showHeader(filePath) {
         console.log('Sound Chips:');
         header.chips.forEach(chip => {
             const dualText = chip.isDualChip ? ' (Dual Chip)' : '';
-            const clockText = typeof chip.clockMHz === 'number' ? `${chip.clockMHz.toFixed(3)} MHz` : '(clock info unavailable)';
+            const clockText = chip.clock > 0 ? `${chip.clock.toLocaleString()} Hz (${chip.clockMHz} MHz)` : '(clock info unavailable)';
             console.log(`  ${chip.name}: ${clockText}${dualText}`);
         });
         
@@ -1716,32 +1951,74 @@ function decompileFile(filePath, options = {}) {
         };
         
         const decompilation = decompileVGM(vgmData, decompileOptions);
-        
+        const header = decompilation.header;
+
         // Выводим заголовок
         console.log(`; VGM Decompilation: ${path.basename(filePath)}`);
         console.log(`; Generated by VGM-lib v1.71`);
         console.log(`; File: ${filePath}`);
         console.log(`; Size: ${vgmData.length} bytes`);
-        console.log(`; Format: ${decompilation.header.signature} ${decompilation.header.versionString}`);
+        console.log(`; Format: ${header.signature.trim()}, version ${header.versionString} (0x${header.versionHex.toString(16).toUpperCase().padStart(4, '0')})`);
+        console.log(`; VGM data offset: 0x${header.dataOffset.toString(16).toUpperCase()} (header size ${header.headerSize} bytes)`);
         console.log(`;`);
-        
+
         // Выводим информацию об использованных чипах
-        if (decompilation.header.chips.length > 0) {
-            console.log(`; Sound chips:`);
-            decompilation.header.chips.forEach(chip => {
-                const dualText = chip.isDualChip ? ' (Dual)' : '';
-                const clockText = typeof chip.clockMHz === 'number' ? `${chip.clockMHz.toFixed(3)} MHz` : '(clock info unavailable)';
-                console.log(`; ${chip.name}: ${clockText}${dualText}`);
+        if (header.chips.length > 0) {
+            console.log(`; Sound chips (${header.chips.length}):`);
+            header.chips.forEach(chip => {
+                const dualText = chip.isDualChip ? ' [Dual chip]' : chip.isT6W28 ? ' [T6W28 mode]' : '';
+                const clockText = chip.clock > 0 ? `${chip.clock.toLocaleString()} Hz (${chip.clockMHz} MHz)` : '(clock info unavailable)';
+                console.log(`; - ${chip.name}: ${clockText}${dualText}`);
             });
             console.log(`;`);
+        } else {
+            console.log(`; Sound chips: none detected`);
+            console.log(`;`);
         }
-        
+
+        // Выводим тайминг и информацию о лупе
+        console.log(`; Timing:`);
+        console.log(`; Sample rate: ${header.sampleRate} Hz (fixed by VGM spec)`);
+        if (header.rate > 0) {
+            console.log(`; Recording rate: ${header.rate} Hz`);
+        }
+        console.log(`; Total samples: ${header.totalSamples} (${header.totalSeconds.toFixed(3)} seconds)`);
+        if (header.hasLoop) {
+            console.log(`; Loop offset: 0x${header.loopOffset.toString(16).toUpperCase()} (relative +0x${(header.loopOffset - 0x1C).toString(16).toUpperCase()} from 0x1C)`);
+            console.log(`; Loop samples: ${header.loopSamples} (${header.loopSeconds.toFixed(3)} seconds)`);
+            console.log(`; Intro (pre-loop) samples: ${header.introSamples} (${header.introSeconds.toFixed(3)} seconds)`);
+        } else {
+            console.log(`; Loop: none`);
+        }
+        console.log(`;`);
+
+        // Выводим GD3 метаданные, если есть
+        if (header.gd3Offset > 0) {
+            console.log(`; GD3 tags (offset 0x${header.gd3Offset.toString(16).toUpperCase()}):`);
+            if (decompilation.gd3) {
+                const gd3 = decompilation.gd3;
+                if (gd3.trackTitle) console.log(`; Track: ${gd3.trackTitle}`);
+                if (gd3.gameName) console.log(`; Game: ${gd3.gameName}`);
+                if (gd3.systemName) console.log(`; System: ${gd3.systemName}`);
+                if (gd3.trackAuthor) console.log(`; Author: ${gd3.trackAuthor}`);
+                if (gd3.date) console.log(`; Date: ${gd3.date}`);
+                if (gd3.ripper) console.log(`; Ripper: ${gd3.ripper}`);
+                if (gd3.notes) console.log(`; Notes: ${gd3.notes}`);
+            } else {
+                console.log(`; (failed to parse GD3 tag)`);
+            }
+            console.log(`;`);
+        }
+
         // Выводим статистику
         console.log(`; Statistics:`);
         console.log(`; Total commands: ${decompilation.statistics.totalCommands}`);
+        console.log(`; Write commands: ${decompilation.statistics.writeCommands}`);
+        console.log(`; Wait commands: ${decompilation.statistics.waitCommands}`);
+        console.log(`; Data blocks: ${decompilation.statistics.dataBlocks}`);
         console.log(`; Total samples: ${decompilation.statistics.totalSamples}`);
         console.log(`; Total time: ${decompilation.statistics.totalSeconds} seconds`);
-        
+
         if (decompilation.statistics.loopFound) {
             console.log(`; Loop sample: ${decompilation.statistics.loopSample}`);
         }
